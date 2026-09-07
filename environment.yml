@@ -1,0 +1,23 @@
+name: laenrich
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - python=3.11
+  - bcftools
+  - bedtools
+  - gemma=0.98.3
+  - ipykernel
+  - jupyterlab
+  - matplotlib
+  - numpy
+  - pandas
+  - plink
+  - pyyaml
+  - pysam
+  - r-base
+  - scikit-learn=1.5.2
+  - scipy
+  - seaborn
+  - statsmodels=0.14.4
+  - tables

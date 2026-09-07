@@ -1,0 +1,367 @@
+{
+  "genome": {
+    "gene_body": {
+      "id": "gene_body",
+      "dataset": "genome",
+      "description": "Variants within annotated gene bodies"
+    },
+    "genic_2kb": {
+      "id": "genic_2kb",
+      "dataset": "genome",
+      "description": "Gene-associated regions, defined as gene bodies plus 2 kb upstream and downstream",
+      "parameters": {
+        "flanking": 2000
+      }
+    },
+    "genic_proximal": {
+      "id": "genic_proximal",
+      "dataset": "genome",
+      "description": "Gene-proximal regions, defined as 5 kb upstream and downstream of annotated gene bodies",
+      "parameters": {
+        "flanking": 5000
+      }
+    },
+    "genic_15kb": {
+      "id": "genic_15kb",
+      "dataset": "genome",
+      "description": "Gene-neighborhood regions, defined as 15 kb upstream and downstream of annotated gene bodies",
+      "parameters": {
+        "flanking": 15000
+      }
+    },
+    "TE": {
+      "id": "TE",
+      "dataset": "genome",
+      "description": "Variants within annotated transposable-element regions"
+    },
+    "other_intergenic": {
+      "id": "other_intergenic",
+      "dataset": "genome",
+      "description": "Variants outside of annotated genic regions (2 kb flanking regions) and transposable-element regions"
+    },
+    "upstream_2kb": {
+      "id": "upstream_2kb",
+      "dataset": "genome",
+      "description": "Variants within 2 kb upstream of annotated gene bodies",
+      "parameters": {
+        "flanking": 2000
+      }
+    },
+    "five_prime_UTR": {
+      "id": "five_prime_UTR",
+      "dataset": "genome",
+      "description": "Variants within annotated 5' UTR regions"
+    },
+    "CDS": {
+      "id": "CDS",
+      "dataset": "genome",
+      "description": "Variants within annotated protein-coding sequences"
+    },
+    "intron": {
+      "id": "intron",
+      "dataset": "genome",
+      "description": "Variants within annotated introns"
+    },
+    "three_prime_UTR": {
+      "id": "three_prime_UTR",
+      "dataset": "genome",
+      "description": "Variants within annotated 3' UTR regions"
+    },
+    "downstream_2kb": {
+      "id": "downstream_2kb",
+      "dataset": "genome",
+      "description": "Variants within 2 kb downstream of annotated gene bodies",
+      "parameters": {
+        "flanking": 2000
+      }
+    },
+    "missense": {
+      "id": "missense",
+      "dataset": "genome",
+      "description": "Variants annotated as missense within coding sequences"
+    },
+    "synonymous": {
+      "id": "synonymous",
+      "dataset": "genome",
+      "description": "Variants annotated as synonymous within coding sequences"
+    },
+    "putative_LoF": {
+      "id": "putative_LoF",
+      "dataset": "genome",
+      "description": "Variants annotated as putative loss-of-function within coding sequences"
+    },
+    "ACR": {
+      "id": "ACR",
+      "dataset": "genome",
+      "description": "Variants within accessible chromatin regions"
+    },
+    "UMR": {
+      "id": "UMR",
+      "dataset": "genome",
+      "description": "Variants within unmethylated regions"
+    },
+    "riboSNitch": {
+      "id": "riboSNitch",
+      "dataset": "genome",
+      "description": "Variants predicted to alter local RNA secondary structure"
+    },
+    "low_pi": {
+      "id": "low_pi",
+      "dataset": "genome",
+      "description": "Variants within windows of Gene-neighborhood regions with low nucleotide diversity (pi)",
+      "parameters": {
+        "quantile": [0.0, 0.25],
+        "window_size": 500,
+        "flanking": 15000,
+        "maf_min": 0.01,
+        "snp_min": 3
+      }
+    },
+    "med_pi": {
+      "id": "med_pi",
+      "dataset": "genome",
+      "description": "Variants within windows of Gene-neighborhood regions with medium nucleotide diversity (pi)",
+      "parameters": {
+        "quantile": [0.25, 0.75],
+        "window_size": 500,
+        "flanking": 15000,
+        "maf_min": 0.01,
+        "snp_min": 3
+      }
+    },
+    "high_pi": {
+      "id": "high_pi",
+      "dataset": "genome",
+      "description": "Variants within windows of Gene-neighborhood regions with high nucleotide diversity (pi)",
+      "parameters": {
+        "quantile": [0.75, 1.0],
+        "window_size": 500,
+        "flanking": 15000,
+        "maf_min": 0.01,
+        "snp_min": 3
+      }
+    },
+    "non_CEs": {
+      "id": "non_CEs",
+      "dataset": "genome",
+      "description": "Variants lacking sufficient phylogenetic information for conservation inference"
+    },
+    "conserved_sites": {
+      "id": "conserved_sites",
+      "dataset": "genome",
+      "description": "Variants within conserved signals identified by phylogenetic conservation inference",
+      "parameters": {
+        "min_phyloP": 1.0
+      }
+    },
+    "neutral_sites": {
+      "id": "neutral_sites",
+      "dataset": "genome",
+      "description": "Variants within neutral signals identified by phylogenetic conservation inference",
+      "parameters": {
+        "min_phyloP": -1.0,
+        "max_phyloP": 1.0
+      }
+    },
+    "accelerated_sites": {
+      "id": "accelerated_sites",
+      "dataset": "genome",
+      "description": "Variants within accelerated signals identified by phylogenetic conservation inference",
+      "parameters": {
+        "max_phyloP": -1.0
+      } 
+    },
+    "maf_0.05_0.1": {
+      "id": "maf_0.05_0.1",
+      "dataset": "genome",
+      "description": "Variants with 0.05 <= MAF < 0.1",
+      "parameters": {
+        "maf_min": 0.05,
+        "maf_max": 0.1
+      }
+    },
+    "maf_0.1_0.2": {
+      "id": "maf_0.1_0.2",
+      "dataset": "genome",
+      "description": "Variants with 0.1 <= MAF < 0.2",
+      "parameters": {
+        "maf_min": 0.1,
+        "maf_max": 0.2
+      }
+    },
+    "maf_0.2_0.3": {
+      "id": "maf_0.2_0.3",
+      "dataset": "genome",
+      "description": "Variants with 0.2 <= MAF < 0.3",
+      "parameters": {
+        "maf_min": 0.2,
+        "maf_max": 0.3
+      }
+    },
+    "maf_0.3_0.4": {
+      "id": "maf_0.3_0.4",
+      "dataset": "genome",
+      "description": "Variants with 0.3 <= MAF < 0.4",
+      "parameters": {
+        "maf_min": 0.3,
+        "maf_max": 0.4
+      }
+    },
+    "maf_0.4_0.5": {
+      "id": "maf_0.4_0.5",
+      "dataset": "genome",
+      "description": "Variants with 0.4 <= MAF <= 0.5",
+      "parameters": {
+        "maf_min": 0.4,
+        "maf_max": 0.5
+      }
+    }
+  },
+  "cds": {
+    "missense_cds_0.01": {
+      "id": "missense_cds_0.01",
+      "dataset": "cds",
+      "description": "Missense variants with MAF >= 0.01"
+    },
+    "synonymous_cds_0.01": {
+      "id": "synonymous_cds_0.01",
+      "dataset": "cds",
+      "description": "Synonymous variants with MAF >= 0.01"
+    },
+    "putative_LoF_cds_0.01": {
+      "id": "putative_LoF_cds_0.01",
+      "dataset": "cds",
+      "description": "Putative loss-of-function variants with MAF >= 0.01"
+    },
+    "maf_0.01_0.03_cds_0.01": {
+      "id": "maf_0.01_0.03_cds_0.01",
+      "dataset": "cds",
+      "description": "Coding-sequence variants with 0.01 <= MAF < 0.03",
+      "parameters": {
+        "maf_min": 0.01,
+        "maf_max": 0.03
+      }
+    },
+    "maf_0.03_0.05_cds_0.01": {
+      "id": "maf_0.03_0.05_cds_0.01",
+      "dataset": "cds",
+      "description": "Coding-sequence variants with 0.03 <= MAF < 0.05",
+      "parameters": {
+        "maf_min": 0.03,
+        "maf_max": 0.05
+      }
+    },
+    "maf_0.05_0.1_cds_0.01": {
+      "id": "maf_0.05_0.1_cds_0.01",
+      "dataset": "cds",
+      "description": "Coding-sequence variants with 0.05 <= MAF < 0.1",
+      "parameters": {
+        "maf_min": 0.05,
+        "maf_max": 0.1
+      }
+    },
+    "maf_0.1_0.2_cds_0.01": {
+      "id": "maf_0.1_0.2_cds_0.01",
+      "dataset": "cds",
+      "description": "Coding-sequence variants with 0.1 <= MAF < 0.2",
+      "parameters": {
+        "maf_min": 0.1,
+        "maf_max": 0.2
+      }
+    },
+    "maf_0.2_0.3_cds_0.01": {
+      "id": "maf_0.2_0.3_cds_0.01",
+      "dataset": "cds",
+      "description": "Coding-sequence variants with 0.2 <= MAF < 0.3",
+      "parameters": {
+        "maf_min": 0.2,
+        "maf_max": 0.3
+      }
+    },
+    "maf_0.3_0.4_cds_0.01": {
+      "id": "maf_0.3_0.4_cds_0.01",
+      "dataset": "cds",
+      "description": "Coding-sequence variants with 0.3 <= MAF < 0.4",
+      "parameters": {
+        "maf_min": 0.3,
+        "maf_max": 0.4
+      }
+    },
+    "maf_0.4_0.5_cds_0.01": {
+      "id": "maf_0.4_0.5_cds_0.01",
+      "dataset": "cds",
+      "description": "Coding-sequence variants with 0.4 <= MAF <= 0.5",
+      "parameters": {
+        "maf_min": 0.4,
+        "maf_max": 0.5
+      }
+    }
+  },
+  "gene": {
+    "flowering_time_genes": {
+      "id": "flowering_time_genes",
+      "dataset": "gene",
+      "description": "Predefined flowering-time genes"
+    },
+    "no_expression_genes": {
+      "id": "no_expression_genes",
+      "dataset": "gene",
+      "description": "Genes with no detectable expression in the NCBI RNA-seq dataset"
+    },
+    "high_variance_genes": {
+      "id": "high_variance_genes",
+      "dataset": "gene",
+      "description": "Genes with high expression variance across tissues in the NCBI RNA-seq dataset"
+    },
+    "stably_expressed_genes": {
+      "id": "stably_expressed_genes",
+      "dataset": "gene",
+      "description": "Genes with stable expression across tissues in the NCBI RNA-seq dataset"
+    },
+    "non_module_genes": {
+      "id": "non_module_genes",
+      "dataset": "gene",
+      "description": "Genes not assigned to any co-expression network module"
+    },
+    "module_genes": {
+      "id": "module_genes",
+      "dataset": "gene",
+      "description": "Genes assigned to co-expression network modules but not identified as hub genes"
+    },
+    "module_hub_genes": {
+      "id": "module_hub_genes",
+      "dataset": "gene",
+      "description": "Genes assigned to co-expression network modules and identified as hub genes"
+    },
+    "orphan_genes": {
+      "id": "orphan_genes",
+      "dataset": "gene",
+      "description": "Genes not assigned to any Poaceae Hierarchical Orthologous Groups"
+    },
+    "multi_copy_genes": {
+      "id": "multi_copy_genes",
+      "dataset": "gene",
+      "description": "Genes assigned to Poaceae Hierarchical Orthologous Groups with multiple copies"
+    },
+    "single_copy_genes": {
+      "id": "single_copy_genes",
+      "dataset": "gene",
+      "description": "Genes assigned to Poaceae Hierarchical Orthologous Groups with a single copy"
+    },
+    "high_recombination_genes": {
+      "id": "high_recombination_genes",
+      "dataset": "gene",
+      "description": "Genes located in high-recombination regions of the genome"
+    },
+    "low_recombination_genes": {
+      "id": "low_recombination_genes",
+      "dataset": "gene",
+      "description": "Genes located in low-recombination regions of the genome"
+    },
+    "med_recombination_genes": {
+      "id": "med_recombination_genes",
+      "dataset": "gene",
+      "description": "Genes located in mid-recombination regions of the genome"
+    }
+  }
+}

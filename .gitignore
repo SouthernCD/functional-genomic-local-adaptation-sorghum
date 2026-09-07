@@ -1,0 +1,11 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.venv/
+config/project.yaml
+.vscode/tasks.json
+data/
+logs/
+runs/
+JUPYTER_START.md

@@ -1,0 +1,20 @@
+cff-version: 1.2.0
+message: "If you use this code, please cite the associated manuscript."
+title: "Functional genomic map of local adaptation in global sorghum: analysis code"
+type: software
+version: 0.1.0
+date-released: 2026-08-18
+authors:
+  - family-names: Xu
+    given-names: Yuxing
+  - family-names: Das
+    given-names: Aayudh
+  - family-names: Cruet-Burgos
+    given-names: Clara
+  - family-names: Morris
+    given-names: Geoffrey P.
+  - family-names: Lasky
+    given-names: Jesse R.
+repository-code: "https://github.com/OWNER/functional-genomic-local-adaptation-sorghum"
+license: MIT
+

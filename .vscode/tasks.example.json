@@ -1,0 +1,27 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Sync sorghum local adaptation to remote",
+      "type": "process",
+      "command": "rsync",
+      "args": [
+        "-av",
+        "--exclude=__pycache__/",
+        "--exclude=*.pyc",
+        "--exclude=.ipynb_checkpoints/",
+        "${workspaceFolder}/README.md",
+        "${workspaceFolder}/README.zh-CN.md",
+        "${workspaceFolder}/src",
+        "${workspaceFolder}/config",
+        "<ssh-alias>:<absolute-remote-project-root>/"
+      ],
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "clear": true
+      }
+    }
+  ]
+}

@@ -1,0 +1,37 @@
+project:
+  name: functional-genomic-local-adaptation-sorghum
+
+remote:
+  machine_profile: <remote-machine-profile-id>
+  project_root: <absolute-remote-project-directory>
+
+jupyter:
+  server:
+    node_role: <interactive-compute-node-role>
+    environment:
+      manager: <micromamba-conda-module-or-other>
+      name: <jupyter-server-environment>
+      activation_script: <absolute-activation-script>
+  kernel:
+    environment:
+      manager: <micromamba-conda-module-or-other>
+      name: <notebook-kernel-environment>
+      activation_script: <absolute-activation-script>
+    kernelspec: <kernelspec-id>
+  same_environment: <true-or-false>
+  ports:
+    local: <local-port>
+    remote: <remote-port>
+
+resources:
+  interactive:
+    execution_mode: <direct-or-scheduler>
+    cores: <integer>
+    memory_gb: <integer>
+  heavy_analysis:
+    execution_mode: <scheduler-or-manual>
+    scheduler: <scheduler-name>
+    queue: <queue-name>
+
+sync:
+  task_label: <vscode-sync-task-label>
