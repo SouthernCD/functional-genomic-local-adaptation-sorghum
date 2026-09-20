@@ -308,3 +308,33 @@ def get_genotype_matrix_from_vcf(vcf_file, chr_id=None, start=None, end=None):
     genotype_matrix = np.array(genotype_matrix)
 
     return genotype_matrix
+
+def get_genotype_matrix_from_vcf_by_pos_list(vcf_file, chr_id, pos_list, *, vcf_reader=None):
+    """
+    Get genotype matrix from a VCF file by position list.
+    pos_list: a list of positions to extract genotypes from the VCF file.
+    vcf_reader: optional open reader owned and closed by the caller.
+    VCF record order and multiple records at the same position are preserved.
+    """
+
+    positions = {int(pos) for pos in pos_list}
+    owns_reader = vcf_reader is None
+    vcf = VCF(vcf_file) if owns_reader else vcf_reader
+    try:
+        genotype_matrix = []
+        used_pos_list = []
+        if positions:
+            for record in vcf(f'{chr_id}:{min(positions)}-{max(positions)}'):
+                if record.POS in positions:
+                    variant_genotypes = [
+                        gt[0] + gt[1] if gt[0] is not None and gt[1] is not None else -1 for gt in record.genotypes]
+                    genotype_matrix.append(variant_genotypes)
+                    used_pos_list.append(record.POS)
+        if genotype_matrix:
+            genotype_matrix = np.array(genotype_matrix)
+        else:
+            genotype_matrix = np.empty((0, len(vcf.samples)), dtype=int)
+        return genotype_matrix, chr_id, used_pos_list
+    finally:
+        if owns_reader:
+            vcf.close()

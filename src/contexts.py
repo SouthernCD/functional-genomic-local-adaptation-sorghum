@@ -9,8 +9,8 @@ import statsmodels.api as sm
 from scipy import interpolate
 import allel
 import igraph as ig
-from .interval import interval_minus_set, merge_intervals
 from interlap import InterLap
+from .interval import interval_minus_set, merge_intervals
 from .feature import read_gff_file, read_fasta_by_faidx
 from .vcf import get_chr_id_list_from_vcf
 
@@ -299,6 +299,168 @@ def get_pi_statistics(ref_gff_file, ref_genome_fa, vcf_file, window_size=500, ge
                             >= min_snp_count].reset_index(drop=True)
     return results_df
 
+def get_genome_pi_statistics(ref_genome_fa, vcf_file, window_size=500, min_snp_count=3):
+    genome_dict = read_fasta_by_faidx(ref_genome_fa)
+    chr_len_dict = {chr_id: genome_dict[chr_id].len()
+                    for chr_id in genome_dict}
+    chr_id_list = get_chr_id_list_from_vcf(vcf_file)
+    chr_len_dict = {chr_id: chr_len_dict[chr_id]
+                    for chr_id in chr_id_list if chr_id in chr_len_dict}
+
+    vcf = VCF(vcf_file)
+    results_list = []
+    for chr_id in chr_len_dict:
+        print(f"Processing {chr_id}")
+        region = f"{chr_id}"
+
+        positions = []
+        genotypes = []
+
+        for variant in vcf(region):
+            positions.append(variant.POS)
+            genotypes.append(variant.genotypes)
+
+        # covert to numpy array and remove phase information (keep only two alleles)
+        genotypes = np.array(genotypes)[:, :, :2]
+        positions = np.array(positions)
+
+        g = allel.GenotypeArray(genotypes)
+        ac = g.count_alleles()
+        pi_values, windows, n_bases, counts = allel.windowed_diversity(
+            positions, ac, size=window_size)
+
+        # Append the results to the list
+        for pi, win, count in zip(pi_values, windows, counts):
+            results_list.append((chr_id, win[0], win[1], count, pi))
+
+    results_df = pd.DataFrame(results_list, columns=[
+                              'CHROM', 'START', 'END', 'SNP_COUNT', 'PI'])
+    results_df = results_df[results_df['SNP_COUNT']
+                            >= min_snp_count].reset_index(drop=True)
+    return results_df
+
+
+def get_genome_pi_statistics(
+    ref_genome_fa,
+    vcf_file,
+    window_size=500,
+    min_snp_count=3,
+    chunk_size=1_000_000,
+):
+    # Genome chromosome lengths
+    genome_dict = read_fasta_by_faidx(ref_genome_fa)
+
+    chr_len_dict = {
+        chr_id: genome_dict[chr_id].len()
+        for chr_id in genome_dict
+    }
+
+    # Keep only chromosomes present in the VCF
+    chr_id_list = get_chr_id_list_from_vcf(vcf_file)
+
+    chr_len_dict = {
+        chr_id: chr_len_dict[chr_id]
+        for chr_id in chr_id_list
+        if chr_id in chr_len_dict
+    }
+
+    # Total number of chunks for tqdm
+    total_chunks = sum(
+        (chr_len + chunk_size - 1) // chunk_size
+        for chr_len in chr_len_dict.values()
+    )
+
+    results_list = []
+    vcf = VCF(vcf_file)
+
+    try:
+        with tqdm(total=total_chunks, desc="Genome pi") as pbar:
+            for chr_id, chr_len in chr_len_dict.items():
+                for chunk_start in range(1, chr_len + 1, chunk_size):
+                    chunk_end = min(
+                        chunk_start + chunk_size - 1,
+                        chr_len,
+                    )
+
+                    region = f"{chr_id}:{chunk_start}-{chunk_end}"
+
+                    positions = []
+                    genotypes = []
+
+                    for variant in vcf(region):
+                        positions.append(variant.POS)
+                        genotypes.append(variant.genotypes)
+
+                    n_variants = len(positions)
+
+                    pbar.set_postfix(
+                        chrom=chr_id,
+                        region=f"{chunk_start}-{chunk_end}",
+                        snps=n_variants,
+                    )
+
+                    # No variants in this chunk
+                    if n_variants == 0:
+                        pbar.update(1)
+                        continue
+
+                    positions = np.asarray(
+                        positions,
+                        dtype=np.int64,
+                    )
+
+                    # cyvcf2 genotype:
+                    # [allele1, allele2, phased]
+                    genotypes = np.asarray(genotypes)[:, :, :2]
+
+                    g = allel.GenotypeArray(genotypes)
+                    ac = g.count_alleles()
+
+                    pi_values, windows, n_bases, counts = (
+                        allel.windowed_diversity(
+                            positions,
+                            ac,
+                            size=window_size,
+                            start=chunk_start,
+                            stop=chunk_end,
+                        )
+                    )
+
+                    # Filter here instead of building all empty / low-SNP windows
+                    keep = counts >= min_snp_count
+
+                    for pi, win, count in zip(
+                        pi_values[keep],
+                        windows[keep],
+                        counts[keep],
+                    ):
+                        results_list.append(
+                            (
+                                chr_id,
+                                int(win[0]),
+                                int(win[1]),
+                                int(count),
+                                float(pi),
+                            )
+                        )
+
+                    pbar.update(1)
+
+    finally:
+        vcf.close()
+
+    results_df = pd.DataFrame(
+        results_list,
+        columns=[
+            "CHROM",
+            "START",
+            "END",
+            "SNP_COUNT",
+            "PI",
+        ],
+    )
+
+    return results_df    
 
 # gene level contexts
 
@@ -512,7 +674,7 @@ def get_gene_family_contexts(gene_contexts_df, gene_family_file):
     return gene_contexts_df
 
 
-def get_recombination_contexts(gene_contexts_df, recombination_file):
+def get_gene_recombination_contexts(gene_contexts_df, recombination_file):
     
     recombination_df = pd.read_csv(recombination_file, sep=",", header=0)
     recombination_df.dropna(inplace=True, ignore_index=True)
@@ -546,3 +708,25 @@ def get_recombination_contexts(gene_contexts_df, recombination_file):
     gene_contexts_df = get_ID_list_contexts(gene_contexts_df, high_recombination_genes, context_name='high_recombination_genes')
 
     return gene_contexts_df
+
+def get_site_recombination_contexts(site_contexts_df, recombination_file, min_CmPerMb=3):
+    
+    recombination_df = pd.read_csv(recombination_file, sep=",", header=0)
+    recombination_df.dropna(inplace=True, ignore_index=True)
+    recombination_df['meanCmPerMb'] = recombination_df['meanCmPerBp'] * 1e6
+
+    p75 = recombination_df[recombination_df['meanCmPerMb'] > min_CmPerMb]['meanCmPerMb'].quantile(0.75)
+
+    recombination_dict = {}
+    for i,r in tqdm(recombination_df.iterrows(), total=len(recombination_df), desc="Building recombination intervals"):
+        recombination_dict.setdefault(r['chr'], InterLap()).add((r['bp'], r['bp']+999, r['meanCmPerMb']))
+
+    site_contexts_df['recombination_rate'] = site_contexts_df.apply(lambda row: np.mean([interval[2] for interval in recombination_dict[row['CHROM']].find((row['POS'], row['POS']))]) if row['CHROM'] in recombination_dict and len(list(recombination_dict[row['CHROM']].find((row['POS'], row['POS'])))) > 0 else np.nan, axis=1)
+
+    site_contexts_df['low_recombination'] = site_contexts_df['recombination_rate'] < min_CmPerMb
+    site_contexts_df['med_recombination'] = (site_contexts_df['recombination_rate'] >= min_CmPerMb) & (site_contexts_df['recombination_rate'] < p75)
+    site_contexts_df['high_recombination'] = site_contexts_df['recombination_rate'] >= p75
+
+    site_contexts_df.drop(columns=['recombination_rate'], inplace=True)
+
+    return site_contexts_df

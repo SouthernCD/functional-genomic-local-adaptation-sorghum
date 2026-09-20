@@ -4,7 +4,6 @@
     "foreground": "genic_2kb",
     "background": "genome",
     "dataset": "genome",
-    "contrast_type": "enrichment",
     "maf_stratify": [
       "all",
       "maf_0.05_0.1",
@@ -19,7 +18,6 @@
     "foreground": "TE",
     "background": "genome",
     "dataset": "genome",
-    "contrast_type": "enrichment",
     "maf_stratify": [
       "all",
       "maf_0.05_0.1",
@@ -34,7 +32,6 @@
     "foreground": "genic_proximal & TE",
     "background": "genic_proximal",
     "dataset": "genome",
-    "contrast_type": "enrichment",
     "maf_stratify": [
       "all",
       "maf_0.05_0.1",
@@ -49,7 +46,6 @@
     "foreground": "(genome - genic_proximal) & TE",
     "background": "genome - genic_proximal",
     "dataset": "genome",
-    "contrast_type": "enrichment",
     "maf_stratify": [
       "all",
       "maf_0.05_0.1",
@@ -64,7 +60,6 @@
     "foreground": "other_intergenic",
     "background": "genome",
     "dataset": "genome",
-    "contrast_type": "enrichment",
     "maf_stratify": [
       "all",
       "maf_0.05_0.1",
@@ -76,10 +71,9 @@
   },
   "upstream_2kb_vs_genic": {
     "id": "upstream_2kb_vs_genic",
-    "foreground": "upstream_2kb",
+    "foreground": "upstream_2kb & genic_2kb",
     "background": "genic_2kb",
     "dataset": "genome",
-    "contrast_type": "enrichment",
     "maf_stratify": [
       "all",
       "maf_0.05_0.1",
@@ -91,10 +85,9 @@
   },
   "five_prime_UTR_vs_genic": {
     "id": "five_prime_UTR_vs_genic",
-    "foreground": "five_prime_UTR",
+    "foreground": "five_prime_UTR & genic_2kb",
     "background": "genic_2kb",
     "dataset": "genome",
-    "contrast_type": "enrichment",
     "maf_stratify": [
       "all",
       "maf_0.05_0.1",
@@ -106,10 +99,9 @@
   },
   "CDS_vs_genic": {
     "id": "CDS_vs_genic",
-    "foreground": "CDS",
+    "foreground": "CDS & genic_2kb",
     "background": "genic_2kb",
     "dataset": "genome",
-    "contrast_type": "enrichment",
     "maf_stratify": [
       "all",
       "maf_0.05_0.1",
@@ -121,10 +113,9 @@
   },
   "intron_vs_genic": {
     "id": "intron_vs_genic",
-    "foreground": "intron",
+    "foreground": "intron & genic_2kb",
     "background": "genic_2kb",
     "dataset": "genome",
-    "contrast_type": "enrichment",
     "maf_stratify": [
       "all",
       "maf_0.05_0.1",
@@ -136,10 +127,9 @@
   },
   "three_prime_UTR_vs_genic": {
     "id": "three_prime_UTR_vs_genic",
-    "foreground": "three_prime_UTR",
+    "foreground": "three_prime_UTR & genic_2kb",
     "background": "genic_2kb",
     "dataset": "genome",
-    "contrast_type": "enrichment",
     "maf_stratify": [
       "all",
       "maf_0.05_0.1",
@@ -151,10 +141,9 @@
   },
   "downstream_2kb_vs_genic": {
     "id": "downstream_2kb_vs_genic",
-    "foreground": "downstream_2kb",
+    "foreground": "downstream_2kb & genic_2kb",
     "background": "genic_2kb",
     "dataset": "genome",
-    "contrast_type": "enrichment",
     "maf_stratify": [
       "all",
       "maf_0.05_0.1",
@@ -169,7 +158,6 @@
     "foreground": "upstream_2kb",
     "background": "genome",
     "dataset": "genome",
-    "contrast_type": "enrichment",
     "maf_stratify": [
       "all",
       "maf_0.05_0.1",
@@ -184,7 +172,6 @@
     "foreground": "five_prime_UTR",
     "background": "genome",
     "dataset": "genome",
-    "contrast_type": "enrichment",
     "maf_stratify": [
       "all",
       "maf_0.05_0.1",
@@ -199,7 +186,6 @@
     "foreground": "CDS",
     "background": "genome",
     "dataset": "genome",
-    "contrast_type": "enrichment",
     "maf_stratify": [
       "all",
       "maf_0.05_0.1",
@@ -214,7 +200,6 @@
     "foreground": "intron",
     "background": "genome",
     "dataset": "genome",
-    "contrast_type": "enrichment",
     "maf_stratify": [
       "all",
       "maf_0.05_0.1",
@@ -229,7 +214,6 @@
     "foreground": "three_prime_UTR",
     "background": "genome",
     "dataset": "genome",
-    "contrast_type": "enrichment",
     "maf_stratify": [
       "all",
       "maf_0.05_0.1",
@@ -244,7 +228,6 @@
     "foreground": "downstream_2kb",
     "background": "genome",
     "dataset": "genome",
-    "contrast_type": "enrichment",
     "maf_stratify": [
       "all",
       "maf_0.05_0.1",
@@ -259,7 +242,6 @@
     "foreground": "`missense_cds_0.01`",
     "background": "cds",
     "dataset": "cds",
-    "contrast_type": "enrichment",
     "maf_stratify": [
       "all",
       "maf_0.01_0.03_cds_0.01",
@@ -276,7 +258,6 @@
     "foreground": "`synonymous_cds_0.01`",
     "background": "cds",
     "dataset": "cds",
-    "contrast_type": "enrichment",
     "maf_stratify": [
       "all",
       "maf_0.01_0.03_cds_0.01",
@@ -293,7 +274,6 @@
     "foreground": "`putative_LoF_cds_0.01`",
     "background": "cds",
     "dataset": "cds",
-    "contrast_type": "enrichment",
     "maf_stratify": [
       "all",
       "maf_0.01_0.03_cds_0.01",
@@ -309,15 +289,13 @@
     "id": "putative_LoF_MAF_0.01_0.03_vs_putative_LoF_MAF_0.03_0.05",
     "foreground": "`putative_LoF_cds_0.01` & `maf_0.01_0.03_cds_0.01`",
     "background": "`putative_LoF_cds_0.01` & `maf_0.03_0.05_cds_0.01`",
-    "dataset": "cds",
-    "contrast_type": "enrichment"
+    "dataset": "cds"
   },
   "ACR_vs_genome": {
     "id": "ACR_vs_genome",
     "foreground": "ACR",
     "background": "genome",
     "dataset": "genome",
-    "contrast_type": "enrichment",
     "maf_stratify": [
       "all",
       "maf_0.05_0.1",
@@ -332,7 +310,6 @@
     "foreground": "ACR & genic_proximal",
     "background": "genic_proximal",
     "dataset": "genome",
-    "contrast_type": "enrichment",
     "maf_stratify": [
       "all",
       "maf_0.05_0.1",
@@ -347,7 +324,6 @@
     "foreground": "(genome - genic_proximal) & ACR",
     "background": "genome - genic_proximal",
     "dataset": "genome",
-    "contrast_type": "enrichment",
     "maf_stratify": [
       "all",
       "maf_0.05_0.1",
@@ -356,13 +332,12 @@
       "maf_0.3_0.4",
       "maf_0.4_0.5"
     ]
-  },  
+  },
   "UMR_vs_genome": {
     "id": "UMR_vs_genome",
     "foreground": "UMR",
     "background": "genome",
     "dataset": "genome",
-    "contrast_type": "enrichment",
     "maf_stratify": [
       "all",
       "maf_0.05_0.1",
@@ -377,7 +352,6 @@
     "foreground": "UMR & genic_proximal",
     "background": "genic_proximal",
     "dataset": "genome",
-    "contrast_type": "enrichment",
     "maf_stratify": [
       "all",
       "maf_0.05_0.1",
@@ -392,7 +366,6 @@
     "foreground": "(genome - genic_proximal) & UMR",
     "background": "genome - genic_proximal",
     "dataset": "genome",
-    "contrast_type": "enrichment",
     "maf_stratify": [
       "all",
       "maf_0.05_0.1",
@@ -401,13 +374,12 @@
       "maf_0.3_0.4",
       "maf_0.4_0.5"
     ]
-  },  
+  },
   "riboSNitch_vs_gene_body": {
     "id": "riboSNitch_vs_gene_body",
-    "foreground": "riboSNitch",
+    "foreground": "riboSNitch & gene_body",
     "background": "gene_body",
     "dataset": "genome",
-    "contrast_type": "enrichment",
     "maf_stratify": [
       "all",
       "maf_0.05_0.1",
@@ -431,5 +403,198 @@
       "maf_0.3_0.4",
       "maf_0.4_0.5"
     ]
+  },
+  "low_pi": {
+    "id": "low_pi",
+    "foreground": "low_pi & genic_15kb",
+    "background": "genic_15kb",
+    "dataset": "genome",
+    "maf_stratify": [
+      "all",
+      "maf_0.05_0.1",
+      "maf_0.1_0.2",
+      "maf_0.2_0.3",
+      "maf_0.3_0.4",
+      "maf_0.4_0.5"
+    ]
+  },
+  "med_pi": {
+    "id": "med_pi",
+    "foreground": "med_pi & genic_15kb",
+    "background": "genic_15kb",
+    "dataset": "genome",
+    "maf_stratify": [
+      "all",
+      "maf_0.05_0.1",
+      "maf_0.1_0.2",
+      "maf_0.2_0.3",
+      "maf_0.3_0.4",
+      "maf_0.4_0.5"
+    ]
+  },
+  "high_pi": {
+    "id": "high_pi",
+    "foreground": "high_pi & genic_15kb",
+    "background": "genic_15kb",
+    "dataset": "genome",
+    "maf_stratify": [
+      "all",
+      "maf_0.05_0.1",
+      "maf_0.1_0.2",
+      "maf_0.2_0.3",
+      "maf_0.3_0.4",
+      "maf_0.4_0.5"
+    ]
+  },
+  "non_CEs": {
+    "id": "non_CEs",
+    "foreground": "non_CEs & genic_15kb",
+    "background": "genic_15kb",
+    "dataset": "genome",
+    "maf_stratify": [
+      "all",
+      "maf_0.05_0.1",
+      "maf_0.1_0.2",
+      "maf_0.2_0.3",
+      "maf_0.3_0.4",
+      "maf_0.4_0.5"
+    ]
+  },
+  "conserved_sites": {
+    "id": "conserved_sites",
+    "foreground": "conserved_sites & genic_15kb",
+    "background": "genic_15kb",
+    "dataset": "genome",
+    "maf_stratify": [
+      "all",
+      "maf_0.05_0.1",
+      "maf_0.1_0.2",
+      "maf_0.2_0.3",
+      "maf_0.3_0.4",
+      "maf_0.4_0.5"
+    ]
+  },
+  "neutral_sites": {
+    "id": "neutral_sites",
+    "foreground": "neutral_sites & genic_15kb",
+    "background": "genic_15kb",
+    "dataset": "genome",
+    "maf_stratify": [
+      "all",
+      "maf_0.05_0.1",
+      "maf_0.1_0.2",
+      "maf_0.2_0.3",
+      "maf_0.3_0.4",
+      "maf_0.4_0.5"
+    ]
+  },
+  "accelerated_sites": {
+    "id": "accelerated_sites",
+    "foreground": "accelerated_sites & genic_15kb",
+    "background": "genic_15kb",
+    "dataset": "genome",
+    "maf_stratify": [
+      "all",
+      "maf_0.05_0.1",
+      "maf_0.1_0.2",
+      "maf_0.2_0.3",
+      "maf_0.3_0.4",
+      "maf_0.4_0.5"
+    ]
+  },
+  "maf_0.05_0.1": {
+    "id": "maf_0.05_0.1",
+    "foreground": "`maf_0.05_0.1` & genic_15kb",
+    "background": "genic_15kb",
+    "dataset": "genome"
+  },
+  "maf_0.1_0.2": {
+    "id": "maf_0.1_0.2",
+    "foreground": "`maf_0.1_0.2` & genic_15kb",
+    "background": "genic_15kb",
+    "dataset": "genome"
+  },
+  "maf_0.2_0.3": {
+    "id": "maf_0.2_0.3",
+    "foreground": "`maf_0.2_0.3` & genic_15kb",
+    "background": "genic_15kb",
+    "dataset": "genome"
+  },
+  "maf_0.3_0.4": {
+    "id": "maf_0.3_0.4",
+    "foreground": "`maf_0.3_0.4` & genic_15kb",
+    "background": "genic_15kb",
+    "dataset": "genome"
+  },
+  "maf_0.4_0.5": {
+    "id": "maf_0.4_0.5",
+    "foreground": "`maf_0.4_0.5` & genic_15kb",
+    "background": "genic_15kb",
+    "dataset": "genome"
+  },
+  "flowering_time_genes": {
+    "id": "flowering_time_genes",
+    "target": "flowering_time_genes",
+    "dataset": "gene"
+  },
+  "no_expression_genes": {
+    "id": "no_expression_genes",
+    "target": "no_expression_genes",
+    "dataset": "gene"
+  },
+  "high_variance_genes": {
+    "id": "high_variance_genes",
+    "target": "high_variance_genes",
+    "dataset": "gene"
+  },
+  "stably_expressed_genes": {
+    "id": "stably_expressed_genes",
+    "target": "stably_expressed_genes",
+    "dataset": "gene"
+  },
+  "non_module_genes": {
+    "id": "non_module_genes",
+    "target": "non_module_genes",
+    "dataset": "gene"
+  },
+  "module_genes": {
+    "id": "module_genes",
+    "target": "module_genes",
+    "dataset": "gene"
+  },
+  "module_hub_genes": {
+    "id": "module_hub_genes",
+    "target": "module_hub_genes",
+    "dataset": "gene"
+  },
+  "orphan_genes": {
+    "id": "orphan_genes",
+    "target": "orphan_genes",
+    "dataset": "gene"
+  },
+  "multi_copy_genes": {
+    "id": "multi_copy_genes",
+    "target": "multi_copy_genes",
+    "dataset": "gene"
+  },
+  "single_copy_genes": {
+    "id": "single_copy_genes",
+    "target": "single_copy_genes",
+    "dataset": "gene"
+  },
+  "low_recombination_genes": {
+    "id": "low_recombination_genes",
+    "target": "low_recombination_genes",
+    "dataset": "gene"
+  },
+  "med_recombination_genes": {
+    "id": "med_recombination_genes",
+    "target": "med_recombination_genes",
+    "dataset": "gene"
+  },
+  "high_recombination_genes": {
+    "id": "high_recombination_genes",
+    "target": "high_recombination_genes",
+    "dataset": "gene"
   }
 }
