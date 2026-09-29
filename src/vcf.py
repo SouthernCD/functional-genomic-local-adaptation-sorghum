@@ -309,6 +309,7 @@ def get_genotype_matrix_from_vcf(vcf_file, chr_id=None, start=None, end=None):
 
     return genotype_matrix
 
+
 def get_genotype_matrix_from_vcf_by_pos_list(vcf_file, chr_id, pos_list, *, vcf_reader=None):
     """
     Get genotype matrix from a VCF file by position list.
@@ -338,3 +339,28 @@ def get_genotype_matrix_from_vcf_by_pos_list(vcf_file, chr_id, pos_list, *, vcf_
     finally:
         if owns_reader:
             vcf.close()
+
+
+def get_genotype_df_from_vcf_by_site_df(vcf_file, site_df):
+    """
+    Get genotype DataFrame from a VCF file by site DataFrame.
+    site_df: a DataFrame with columns 'CHROM' and 'POS' specifying the sites to extract genotypes for.
+    """
+    sample_id_list = get_sample_list_from_vcf(vcf_file)
+    chr_id_list = site_df['CHROM'].unique().tolist()
+    genotype_df = pd.DataFrame(columns=sample_id_list)
+    for chr_id in chr_id_list:
+        pos_list = site_df.loc[site_df['CHROM'] == chr_id, 'POS'].tolist()
+        id_list = site_df.loc[site_df['CHROM'] == chr_id, 'ID'].tolist()
+        genotype_matrix, chr_id, used_pos_list = get_genotype_matrix_from_vcf_by_pos_list(vcf_file, chr_id, pos_list)
+        used_id_list = [id_list[pos_list.index(pos)] for pos in used_pos_list]
+
+        genotype_df = pd.concat([
+            genotype_df,
+            pd.DataFrame(
+                genotype_matrix,
+                columns=sample_id_list,
+                index=used_id_list
+            )
+        ])
+    return genotype_df

@@ -21,12 +21,17 @@ from pathlib import Path
 import allel
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+import matplotlib.ticker as ticker
+from matplotlib.colors import LinearSegmentedColormap
 from cyvcf2 import VCF
 from interlap import InterLap
 
-from .feature import get_gene_range_df
+from .feature import get_gene_range_df, read_gff_file
 from .ld import calculate_ld_matrix
 from .utils import multiprocess_running
+from .plot import set_plot_style
 
 
 DEFAULT_CONFIG = {
@@ -279,7 +284,6 @@ def load_genotypes(vcf_file, chr_id, range_list):
     return genotypes, positions
 
 
-
 def load_range_genotypes_and_convert(
     vcf_file,
     chr_id,
@@ -334,7 +338,6 @@ def get_pi_values(
     )
 
     return counts, pi_values, windows
-
 
 
 def get_region_bin_pi(
@@ -454,6 +457,54 @@ def get_bin_pi_for_many_pos_flank_regions(
 # Gene information
 # ---------------------------------------------------------------------
 
+def _get_gene_utr_lengths(gff_file, gene_ids):
+    """Return 5' and 3' UTR lengths using the first transcript of each gene.
+
+    This follows the original intragene notebook definition: the 5' UTR is
+    the distance from TSS to the first CDS boundary, and the 3' UTR is the
+    distance from the last CDS boundary to TTS. Genes without a usable first
+    transcript/CDS are returned as NaN.
+    """
+    gene_dict = read_gff_file(gff_file).get("gene", {})
+    utr_5 = {}
+    utr_3 = {}
+
+    for gene_id in gene_ids:
+        gene = gene_dict.get(gene_id)
+        if gene is None:
+            utr_5[gene_id] = np.nan
+            utr_3[gene_id] = np.nan
+            continue
+
+        transcripts = getattr(gene, "sub_features", None) or []
+        if not transcripts:
+            utr_5[gene_id] = np.nan
+            utr_3[gene_id] = np.nan
+            continue
+
+        transcript = transcripts[0]
+        sub_features = getattr(transcript, "sub_features", None) or []
+        cds_features = [feature for feature in sub_features if feature.type == "CDS"]
+        if not cds_features:
+            utr_5[gene_id] = np.nan
+            utr_3[gene_id] = np.nan
+            continue
+
+        if gene.strand == "+":
+            tss, tts = gene.start, gene.end
+            cds_start = min(feature.start for feature in cds_features)
+            cds_end = max(feature.end for feature in cds_features)
+        else:
+            tss, tts = gene.end, gene.start
+            cds_start = max(feature.end for feature in cds_features)
+            cds_end = min(feature.start for feature in cds_features)
+
+        utr_5[gene_id] = abs(cds_start - tss)
+        utr_3[gene_id] = abs(tts - cds_end)
+
+    return pd.Series(utr_5, dtype=float), pd.Series(utr_3, dtype=float)
+
+
 def build_gene_info(
     gff_file,
     output_file=None,
@@ -462,9 +513,10 @@ def build_gene_info(
 ):
     """Build the gene table shared by all profile databases.
 
-    Gene coordinates are loaded through feature.get_gene_range_df(), so GFF
-    parsing stays centralized in feature.py. TSS/TTS are then derived from
-    gene START/END according to transcription strand.
+    Gene coordinates are loaded through feature.get_gene_range_df(), while
+    UTR lengths reuse feature.read_gff_file() and the first transcript/CDS
+    structure used by the original intragene notebook. TSS/TTS are derived
+    from gene START/END according to transcription strand.
     """
     if output_file is not None:
         output_file = Path(output_file)
@@ -472,7 +524,6 @@ def build_gene_info(
             return pd.read_hdf(output_file, key="gene_info")
 
     gene_range_df = get_gene_range_df(gff_file).copy()
-
     required_columns = {"GENE", "CHROM", "START", "END", "STRAND"}
     missing_columns = required_columns - set(gene_range_df.columns)
     if missing_columns:
@@ -484,16 +535,15 @@ def build_gene_info(
     gene_range_df = gene_range_df[
         gene_range_df["STRAND"].isin(["+", "-"])
     ].copy()
-
     if chromosome_filter is not None:
         chromosome_filter = set(chromosome_filter)
         gene_range_df = gene_range_df[
             gene_range_df["CHROM"].isin(chromosome_filter)
         ].copy()
 
+    gene_range_df["GENE"] = gene_range_df["GENE"].astype(str)
     gene_range_df["START"] = gene_range_df["START"].astype(int)
     gene_range_df["END"] = gene_range_df["END"].astype(int)
-
     plus_strand = gene_range_df["STRAND"] == "+"
     gene_range_df["TSS"] = np.where(
         plus_strand, gene_range_df["START"], gene_range_df["END"]
@@ -504,6 +554,12 @@ def build_gene_info(
     gene_range_df["gene_length"] = (
         gene_range_df["END"] - gene_range_df["START"]
     ).abs() + 1
+
+    utr_5, utr_3 = _get_gene_utr_lengths(
+        gff_file, gene_range_df["GENE"].tolist()
+    )
+    gene_range_df["5utr_length"] = gene_range_df["GENE"].map(utr_5)
+    gene_range_df["3utr_length"] = gene_range_df["GENE"].map(utr_3)
 
     gene_info = gene_range_df.rename(
         columns={
@@ -516,7 +572,10 @@ def build_gene_info(
     ).set_index("gene_id")
     gene_info.index.name = "gene_id"
     gene_info = gene_info[
-        ["chrom", "strand", "start", "end", "TSS", "TTS", "gene_length"]
+        [
+            "chrom", "strand", "start", "end", "TSS", "TTS",
+            "gene_length", "5utr_length", "3utr_length",
+        ]
     ]
 
     if output_file is not None:
@@ -529,6 +588,7 @@ def build_gene_info(
         )
 
     return gene_info
+
 
 def make_anchor_table(gene_info, anchor):
     """Create CHROM/POS/STRAND input for a TSS or TTS calculation."""
@@ -829,7 +889,8 @@ def get_region_bin_ld(
     min_pairs = int(min_pairs)
 
     if min(flank, step, bin_size, min_pairs) < 1:
-        raise ValueError("flank, step, bin_size and min_pairs must all be >= 1")
+        raise ValueError(
+            "flank, step, bin_size and min_pairs must all be >= 1")
 
     relative_positions = _relative_window_positions(flank, step, bin_size)
     scan_windows = [
@@ -844,7 +905,8 @@ def get_region_bin_ld(
         anchor_pos, strand, reference_relative_position, bin_size
     )
 
-    region_start = min(reference_start, min(start for start, _ in scan_windows))
+    region_start = min(reference_start, min(
+        start for start, _ in scan_windows))
     region_end = max(reference_end, max(end for _, end in scan_windows))
     region_sites = _load_variant_sites(
         vcf_file, chr_id, region_start, region_end
@@ -1394,11 +1456,856 @@ def build_gene_profile_database(
     return outputs
 
 
-if __name__ == "__main__":
-    # Example: build all gene-centered profiles with the default settings
-    # (flank=10 kb, bin_size=500 bp, step=10 bp).
-    project_dir = Path("/path/to/project")
+# ---------------------------------------------------------------------
+# Plotting
+# ---------------------------------------------------------------------
+PLOT_TRACK_ALIASES = {
+    "qre": "QRE",
+    "pi": "pi",
+    "acr": "ACR",
+    "acrs": "ACR",
+    "umr": "UMR",
+    "umrs": "UMR",
+    "ld": "LD",
+    "high_effect_index": "high_effect_index",
+}
 
+
+def _normalize_plot_track(track):
+    key = str(track).strip().lower()
+    if key not in PLOT_TRACK_ALIASES:
+        raise ValueError(
+            f"Unknown plot track: {track}. Supported tracks are "
+            "'pi', 'ACR', 'UMR', 'LD' and 'high_effect_index'."
+        )
+    return PLOT_TRACK_ALIASES[key]
+
+
+def _get_plot_profile_path(profile_db, env_name, track, anchor):
+    """Resolve one profile file from build_gene_profile_database() output."""
+    anchor = anchor.upper()
+    if anchor not in {"TSS", "TTS"}:
+        raise ValueError("anchor must be 'TSS' or 'TTS'")
+
+    if track == "QRE":
+        try:
+            return Path(profile_db["qre"][env_name][anchor])
+        except KeyError as exc:
+            raise KeyError(
+                f"QRE profile for environment '{env_name}' and {anchor} is "
+                "not present in profile_db"
+            ) from exc
+
+    output_key = {"pi": "pi", "ACR": "acr", "UMR": "umr", "LD": "ld"}[track]
+    try:
+        return Path(profile_db[output_key][anchor])
+    except KeyError as exc:
+        raise KeyError(
+            f"{track} profile for {anchor} is not present in profile_db"
+        ) from exc
+
+
+def _load_gene_info_from_profile_db(profile_db):
+    if "gene_info" not in profile_db:
+        raise KeyError("profile_db must contain the 'gene_info' output")
+    return pd.read_hdf(profile_db["gene_info"], key="gene_info")
+
+
+def _prepare_plot_gene_sets(
+    magma_gwas_df_h5,
+    gene_universe,
+    top_gene_quantile=0.05,
+    random_num=1000,
+    seed=42,
+):
+    """Select top MAGMA genes and matched-size random sets from all other genes."""
+    top_gene_quantile = float(top_gene_quantile)
+    random_num = int(random_num)
+    if not 0 < top_gene_quantile < 1:
+        raise ValueError("top_gene_quantile must be between 0 and 1")
+    if random_num < 1:
+        raise ValueError("random_num must be >= 1")
+
+    magma_df = pd.read_hdf(magma_gwas_df_h5, key="df")
+    required = {"ID", "P_VALUE"}
+    missing = required - set(magma_df.columns)
+    if missing:
+        raise ValueError(
+            "MAGMA GWAS dataframe is missing required columns: "
+            + ", ".join(sorted(missing))
+        )
+
+    magma_df = magma_df[["ID", "P_VALUE"]].dropna().copy()
+    magma_df["ID"] = magma_df["ID"].astype(str)
+    magma_df = magma_df.sort_values(
+        "P_VALUE", kind="stable").drop_duplicates("ID")
+
+    gene_universe = pd.Index(gene_universe).astype(str)
+    magma_df = magma_df[magma_df["ID"].isin(gene_universe)].copy()
+    if magma_df.empty:
+        raise ValueError("No MAGMA genes overlap the gene profile database")
+
+    top_gene_num = max(1, int(len(magma_df) * top_gene_quantile))
+    top_genes = magma_df.head(top_gene_num)["ID"].to_numpy()
+    background_genes = magma_df.loc[
+        ~magma_df["ID"].isin(top_genes), "ID"
+    ].to_numpy()
+
+    if len(background_genes) < top_gene_num:
+        raise ValueError(
+            f"Only {len(background_genes)} non-top genes are available, but "
+            f"each random set requires {top_gene_num} genes"
+        )
+
+    rng = np.random.default_rng(seed)
+    random_indices = np.empty((random_num, top_gene_num), dtype=np.int32)
+    for i in range(random_num):
+        random_indices[i] = rng.choice(
+            len(background_genes), size=top_gene_num, replace=False
+        )
+
+    return {
+        "top_genes": top_genes,
+        "background_genes": background_genes,
+        "random_indices": random_indices,
+        "top_gene_num": top_gene_num,
+        "eligible_gene_num": len(magma_df),
+    }
+
+
+def _nanmean_axis1(values):
+    finite = np.isfinite(values)
+    counts = finite.sum(axis=1)
+    sums = np.nansum(values, axis=1)
+    return np.divide(
+        sums,
+        counts,
+        out=np.full(sums.shape, np.nan, dtype=float),
+        where=counts > 0,
+    )
+
+
+def _summarize_profile_for_plot(
+    profile_file,
+    gene_sets,
+    plot_xlim,
+    ci_percentiles=(5, 95),
+    random_batch_size=8,
+):
+    """Summarize one gene x position profile for top and random gene sets."""
+    profile_df, metadata = read_profile(profile_file)
+    profile_df.index = profile_df.index.astype(str)
+    profile_df.columns = pd.Index(
+        [int(x) for x in profile_df.columns], name="relative_position"
+    )
+
+    bin_size = int(metadata.get("bin_size", 500))
+    x = profile_df.columns.to_numpy(dtype=float) + bin_size / 2
+    keep = (x >= plot_xlim[0]) & (x <= plot_xlim[1])
+    if not keep.any():
+        raise ValueError(
+            f"No profile windows in {profile_file} overlap plot_xlim={plot_xlim}"
+        )
+
+    profile_df = profile_df.loc[:, keep]
+    x = x[keep]
+    top_genes = gene_sets["top_genes"]
+    background_genes = gene_sets["background_genes"]
+
+    missing_top = pd.Index(top_genes).difference(profile_df.index)
+    missing_background = pd.Index(
+        background_genes).difference(profile_df.index)
+    if len(missing_top) or len(missing_background):
+        raise ValueError(
+            f"Profile {profile_file} does not contain the complete MAGMA gene "
+            f"universe ({len(missing_top)} top and {len(missing_background)} "
+            "background genes missing)"
+        )
+
+    top_values = profile_df.loc[top_genes].to_numpy(dtype=float, copy=False)
+    top_mean = _nanmean_axis1(top_values.T)
+
+    background_values = profile_df.loc[background_genes].to_numpy(
+        dtype=float, copy=False
+    )
+    random_indices = gene_sets["random_indices"]
+    random_num = len(random_indices)
+    random_batch_size = max(1, int(random_batch_size))
+    random_means = np.full((random_num, len(x)), np.nan, dtype=float)
+
+    for start in range(0, random_num, random_batch_size):
+        end = min(start + random_batch_size, random_num)
+        block = background_values[random_indices[start:end]]
+        finite = np.isfinite(block)
+        counts = finite.sum(axis=1)
+        sums = np.nansum(block, axis=1)
+        random_means[start:end] = np.divide(
+            sums,
+            counts,
+            out=np.full(sums.shape, np.nan, dtype=float),
+            where=counts > 0,
+        )
+
+    with np.errstate(invalid="ignore"):
+        random_low = np.nanpercentile(random_means, ci_percentiles[0], axis=0)
+        random_high = np.nanpercentile(random_means, ci_percentiles[1], axis=0)
+
+    return {
+        "x": x,
+        "top_mean": top_mean,
+        "random_low": random_low,
+        "random_high": random_high,
+        "metadata": metadata,
+    }
+
+
+def load_env_track_data(
+    env_name,
+    magma_gwas_df_h5,
+    config,
+    top_gene_quantile=0.05,
+    random_num=1000,
+    seed=42,
+    track_order=None,
+):
+    """Load and summarize the profile database for one GEA environment."""
+    profile_db = config["profile_db"]
+    plot_xlim = tuple(config.get("plot_xlim", (-5500, 5500)))
+    ci_percentiles = tuple(config.get("ci_percentiles", (5, 95)))
+    random_batch_size = config.get("random_batch_size", 8)
+
+    if track_order is None:
+        track_order = config.get("track_order", ("pi", "ACR", "UMR", "LD"))
+    track_order = [_normalize_plot_track(track) for track in track_order]
+    if "QRE" in track_order:
+        raise ValueError(
+            "QRE is plotted automatically and must not be in track_order")
+    if len(track_order) != len(set(track_order)):
+        raise ValueError("track_order contains duplicate tracks")
+
+    gene_info = _load_gene_info_from_profile_db(profile_db)
+    gene_info.index = gene_info.index.astype(str)
+    gene_sets = _prepare_plot_gene_sets(
+        magma_gwas_df_h5,
+        gene_info.index,
+        top_gene_quantile=top_gene_quantile,
+        random_num=random_num,
+        seed=seed,
+    )
+
+    data = {"gene_info": gene_info, "gene_sets": gene_sets}
+    database_tracks = ["QRE"] + [
+        track for track in track_order if track != "high_effect_index"
+    ]
+
+    for track in database_tracks:
+        data[track] = {}
+        for anchor in ("TSS", "TTS"):
+            profile_file = _get_plot_profile_path(
+                profile_db, env_name, track, anchor
+            )
+            data[track][anchor] = _summarize_profile_for_plot(
+                profile_file,
+                gene_sets,
+                plot_xlim=plot_xlim,
+                ci_percentiles=ci_percentiles,
+                random_batch_size=random_batch_size,
+            )
+
+    return data, track_order
+
+
+def _set_left_track_label(ax, label, config):
+    ax.set_ylabel(
+        label,
+        fontsize=config.get("label_fontsize", 11),
+        rotation=config.get("left_track_label_rotation", 90),
+        ha=config.get("left_track_label_ha", "center"),
+        va=config.get("left_track_label_va", "center"),
+    )
+    ax.yaxis.set_label_coords(config.get("left_track_label_x", -0.15), 0.5)
+
+
+def _hide_top_right_bottom_spines(ax):
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.spines["bottom"].set_visible(False)
+
+
+def _hide_right_panel_y_axis(ax):
+    ax.spines["left"].set_visible(False)
+    ax.tick_params(
+        axis="y", which="both", left=False, right=False,
+        labelleft=False, labelright=False,
+    )
+
+
+def _hide_x_axis(ax):
+    ax.tick_params(axis="x", which="both", bottom=False,
+                   top=False, labelbottom=False)
+
+
+def _add_site_line(ax, site_label, config):
+    ax.axvline(
+        0,
+        color=config.get("site_line_color", "red"),
+        linestyle=config.get("site_line_style", "--"),
+        linewidth=config.get("site_line_width", 1),
+        label=site_label,
+    )
+
+
+def _set_site_xticks(ax, site_label, config):
+    ax.tick_params(axis="x", which="both", bottom=True,
+                   top=False, labelbottom=True)
+    ax.xaxis.set_major_locator(
+        ticker.MultipleLocator(config.get("x_tick_interval", 2500))
+    )
+    ticks = ax.get_xticks()
+    labels = [site_label if np.isclose(
+        tick, 0) else str(int(tick)) for tick in ticks]
+    ax.set_xticks(ticks)
+    ax.set_xticklabels(labels)
+
+
+def _add_scale_bar(ax, config):
+    xlim = config.get("plot_xlim", (-5500, 5500))
+    bar_frac = config.get("scale_bp", 500) / (xlim[1] - xlim[0])
+    x1 = config.get("scale_bar_right", 0.72)
+    x0 = x1 - bar_frac
+    y = config.get("scale_bar_y", 0.95)
+    ax.plot(
+        [x0, x1], [y, y], transform=ax.transAxes,
+        color="black", linewidth=config.get("scale_bar_linewidth", 2),
+        solid_capstyle="butt", clip_on=False,
+    )
+    ax.text(
+        (x0 + x1) / 2,
+        y + config.get("scale_bar_label_offset", 0.025),
+        config.get("scale_bar_label", "500-bp (10-bp step)"),
+        transform=ax.transAxes,
+        ha="center", va="bottom",
+        fontsize=config.get("scale_fontsize", 9),
+        clip_on=False,
+    )
+
+
+DEFAULT_LENGTH_BAR_CMAP = LinearSegmentedColormap.from_list(
+    "length_bar_cmap", ["#FFFFFF", "#5580B0"]
+)
+
+
+def _plot_length_bar(
+    fig,
+    anchor_ax,
+    gene_info_df,
+    feature_col,
+    label,
+    y,
+    invert_x,
+    config,
+):
+    """Plot the fraction of top genes whose feature length reaches each bp."""
+    if feature_col not in gene_info_df.columns:
+        raise ValueError(
+            f"gene_info is missing '{feature_col}'. Rebuild gene_info.h5 "
+            "with the current gene_profiles.py before plotting."
+        )
+
+    values = pd.to_numeric(gene_info_df[feature_col], errors="coerce")
+    values = values[np.isfinite(values)].to_numpy(dtype=float)
+    if len(values) == 0:
+        return
+
+    length_bar_max = int(config.get("length_bar_max", 5500))
+    site_x = anchor_ax.transData.transform((0, 0))[0]
+    site_x = fig.transFigure.inverted().transform((site_x, 0))[0]
+    target_x = -length_bar_max if invert_x else length_bar_max
+    bar_end = anchor_ax.transData.transform((target_x, 0))[0]
+    bar_end = fig.transFigure.inverted().transform((bar_end, 0))[0]
+    bar_length = abs(bar_end - site_x)
+
+    lengths = np.arange(length_bar_max)
+    dist = (values[:, None] >= lengths).mean(axis=0)
+    bar_y = float(y)
+    bar_height = config.get("length_bar_height", 0.02)
+    if invert_x:
+        ax_bar = fig.add_axes([site_x - bar_length, bar_y, bar_length, bar_height])
+    else:
+        ax_bar = fig.add_axes([site_x, bar_y, bar_length, bar_height])
+
+    ax_bar.set_axis_off()
+    ax_bar.imshow(
+        dist.reshape(1, -1),
+        aspect="auto",
+        cmap=config.get("length_bar_cmap", DEFAULT_LENGTH_BAR_CMAP),
+        extent=[0, length_bar_max, 0, 1],
+        vmin=0,
+        vmax=1,
+    )
+    label_offset = config.get("length_bar_label_offset_bp", 200)
+    ax_bar.text(
+        -label_offset,
+        0.6,
+        label,
+        va="center",
+        ha="left" if invert_x else "right",
+        fontsize=config.get("bar_label_fontsize", 10),
+        clip_on=False,
+    )
+    median_target = config.get("length_bar_median_target", 0.5)
+    median_idx = int(np.argmin(np.abs(dist - median_target)))
+    ax_bar.axvline(
+        median_idx,
+        color="black",
+        linewidth=config.get("length_bar_median_linewidth", 1),
+    )
+    if invert_x:
+        ax_bar.invert_xaxis()
+
+
+def _add_gene_utr_bars(fig, qre_tss_ax, qre_tts_ax, data, config):
+    """Add gene-length and 5'/3' UTR distributions for the top GEA genes."""
+    if not config.get("show_length_bars", True):
+        return
+
+    top_genes = pd.Index(data["gene_sets"]["top_genes"]).astype(str)
+    gene_info = data["gene_info"].copy()
+    gene_info.index = gene_info.index.astype(str)
+    top_gene_info = gene_info.reindex(top_genes)
+
+    _plot_length_bar(
+        fig, qre_tss_ax, top_gene_info,
+        feature_col="gene_length", label="Gene length",
+        y=config.get("gene_bar_y", 0.65), invert_x=False, config=config,
+    )
+    _plot_length_bar(
+        fig, qre_tss_ax, top_gene_info,
+        feature_col="5utr_length", label="5' UTR length",
+        y=config.get("utr_bar_y", 0.61), invert_x=False, config=config,
+    )
+    _plot_length_bar(
+        fig, qre_tts_ax, top_gene_info,
+        feature_col="gene_length", label="Gene length",
+        y=config.get("gene_bar_y", 0.65), invert_x=True, config=config,
+    )
+    _plot_length_bar(
+        fig, qre_tts_ax, top_gene_info,
+        feature_col="3utr_length", label="3' UTR length",
+        y=config.get("utr_bar_y", 0.61), invert_x=True, config=config,
+    )
+
+
+def _plot_profile_track(
+    ax_left,
+    ax_right,
+    track_data,
+    label,
+    config,
+    is_bottom_track=False,
+    show_gene_set_labels=False,
+):
+    main_color = config.get("main_color", "#5580B0")
+    random_color = config.get("random_color", "gray")
+    random_alpha = config.get("random_alpha", 0.2)
+
+    for ax, anchor in ((ax_left, "TSS"), (ax_right, "TTS")):
+        summary = track_data[anchor]
+        ax.plot(summary["x"], summary["top_mean"], color=main_color)
+        ax.fill_between(
+            summary["x"], summary["random_low"], summary["random_high"],
+            color=random_color, alpha=random_alpha, edgecolor="none",
+        )
+        _add_site_line(ax, anchor, config)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+
+    _set_left_track_label(ax_left, label, config)
+    _hide_right_panel_y_axis(ax_right)
+
+    if show_gene_set_labels:
+        top_pct = config["_top_gene_quantile"] * 100
+        random_num = config["_random_num"]
+        ci_low, ci_high = config.get("ci_percentiles", (5, 95))
+        ax_left.text(
+            0.04, 0.90, f"Top {top_pct:g}% GEA genes",
+            transform=ax_left.transAxes, ha="left", va="top",
+            fontsize=config.get("legend_fontsize", 10), color=main_color,
+        )
+        ax_left.text(
+            0.04, 0.80,
+            f"Random gene sets\n({ci_low}–{ci_high}%)",
+            transform=ax_left.transAxes, ha="left", va="top",
+            fontsize=config.get("legend_fontsize", 10), color=random_color,
+        )
+
+    if is_bottom_track:
+        _set_site_xticks(ax_left, "TSS", config)
+        _set_site_xticks(ax_right, "TTS", config)
+    else:
+        ax_left.spines["bottom"].set_visible(False)
+        ax_right.spines["bottom"].set_visible(False)
+        _hide_x_axis(ax_left)
+        _hide_x_axis(ax_right)
+
+
+def _qre_label(env_desc):
+    if "striga" in env_desc.lower():
+        return "Relative GEA signal for\n" + r"$\mathit{Striga}$ HS score"
+    return f"Relative GEA signal for\n{env_desc.lower()}"
+
+
+def _load_high_effect_index(config):
+    if "high_effect_index_csv" not in config:
+        raise KeyError(
+            "high_effect_index_csv is required when high_effect_index is plotted"
+        )
+    df = pd.read_csv(config["high_effect_index_csv"]).sort_values("center")
+    xlim = config.get("plot_xlim", (-5500, 5500))
+    return df[df["center"].between(*xlim)].copy()
+
+
+def _plot_high_effect_index_track(ax_left, ax_right, high_effect_df, config, is_bottom_track=False):
+    ax_left.plot(
+        high_effect_df["center"],
+        high_effect_df["relative_probability_index"],
+        color=config.get("high_effect_color",
+                         config.get("main_color", "#5580B0")),
+    )
+    ax_left.axhline(
+        1,
+        color=config.get("baseline_color", "gray"),
+        linestyle=config.get("baseline_line_style", ":"),
+        linewidth=config.get("baseline_line_width", 1),
+    )
+    _add_site_line(ax_left, "TSS", config)
+    _add_site_line(ax_right, "TTS", config)
+    _set_left_track_label(ax_left, "High-effect\nindex", config)
+    _hide_right_panel_y_axis(ax_right)
+
+    if config.get("show_high_effect_annotation", True):
+        ax_left.figure.text(
+            *config.get("high_effect_annotation_fig_xy", (0.35, 0.19)),
+            config.get(
+                "high_effect_annotation_text",
+                "Frequency of high impact CRISPR mutations",
+            ),
+            fontsize=config.get("high_effect_annotation_fontsize", 9),
+            color=config.get("high_effect_annotation_color", "#000000"),
+            ha=config.get("high_effect_annotation_ha", "left"),
+            va=config.get("high_effect_annotation_va", "center"),
+        )
+
+    for ax in (ax_left, ax_right):
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+
+    if is_bottom_track:
+        _set_site_xticks(ax_left, "TSS", config)
+        _set_site_xticks(ax_right, "TTS", config)
+    else:
+        ax_left.spines["bottom"].set_visible(False)
+        ax_right.spines["bottom"].set_visible(False)
+        _hide_x_axis(ax_left)
+        _hide_x_axis(ax_right)
+
+
+DEFAULT_PLOT_CONFIG = {
+    # ------------------------------------------------------------
+    # Profile database
+    # ------------------------------------------------------------
+    # build_gene_profile_database() 的返回值
+    # "profile_db": outputs,
+
+    # QRE 固定画在第一行，不需要写进这里
+    # 可选: "pi", "ACR", "UMR", "LD", "high_effect_index"
+    "track_order": ["LD", "pi", "ACR", "UMR", "high_effect_index"],
+
+    # 数据库可以计算到 ±10 kb，这里只控制实际读取/绘制的范围
+    "plot_xlim": (-5500, 5500),
+
+    # ------------------------------------------------------------
+    # Random gene sets
+    # ------------------------------------------------------------
+    # 随机基因集 percentile 区间
+    "ci_percentiles": (5, 95),
+
+    # 一次处理多少个 random sets，主要控制内存
+    # 不影响最终结果
+    "random_batch_size": 8,
+
+    # ------------------------------------------------------------
+    # Figure layout
+    # ------------------------------------------------------------
+    "fig_size": (11, 6.5),
+
+    # QRE 第一行相对更高
+    "qre_height_ratio": 3,
+
+    # 其余 track 的统一高度
+    "track_height_ratio": 1,
+
+    # TSS / TTS 两列之间的距离
+    "grid_wspace": 0.05,
+
+    # tracks 之间的距离
+    "grid_hspace": 0.20,
+
+    # ------------------------------------------------------------
+    # Main profile style
+    # ------------------------------------------------------------
+    # Top GEA genes
+    "main_color": "#5580B0",
+
+    # Random gene sets CI
+    "random_color": "gray",
+    "random_alpha": 0.20,
+
+    # ------------------------------------------------------------
+    # TSS / TTS vertical reference line
+    # ------------------------------------------------------------
+    "site_line_color": "red",
+    "site_line_style": "--",
+    "site_line_width": 1,
+
+    # ------------------------------------------------------------
+    # Y-axis track labels
+    # ------------------------------------------------------------
+    "label_fontsize": 11,
+
+    # 左侧 ylabel 的位置
+    "left_track_label_x": -0.15,
+
+    "left_track_label_rotation": 90,
+    "left_track_label_ha": "center",
+    "left_track_label_va": "center",
+
+    # ------------------------------------------------------------
+    # Top/random annotation
+    # ------------------------------------------------------------
+    "legend_fontsize": 10,
+
+    # ------------------------------------------------------------
+    # X axis
+    # ------------------------------------------------------------
+    "x_tick_interval": 2500,
+
+    # ------------------------------------------------------------
+    # Scale bar
+    # ------------------------------------------------------------
+    # scale bar 表示的 genomic length
+    "scale_bp": 500,
+
+    "scale_bar_label": "500-bp\n(10-bp step)",
+
+    # "TSS" 或 "TTS"
+    "scale_bar_panel": "TSS",
+
+    # axes fraction coordinates
+    "scale_bar_y": 0.95,
+    "scale_bar_right": 0.72,
+
+    "scale_bar_linewidth": 2,
+    "scale_bar_label_offset": 0.025,
+    "scale_fontsize": 9,
+
+    # ------------------------------------------------------------
+    # Gene / UTR length bars
+    # ------------------------------------------------------------
+    "show_length_bars": True,
+    "length_bar_max": 5500,
+    "length_bar_height": 0.02,
+    "gene_bar_y": 0.65,
+    "utr_bar_y": 0.61,
+    "length_bar_label_offset_bp": 200,
+    "length_bar_median_target": 0.5,
+    "length_bar_median_linewidth": 1,
+    "bar_label_fontsize": 10,
+    "length_bar_cmap": DEFAULT_LENGTH_BAR_CMAP,
+
+    # ------------------------------------------------------------
+    # Optional high-effect index track
+    # ------------------------------------------------------------
+    # 只有 track_order 中加入 "high_effect_index" 才会使用
+    #
+    # "high_effect_index_csv":
+    #     project_dir / "high_effect_index.csv",
+
+    "high_effect_color": "#5580B0",
+
+    # relative_probability_index = 1 的 baseline
+    "baseline_color": "gray",
+    "baseline_line_style": ":",
+    "baseline_line_width": 1,
+
+    # high-effect track 上的说明文字
+    "show_high_effect_annotation": True,
+
+    "high_effect_annotation_text": (
+        'Frequency of high impact CRISPR mutations\n'
+        r'(Groover $\it{et}$ $\it{al.,}$ 2026)'
+    ),
+
+    # figure coordinates，不是 axes coordinates
+    "high_effect_annotation_fig_xy": (0.35, 0.19),
+
+    "high_effect_annotation_fontsize": 9,
+    "high_effect_annotation_color": "#000000",
+    "high_effect_annotation_ha": "left",
+    "high_effect_annotation_va": "center",
+
+    # ------------------------------------------------------------
+    # Output
+    # ------------------------------------------------------------
+    # "plot_output_dir": project_dir / "figures",
+
+    "save_fig": False,
+    "show_fig": True,
+
+    "save_kwargs": {
+        "format": "pdf",
+        "facecolor": "none",
+        "edgecolor": "none",
+        "bbox_inches": "tight",
+    },
+}
+
+
+def plot_env_tracks(
+    env_name,
+    env_desc,
+    magma_gwas_df_h5,
+    config,
+    top_gene_quantile=0.05,
+    random_num=1000,
+    seed=42,
+    track_order=None,
+    save_path=None,
+):
+    """
+    Plot TSS/TTS tracks from build_gene_profile_database() output.
+
+    Top genes are selected from magma_gwas_df_h5 by ascending P_VALUE.
+    Each random set contains the same number of genes sampled without
+    replacement from the remaining non-top MAGMA genes. The same random
+    sets are used for every anchor and every track.
+    """
+    set_plot_style()
+
+    plt.rcParams['xtick.labelsize'] = 10
+    plt.rcParams['ytick.labelsize'] = 10
+
+    plot_config = dict(config)
+    plot_config["_top_gene_quantile"] = float(top_gene_quantile)
+    plot_config["_random_num"] = int(random_num)
+
+    data, track_order = load_env_track_data(
+        env_name,
+        magma_gwas_df_h5,
+        plot_config,
+        top_gene_quantile=top_gene_quantile,
+        random_num=random_num,
+        seed=seed,
+        track_order=track_order,
+    )
+
+    all_rows = ["QRE"] + list(track_order)
+    n_rows = len(all_rows)
+    height_ratios = [plot_config.get("qre_height_ratio", 3)] + [
+        plot_config.get("track_height_ratio", 1)
+    ] * (n_rows - 1)
+
+    fig = plt.figure(figsize=plot_config.get("fig_size", (11, 6)))
+    gs = gridspec.GridSpec(
+        n_rows,
+        2,
+        height_ratios=height_ratios,
+        wspace=plot_config.get("grid_wspace", 0.05),
+        hspace=plot_config.get("grid_hspace", 0.1),
+    )
+
+    axes = {}
+    for row_idx, track in enumerate(all_rows):
+        if row_idx == 0:
+            left_ax = fig.add_subplot(gs[row_idx, 0])
+            right_ax = fig.add_subplot(gs[row_idx, 1], sharey=left_ax)
+        else:
+            left_ax = fig.add_subplot(gs[row_idx, 0], sharex=axes["QRE"][0])
+            right_ax = fig.add_subplot(
+                gs[row_idx, 1], sharex=axes["QRE"][1], sharey=left_ax
+            )
+        axes[track] = (left_ax, right_ax)
+
+    _plot_profile_track(
+        *axes["QRE"],
+        data["QRE"],
+        _qre_label(env_desc),
+        plot_config,
+        is_bottom_track=(n_rows == 1),
+        show_gene_set_labels=True,
+    )
+
+    scale_bar_panel = plot_config.get("scale_bar_panel", "TSS")
+    _add_scale_bar(
+        axes["QRE"][0 if scale_bar_panel == "TSS" else 1],
+        plot_config,
+    )
+
+    track_labels = {
+        "pi": "π",
+        "ACR": "ACRs",
+        "UMR": "UMRs",
+        # "LD": r"LD ($r^2$)",
+        "LD": ("LD\n" r"($r^2$)"),
+    }
+    high_effect_df = None
+
+    for i, track in enumerate(track_order):
+        is_bottom = i == len(track_order) - 1
+        if track == "high_effect_index":
+            if high_effect_df is None:
+                high_effect_df = _load_high_effect_index(plot_config)
+            _plot_high_effect_index_track(
+                *axes[track], high_effect_df, plot_config,
+                is_bottom_track=is_bottom,
+            )
+        else:
+            _plot_profile_track(
+                *axes[track],
+                data[track],
+                track_labels[track],
+                plot_config,
+                is_bottom_track=is_bottom,
+            )
+
+    for ax in axes["QRE"]:
+        ax.set_xlim(*plot_config.get("plot_xlim", (-5500, 5500)))
+
+    _add_gene_utr_bars(
+        fig, axes["QRE"][0], axes["QRE"][1], data, plot_config
+    )
+
+    if save_path is None and plot_config.get("save_fig", True):
+        output_dir = Path(plot_config.get("plot_output_dir", "."))
+        output_dir.mkdir(parents=True, exist_ok=True)
+        save_path = output_dir / f"{env_name}.gene_profiles.pdf"
+
+    if plot_config.get("save_fig", True):
+        save_kwargs = plot_config.get(
+            "save_kwargs",
+            dict(format="pdf", facecolor="none",
+                 edgecolor="none", bbox_inches="tight"),
+        )
+        fig.savefig(save_path, **save_kwargs)
+    if plot_config.get("show_fig", True):
+        plt.show()
+
+    return fig, axes
+
+
+if __name__ == "__main__":
+    # Example 1: build all gene-centered profile databases.
+    project_dir = Path("/path/to/project")
     gff_file = project_dir / "genome.gff3"
     vcf_file = project_dir / "genotype.vcf.gz"
     acr_bed_file = project_dir / "ACR.bed.gz"
@@ -1423,4 +2330,59 @@ if __name__ == "__main__":
         overwrite=False,
     )
 
-    print(outputs)
+    # Example 2: plot one environment from the database returned above.
+    # The database is calculated to +/-10 kb, while plot_xlim selects the
+    # displayed range here without rebuilding the profiles.
+    plot_config = {
+        "profile_db": outputs,
+        "track_order": ["pi", "ACR", "UMR", "LD"],
+        "plot_xlim": (-5500, 5500),
+        "plot_output_dir": project_dir / "figures",
+        "fig_size": (11, 6.5),
+        "qre_height_ratio": 3,
+        "track_height_ratio": 1,
+        "grid_wspace": 0.05,
+        "grid_hspace": 0.10,
+        "main_color": "#5580B0",
+        "random_color": "gray",
+        "random_alpha": 0.2,
+        "site_line_color": "red",
+        "site_line_style": "--",
+        "site_line_width": 1,
+        "label_fontsize": 11,
+        "legend_fontsize": 10,
+        "left_track_label_x": -0.15,
+        "x_tick_interval": 2500,
+        "ci_percentiles": (5, 95),
+        "random_batch_size": 8,
+        "scale_bp": 500,
+        "scale_bar_label": "500-bp (10-bp step)",
+        "scale_bar_panel": "TSS",
+        "scale_bar_y": 0.95,
+        "scale_bar_right": 0.72,
+        "show_length_bars": True,
+        "length_bar_max": 5500,
+        "length_bar_height": 0.02,
+        "gene_bar_y": 0.65,
+        "utr_bar_y": 0.61,
+        "length_bar_label_offset_bp": 200,
+        "length_bar_median_target": 0.5,
+        "length_bar_median_linewidth": 1,
+        "bar_label_fontsize": 10,
+        "length_bar_cmap": DEFAULT_LENGTH_BAR_CMAP,
+        "save_fig": True,
+        "show_fig": True,
+        "save_kwargs": dict(
+            format="pdf", facecolor="none", edgecolor="none", bbox_inches="tight"
+        ),
+    }
+
+    fig, axes = plot_env_tracks(
+        env_name="bio18",
+        env_desc="Precipitation of Warmest Quarter",
+        magma_gwas_df_h5=project_dir / "bio18.magma.gwas_df.h5",
+        config=plot_config,
+        top_gene_quantile=0.05,
+        random_num=1000,
+        seed=42,
+    )

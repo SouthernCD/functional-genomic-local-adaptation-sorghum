@@ -15,6 +15,9 @@ from .utils import have_file
 from .plot import set_plot_style
 
 
+CHROMOSOME_PERMUTATION_SCHEME = 'within_chromosome_roll_v1'
+
+
 def filter_df_by_set_expr(df, expr):
     """
     根据布尔列的集合运算表达式筛选 DataFrame。
@@ -116,6 +119,25 @@ def permute_array(feature_array, seed=None):
     permuted_feature_array = np.roll(feature_array, random_number)
     return permuted_feature_array
 
+
+def chromosome_slices(chromosomes):
+    """Return contiguous chromosome slices for rows sorted by CHROM and POS."""
+    chromosomes = np.asarray(chromosomes)
+    boundaries = np.r_[0, np.flatnonzero(chromosomes[1:] != chromosomes[:-1]) + 1,
+                       len(chromosomes)]
+    return tuple(slice(int(start), int(end))
+                 for start, end in zip(boundaries[:-1], boundaries[1:]))
+
+
+def permute_array_within_chromosomes(feature_array, chrom_slices, seed=None):
+    """Independently circular-shift each chromosome without moving sites across it."""
+    rng = np.random.default_rng(seed)
+    permuted = np.empty_like(feature_array)
+    for chrom_slice in chrom_slices:
+        segment = feature_array[chrom_slice]
+        permuted[chrom_slice] = np.roll(segment, rng.integers(len(segment)))
+    return permuted
+
 # fold enrichment
 
 
@@ -132,9 +154,10 @@ def get_fold_enrichment(data_df, foreground_mask, data_col, top_percent):
     return fore_top_pvalue/back_top_pvalue
 
 
-def get_permutation_fold_enrichment(perm_id, run_context_arrays, env_id_list, top_percent):
-    permuted_foreground = permute_array(
-        run_context_arrays['foreground'], seed=perm_id)
+def get_permutation_fold_enrichment(perm_id, run_context_arrays, env_id_list, top_percent,
+                                    chrom_slices):
+    permuted_foreground = permute_array_within_chromosomes(
+        run_context_arrays['foreground'], chrom_slices, seed=perm_id)
     return {
         env_id: get_fold_enrichment(
             run_context_arrays, permuted_foreground, env_id, top_percent
@@ -146,10 +169,10 @@ def get_permutation_fold_enrichment(perm_id, run_context_arrays, env_id_list, to
 _permutation_worker_state = None
 
 
-def _init_permutation_worker(run_context_arrays, env_id_list, top_percent):
+def _init_permutation_worker(run_context_arrays, env_id_list, top_percent, chrom_slices):
     # With fork, these arrays are inherited once and used read-only by each worker.
     global _permutation_worker_state
-    _permutation_worker_state = (run_context_arrays, env_id_list, top_percent)
+    _permutation_worker_state = (run_context_arrays, env_id_list, top_percent, chrom_slices)
 
 
 def _run_permutation_worker(perm_id):
@@ -236,6 +259,7 @@ def enrichment_permutation_analysis(
         col: run_context_df[col].to_numpy()
         for col in ['foreground'] + env_id_list
     }
+    chrom_slices = chromosome_slices(run_context_df['CHROM'].to_numpy())
 
     obs_values = {}
     for env_id in env_id_list:
@@ -246,7 +270,7 @@ def enrichment_permutation_analysis(
     if pool_num == 1:
         result_iter = (
             get_permutation_fold_enrichment(
-                perm_id, run_context_arrays, env_id_list, top_percent
+                perm_id, run_context_arrays, env_id_list, top_percent, chrom_slices
             )
             for perm_id in range(permutations)
         )
@@ -257,7 +281,7 @@ def enrichment_permutation_analysis(
         with mp.Pool(
             processes=pool_num,
             initializer=_init_permutation_worker,
-            initargs=(run_context_arrays, tuple(env_id_list), top_percent),
+            initargs=(run_context_arrays, tuple(env_id_list), top_percent, chrom_slices),
         ) as pool:
             result_iter = pool.imap(
                 _run_permutation_worker, range(permutations), chunksize=1
@@ -307,6 +331,7 @@ def enrichment_permutation_analysis(
         "stratify_id": stratify_id,
         "top_percent": top_percent,
         "env_id_list": env_id_list,
+        "permutation_scheme": CHROMOSOME_PERMUTATION_SCHEME,
     }
 
     return results_json
@@ -353,7 +378,18 @@ def site_contrast_runner(contrast_id, contrast_json, context_df, env_id_list, ou
 
     results_json_file = os.path.join(
         output_dir, f"{contrast_id}.enrichment.json.gz")
-    if not have_file(results_json_file):
+    reuse_result = have_file(results_json_file)
+    if reuse_result:
+        try:
+            with gzip.open(results_json_file, 'rt', encoding='utf-8') as f:
+                existing_results = json.load(f)
+            reuse_result = (isinstance(existing_results, dict) and
+                            all(isinstance(result, dict) and
+                                result.get('permutation_scheme') == CHROMOSOME_PERMUTATION_SCHEME
+                                for result in existing_results.values()))
+        except (OSError, EOFError, UnicodeError, json.JSONDecodeError):
+            reuse_result = False
+    if not reuse_result:
         enrich_data_df = context_df.copy()
         foreground_mask = filter_df_by_set_expr(
             enrich_data_df, contrast_json["foreground"])

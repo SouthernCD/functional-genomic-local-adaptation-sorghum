@@ -8,6 +8,17 @@ from time import sleep
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
+from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from itertools import zip_longest
+import fcntl
+import hashlib
+import json
+import os
+import shlex
+import subprocess
+import tempfile
+from cyvcf2 import VCF
 
 
 def prepare_gemma_phenotype_file(env_name, phenotype_df, phenotype_file):
@@ -28,8 +39,14 @@ def gemma_result_parser(gemma_output_assoc_file, var_stat_h5, chr_list):
     print(f'Parsing {gemma_output_assoc_file}...')
     print(f'Loading gemma_output_assoc_file...')
     gemma_output_assoc_df = pd.read_csv(gemma_output_assoc_file, sep='\t')
-    gemma_output_assoc_df = gemma_output_assoc_df[[
-        'rs', 'af', 'beta', 'se', 'logl_H1', 'l_remle', 'l_mle', 'p_wald', 'p_lrt', 'p_score']]
+    required_columns = ['rs', 'af', 'beta', 'se', 'p_wald']
+    missing_columns = [column for column in required_columns
+                       if column not in gemma_output_assoc_df.columns]
+    if missing_columns:
+        raise ValueError(f'Missing GEMMA association columns: {missing_columns}')
+    gemma_output_assoc_df = gemma_output_assoc_df.reindex(columns=[
+        'rs', 'af', 'beta', 'se', 'logl_H1', 'l_remle', 'l_mle',
+        'p_wald', 'p_lrt', 'p_score'])
     gemma_output_assoc_df = gemma_output_assoc_df.rename(
         columns={'rs': 'ID', 'af': 'MAF', 'beta': 'BETA', 'se': 'SE', 'logl_H1': 'LOGL_H1', 'l_remle': 'L_REMLE', 'l_mle': 'L_MLE', 'p_wald': 'P_WALD', 'p_lrt': 'P_LRT', 'p_score': 'P_SCORE'})
     gemma_output_assoc_df['P_VALUE'] = gemma_output_assoc_df['P_WALD']
@@ -59,30 +76,226 @@ def gemma_result_parser(gemma_output_assoc_file, var_stat_h5, chr_list):
     gemma_output_assoc_df = gemma_output_assoc_df.drop(columns=['MAF'])
     merged_df = pd.merge(gemma_output_assoc_df,
                          chr_pos_df, on='ID', how='left')
+    merged_df = merged_df.sort_values(['CHROM', 'POS'], kind='stable').reset_index(drop=True)
 
     return merged_df
 
 
-def gemma_run(name, work_dir, bimbam_file, phenotype_file, kinship_file, input_vcf_file=None, genome_chr_list=None, retry=3, dry_run=False, vcf_var_stat_h5=None):
+def _split_gemma_bimbam(input_vcf_file, bimbam_file, block_dir, block_size):
+    """Split BIMBAM rows by the matching VCF record's genomic 1-based position."""
+    os.makedirs(block_dir, exist_ok=True)
+    blocks = OrderedDict()
+    handles = OrderedDict()
+    initialized = set()
+    vcf = VCF(input_vcf_file)
+    try:
+        with open(bimbam_file) as bimbam:
+            for index, pair in enumerate(zip_longest(vcf, bimbam), 1):
+                record, line = pair
+                if record is None or line is None:
+                    raise ValueError('VCF and BIMBAM have different variant counts')
+                if line.split(',', 1)[0] != record.ID:
+                    raise ValueError(f'VCF/BIMBAM variant mismatch at row {index}')
+                key = (record.CHROM, (record.POS - 1) // block_size)
+                if key not in blocks:
+                    blocks[key] = os.path.join(block_dir, f'block_{len(blocks):05d}')
+                path = blocks[key] + '.bimbam'
+                if path not in handles:
+                    if len(handles) == 32:
+                        _, old_handle = handles.popitem(last=False)
+                        old_handle.close()
+                    handles[path] = open(path, 'a' if path in initialized else 'w')
+                    initialized.add(path)
+                handles.move_to_end(path)
+                handles[path].write(line)
+    finally:
+        vcf.close()
+        for handle in handles.values():
+            handle.close()
+    return list(blocks.values())
+
+
+def _gemma_input_signature(path):
+    stat = os.stat(path)
+    return {'path': os.path.realpath(path), 'size': stat.st_size,
+            'mtime_ns': stat.st_mtime_ns, 'ctime_ns': stat.st_ctime_ns}
+
+
+def _get_gemma_blocks(input_vcf_file, bimbam_file, block_size, block_cache_dir=None):
+    """Reuse a complete, immutable split when its input signatures match."""
+    signature = {'version': 1, 'block_size': block_size,
+                 'vcf': _gemma_input_signature(input_vcf_file),
+                 'bimbam': _gemma_input_signature(bimbam_file)}
+    digest = hashlib.sha256(json.dumps(signature, sort_keys=True).encode()).hexdigest()
+    cache_root = os.path.abspath(block_cache_dir or bimbam_file + '.gemma_blocks')
+    cache_dir = os.path.join(cache_root, digest)
+    os.makedirs(cache_dir, exist_ok=True)
+    with open(os.path.join(cache_dir, '.lock'), 'w') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        pointer_file = os.path.join(cache_dir, 'current.json')
+        try:
+            with open(pointer_file) as source:
+                revision = json.load(source)['revision']
+            revision_dir = os.path.join(cache_dir, revision)
+            if not revision.startswith('revision_') or os.path.basename(revision) != revision:
+                raise ValueError('Invalid cache revision')
+            with open(os.path.join(revision_dir, 'manifest.json')) as source:
+                manifest = json.load(source)
+            if manifest['signature'] != signature or not manifest['blocks']:
+                raise ValueError('Cache parameters changed')
+            for block in manifest['blocks']:
+                if os.path.basename(block['name']) != block['name']:
+                    raise ValueError('Invalid cache block name')
+                path = os.path.join(revision_dir, block['name'])
+                stat = os.stat(path)
+                if stat.st_size != block['size'] or stat.st_mtime_ns != block['mtime_ns']:
+                    raise ValueError(f'Incomplete GEMMA block: {path}')
+        except (OSError, ValueError, KeyError, TypeError):
+            revision_dir = tempfile.mkdtemp(prefix='revision_', dir=cache_dir)
+            prefixes = _split_gemma_bimbam(input_vcf_file, bimbam_file,
+                                            revision_dir, block_size)
+            if not prefixes:
+                raise ValueError('VCF has no variants')
+            if (_gemma_input_signature(input_vcf_file) != signature['vcf'] or
+                    _gemma_input_signature(bimbam_file) != signature['bimbam']):
+                raise RuntimeError('VCF or BIMBAM changed during GEMMA block creation')
+            manifest = {'signature': signature, 'blocks': []}
+            for prefix in prefixes:
+                path = prefix + '.bimbam'
+                stat = os.stat(path)
+                manifest['blocks'].append({'name': os.path.basename(path),
+                                           'size': stat.st_size,
+                                           'mtime_ns': stat.st_mtime_ns})
+            with open(os.path.join(revision_dir, 'manifest.json'), 'w') as target:
+                json.dump(manifest, target)
+            temporary_pointer = pointer_file + '.tmp'
+            with open(temporary_pointer, 'w') as target:
+                json.dump({'revision': os.path.basename(revision_dir)}, target)
+            os.replace(temporary_pointer, pointer_file)
+            print(f'Created {len(prefixes)} GEMMA blocks in {revision_dir}')
+        else:
+            print(f'Reusing {len(manifest["blocks"])} GEMMA blocks from {revision_dir}')
+        return [os.path.join(revision_dir, block['name'])
+                for block in manifest['blocks']]
+
+
+def _run_gemma_block(bimbam_file, block_dir, phenotype_file, kinship_file,
+                     retry, lmm):
+    os.makedirs(block_dir, exist_ok=True)
+    command = ['gemma', '-g', bimbam_file, '-k', kinship_file,
+               '-lmm', str(lmm), '-miss', '0.1', '-p', phenotype_file,
+               '-o', 'gemma_output']
+    env = os.environ.copy()
+    env['OMP_NUM_THREADS'] = '1'
+    env['OPENBLAS_NUM_THREADS'] = '1'
+    assoc_file = os.path.join(block_dir, 'output', 'gemma_output.assoc.txt')
+    for attempt in range(max(1, retry)):
+        with open(os.path.join(block_dir, 'gemma.log'), 'a') as log:
+            result = subprocess.run(command, cwd=block_dir, env=env,
+                                    stdout=log, stderr=subprocess.STDOUT, check=False)
+        if result.returncode == 0 and have_file(assoc_file):
+            return assoc_file
+        if attempt + 1 < max(1, retry):
+            sleep(30)
+    raise RuntimeError(f'GEMMA failed for {bimbam_file}; see {block_dir}/gemma.log')
+
+
+def _run_gemma_parallel(work_dir, bimbam_file, phenotype_file, kinship_file,
+                        input_vcf_file, retry, dry_run, block_size, max_workers,
+                        block_cache_dir, lmm):
+    if block_size <= 0 or max_workers <= 0:
+        raise ValueError('block_size and max_workers must be positive')
+    bimbam_file = os.path.abspath(bimbam_file)
+    phenotype_file = os.path.abspath(phenotype_file)
+    kinship_file = os.path.abspath(kinship_file)
+    input_vcf_file = os.path.abspath(input_vcf_file)
+    work_dir = os.path.abspath(work_dir)
+    block_files = _get_gemma_blocks(input_vcf_file, bimbam_file, block_size,
+                                    block_cache_dir)
+    blocks = [(block_file, os.path.join(work_dir, 'blocks',
+               os.path.basename(block_file).removesuffix('.bimbam') + '.gemma'))
+              for block_file in block_files]
+    with open(os.path.join(work_dir, 'gemma_cmd.sh'), 'w') as script:
+        script.write('#!/bin/sh\nset -eu\nexport OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1\n')
+        for block_file, block_dir in blocks:
+            command = ['gemma', '-g', block_file, '-k', kinship_file,
+                       '-lmm', str(lmm), '-miss', '0.1', '-p', phenotype_file,
+                       '-o', 'gemma_output']
+            script.write(f'mkdir -p {shlex.quote(block_dir)}\n'
+                         f'(cd {shlex.quote(block_dir)} && '
+                         f'{shlex.join(command)})\n')
+    if dry_run:
+        return None
+    results = {}
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(_run_gemma_block, block_file, block_dir,
+                                   phenotype_file, kinship_file, retry, lmm): block_file
+                   for block_file, block_dir in blocks}
+        for future in as_completed(futures):
+            results[futures[future]] = future.result()
+    output_dir = os.path.join(work_dir, 'output')
+    os.makedirs(output_dir, exist_ok=True)
+    assoc_file = os.path.join(output_dir, 'gemma_output.assoc.txt')
+    temporary_file = assoc_file + '.tmp'
+    with open(temporary_file, 'w') as merged:
+        for index, (block_file, _) in enumerate(blocks):
+            with open(results[block_file]) as source:
+                header = next(source)
+                if index == 0:
+                    merged.write(header)
+                for line in source:
+                    merged.write(line)
+    os.replace(temporary_file, assoc_file)
+    return assoc_file
+
+
+def _check_gemma_lmm_output(work_dir, lmm):
+    metadata_file = os.path.join(work_dir, 'gemma_run.json')
+    if os.path.exists(metadata_file):
+        with open(metadata_file) as source:
+            previous_lmm = json.load(source)['lmm']
+    else:
+        previous_lmm = 4  # Results made before the metadata file used -lmm 4.
+    if previous_lmm != lmm:
+        raise ValueError(f'Existing GEMMA output in {work_dir} uses -lmm {previous_lmm}; '
+                         f'use a different name or work_dir for -lmm {lmm}')
+
+
+def gemma_run(name, work_dir, bimbam_file, phenotype_file, kinship_file, input_vcf_file=None, genome_chr_list=None, retry=3, dry_run=False, vcf_var_stat_h5=None, block_size=10_000_000, max_workers=80, block_cache_dir=None, lmm=4):
+    if lmm not in (1, 4):
+        raise ValueError('lmm must be 1 (Wald) or 4 (all tests)')
     # 创建输出目录
     mkdir(work_dir)
 
     # 运行GEMMA
     gemma_output_assoc_file = f'{work_dir}/output/gemma_output.assoc.txt'
-    if have_file(gemma_output_assoc_file):
+    gwas_df_h5 = f'{work_dir}/{name}.gemma.gwas_df.h5'
+    if have_file(gwas_df_h5):
+        _check_gemma_lmm_output(work_dir, lmm)
+    assoc_exists = have_file(gemma_output_assoc_file)
+    if assoc_exists:
+        _check_gemma_lmm_output(work_dir, lmm)
         print(
             f'GEMMA GWAS result already exists.')
-    elif dry_run:
+    elif not dry_run:
+        metadata_file = os.path.join(work_dir, 'gemma_run.json')
+        with open(metadata_file, 'w') as target:
+            json.dump({'lmm': lmm}, target)
+    if not assoc_exists and input_vcf_file is not None:
+        _run_gemma_parallel(work_dir, bimbam_file, phenotype_file, kinship_file,
+                            input_vcf_file, retry, dry_run, block_size, max_workers,
+                            block_cache_dir, lmm)
+    elif not assoc_exists and dry_run:
         with open(f'{work_dir}/gemma_cmd.sh', 'w') as f:
             f.write(
-                f"gemma -g {bimbam_file} -k {kinship_file} -lmm 4 -miss 0.1 -p {phenotype_file} -o gemma_output -outdir {work_dir}")
-    else:
+                f"gemma -g {bimbam_file} -k {kinship_file} -lmm {lmm} -miss 0.1 -p {phenotype_file} -o gemma_output -outdir {work_dir}")
+    elif not assoc_exists:
         with open(f'{work_dir}/gemma_cmd.sh', 'w') as f:
             f.write(
-                f"gemma -g {bimbam_file} -k {kinship_file} -lmm 4 -miss 0.1 -p {phenotype_file} -o gemma_output -outdir {work_dir}")
+                f"gemma -g {bimbam_file} -k {kinship_file} -lmm {lmm} -miss 0.1 -p {phenotype_file} -o gemma_output -outdir {work_dir}")
 
         f, o, e = cmd_run(
-            f"gemma -g {bimbam_file} -k {kinship_file} -lmm 4 -miss 0.1 -p {phenotype_file} -o gemma_output", cwd=work_dir)
+            f"gemma -g {bimbam_file} -k {kinship_file} -lmm {lmm} -miss 0.1 -p {phenotype_file} -o gemma_output", cwd=work_dir)
 
         retry_count = 0
         if not have_file(gemma_output_assoc_file):
@@ -93,16 +306,17 @@ def gemma_run(name, work_dir, bimbam_file, phenotype_file, kinship_file, input_v
                     f'GEMMA GWAS failed, retrying {retry_count}...')
                 sleep(30)
                 cmd_run(
-                    f"gemma -g {bimbam_file} -k {kinship_file} -lmm 4 -miss 0.1 -p {phenotype_file} -o gemma_output", cwd=work_dir)
+                    f"gemma -g {bimbam_file} -k {kinship_file} -lmm {lmm} -miss 0.1 -p {phenotype_file} -o gemma_output", cwd=work_dir)
             else:
                 raise FileNotFoundError(
                     f'GEMMA GWAS failed: {gemma_output_assoc_file}')
 
     if input_vcf_file is None and vcf_var_stat_h5 is None:
         return gemma_output_assoc_file
+    if dry_run:
+        return gemma_output_assoc_file
 
     # 解析GEMMA结果为DataFrame
-    gwas_df_h5 = f'{work_dir}/{name}.gemma.gwas_df.h5'
     if have_file(gwas_df_h5):
         return gwas_df_h5
     else:
@@ -116,12 +330,16 @@ def gemma_run(name, work_dir, bimbam_file, phenotype_file, kinship_file, input_v
 
 
 class GEMMA_JOB():
-    def __init__(self, name, work_dir, input_vcf_file, phenotype_file, kinship_file):
+    def __init__(self, name, work_dir, input_vcf_file, phenotype_file,
+                 kinship_file, lmm=4):
+        if lmm not in (1, 4):
+            raise ValueError('lmm must be 1 (Wald) or 4 (all tests)')
         self.name = name
         self.work_dir = work_dir
         self.input_vcf_file = input_vcf_file
         self.kinship_file = kinship_file
         self.phenotype_file = phenotype_file
+        self.lmm = lmm
 
         self.gwas_df_h5 = f'{self.work_dir}/{self.name}.gemma/{self.name}.gemma.gwas_df.h5'
 
@@ -137,14 +355,19 @@ class GEMMA_JOB():
             convert_vcf_to_bimbam(self.input_vcf_file, self.bimbam_file)
         self.genome_chr_list = get_chr_id_list_from_vcf(self.input_vcf_file)
 
-    def run(self, retry=3, dry_run=False):
+    def run(self, retry=3, dry_run=False, block_size=5_000_000,
+            max_workers=80, block_cache_dir=None):
         if have_file(self.gwas_df_h5):
+            _check_gemma_lmm_output(f'{self.work_dir}/{self.name}.gemma', self.lmm)
             print(
                 f'GEMMA GWAS result already exists.')
         else:
             self.prepare()
             self.gwas_df_h5 = gemma_run(self.name, f'{self.work_dir}/{self.name}.gemma', self.bimbam_file,
-                                        self.phenotype_file, self.kinship_file, self.input_vcf_file, self.genome_chr_list, retry=retry, dry_run=dry_run)
+                                        self.phenotype_file, self.kinship_file, self.input_vcf_file, self.genome_chr_list,
+                                        retry=retry, dry_run=dry_run, block_size=block_size,
+                                        max_workers=max_workers, block_cache_dir=block_cache_dir,
+                                        lmm=self.lmm)
 
 
 def get_genefile(input_gff3_file, genefile, chr_id_map_file=None):
@@ -648,3 +871,21 @@ def plot_gwas_summary_panel(gwas_df_h5, genome_fasta_file,
     plt.close(fig)
 
     # return fig
+
+if __name__ == "__main__":
+
+    from statsmodels.sandbox.stats.multicomp import multipletests
+    import pandas as pd
+    import os
+    env_id_list = ["bio12", "bio3", "annualPET", "bio8", "topoWet", "NTO", "TPH", "CLYPPT"]
+    for env_id in env_id_list:
+        gwas_df_csv = f"/lustre/home/xuyuxing/Work/Jesse/local_adaptation.3.0/2.envGWAS/{env_id}/{env_id}.gemma/output/gemma_output.assoc.txt"
+        file_with_fdr = gwas_df_csv.replace(".assoc.txt", ".assoc.fdr.txt.gz")
+        if os.path.exists(file_with_fdr):
+            print(f"scp cn04_acc2:{file_with_fdr} {env_id}.gemma.assoc.fdr.txt.gz")
+            continue
+        gwas_df = pd.read_csv(gwas_df_csv, sep="\t")
+        gwas_df['fdr'] = multipletests(gwas_df['p_wald'], method='fdr_bh')[1]
+        print(gwas_df[gwas_df['fdr'] < 0.05].shape[0])
+        gwas_df.to_csv(gwas_df_csv.replace(".assoc.txt", ".assoc.fdr.txt.gz"), sep="\t", index=False, compression="gzip")
+        

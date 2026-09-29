@@ -1,3 +1,5 @@
+from scipy.stats import pearsonr, spearmanr, mannwhitneyu
+from statsmodels.stats.multitest import multipletests
 import gc
 import numpy as np
 import pandas as pd
@@ -5,6 +7,25 @@ import pandas as pd
 from scipy.sparse import csr_matrix
 from numba import njit, prange
 
+
+import os
+import json
+import time
+import hashlib
+import shutil
+import tempfile
+import gzip
+from datetime import datetime
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+from .ld import prune_sites_by_ld
+from .vcf import get_sample_list_from_vcf, get_genotype_df_from_vcf_by_site_df
+from .gwas import GEMMA_JOB, plot_gwas_summary_panel
+from .enrich import enrichment_permutation_analysis
+from .sim.phenotype_simulator_wrap import simulate_phenotype_with_kinship
 
 # ============================================================
 # Numba core functions
@@ -1659,7 +1680,6 @@ class LDCutSimulator:
             / expected
         )
 
-
     @property
     def initial_parent_mismatch_count(
         self,
@@ -2375,6 +2395,7 @@ class LDCutSimulator:
                     preferred_labels_ok
                 ),
         }
+
 
 if __name__ == "__main__":
     # ========================================================
@@ -5383,3 +5404,1937 @@ if __name__ == "__main__":
 #     # print(sim.check_state())
 #     #
 #     pass
+
+
+def sample_causal_snps(
+    df,
+    causal_fraction=0.05,
+    enrichment_ratio=1.0,
+    maf_col="MAF",
+    foreground_col="foreground",
+    maf_bins=None,
+    seed=None,
+    causal_col="causal",
+    causal_foreground_fraction=None,
+):
+    """
+    Sample causal SNPs from an LD-pruned SNP DataFrame.
+
+    enrichment_ratio is defined as:
+
+        P(causal | foreground) / P(causal | background)
+
+    Causal SNPs are stratified by MAF so that the MAF distribution of
+    causal SNPs approximately follows that of the full SNP universe.
+
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        One row per LD-pruned SNP. Must contain foreground and MAF columns.
+
+    causal_fraction : float
+        Fraction of all SNPs to label causal, e.g. 0.05.
+
+    enrichment_ratio : float
+        Relative causal probability in foreground versus background.
+        1.0 = no enrichment, 2.0 = 2-fold enrichment.
+
+    causal_foreground_fraction : float, optional
+        Target fraction of causal SNPs in the foreground, in [0, 1]. Set
+        enrichment_ratio=None when using this mode. The requested foreground
+        and background counts are rounded to whole SNPs, then sampled within
+        each group's MAF bins in proportion to available sites.
+
+    maf_bins : array-like, optional
+        MAF bin edges. Default:
+        [0, .05, .10, .15, ..., .50].
+
+    seed : int, optional
+        Random seed.
+
+    Returns
+    -------
+    sampled_df : pandas.DataFrame
+        Copy of df with a boolean causal column.
+
+    summary_df : pandas.DataFrame
+        Per-MAF-bin sampling summary.
+    """
+    if not 0 <= causal_fraction <= 1:
+        raise ValueError("causal_fraction must be in [0, 1]")
+    if (enrichment_ratio is None) == (causal_foreground_fraction is None):
+        raise ValueError(
+            "Specify exactly one of enrichment_ratio or causal_foreground_fraction"
+        )
+    if enrichment_ratio is not None:
+        if isinstance(enrichment_ratio, (bool, np.bool_)):
+            raise ValueError("enrichment_ratio must be a finite positive number")
+        try:
+            enrichment_ratio = float(enrichment_ratio)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("enrichment_ratio must be a finite positive number") from exc
+        if not np.isfinite(enrichment_ratio) or enrichment_ratio <= 0:
+            raise ValueError("enrichment_ratio must be a finite positive number")
+    else:
+        if isinstance(causal_foreground_fraction, (bool, np.bool_)):
+            raise ValueError("causal_foreground_fraction must be in [0, 1]")
+        try:
+            causal_foreground_fraction = float(causal_foreground_fraction)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("causal_foreground_fraction must be in [0, 1]") from exc
+        if not np.isfinite(causal_foreground_fraction) or not 0 <= causal_foreground_fraction <= 1:
+            raise ValueError("causal_foreground_fraction must be in [0, 1]")
+    if maf_col not in df or foreground_col not in df:
+        raise ValueError(f"df must contain {maf_col!r} and {foreground_col!r}")
+
+    out = df.copy()
+    maf = pd.to_numeric(out[maf_col], errors="coerce")
+    if maf.isna().any() or ((maf < 0) | (maf > 0.5)).any():
+        raise ValueError("MAF must contain finite values in [0, 0.5]")
+
+    foreground = out[foreground_col]
+    if not foreground.isin([True, False]).all():
+        raise ValueError(f"{foreground_col!r} must contain only True/False")
+
+    if maf_bins is None:
+        maf_bins = np.linspace(0, 0.5, 11)
+
+    maf_bins = np.asarray(maf_bins, dtype=float)
+    if maf_bins.ndim != 1 or len(maf_bins) < 2:
+        raise ValueError("maf_bins must contain at least two edges")
+    if np.any(np.diff(maf_bins) <= 0):
+        raise ValueError("maf_bins must be strictly increasing")
+    if maf.min() < maf_bins[0] or maf.max() > maf_bins[-1]:
+        raise ValueError("maf_bins do not cover all observed MAF values")
+
+    rng = np.random.default_rng(seed)
+
+    out["_maf_bin"] = pd.cut(
+        maf,
+        bins=maf_bins,
+        include_lowest=True,
+        right=True,
+    )
+    out[causal_col] = False
+
+    # Exact genome-wide number of causal SNPs.
+    n_total = len(out)
+    n_causal_total = int(round(n_total * causal_fraction))
+
+    bin_counts = out["_maf_bin"].value_counts(sort=False)
+    if causal_foreground_fraction is None:
+        # Allocate the exact total across MAF bins before weighting FG/BG.
+        expected = n_causal_total * bin_counts / n_total
+        causal_per_bin = np.floor(expected).astype(int)
+        remainder = n_causal_total - causal_per_bin.sum()
+        if remainder > 0:
+            fractional = expected - causal_per_bin
+            add_bins = fractional.sort_values(ascending=False).index[:remainder]
+            causal_per_bin.loc[add_bins] += 1
+    else:
+        target_fg = int(round(n_causal_total * causal_foreground_fraction))
+        target_bg = n_causal_total - target_fg
+        n_fg_available = int(out[foreground_col].sum())
+        n_bg_available = n_total - n_fg_available
+        if target_fg > n_fg_available or target_bg > n_bg_available:
+            raise ValueError(
+                f"Requested causal_foreground_fraction is infeasible: "
+                f"need {target_fg} foreground and {target_bg} background SNPs, "
+                f"but only {n_fg_available} and {n_bg_available} are available"
+            )
+        fixed_counts = {
+            maf_bin: {True: 0, False: 0} for maf_bin in bin_counts.index
+        }
+        for is_fg, target, available in (
+            (True, target_fg, n_fg_available),
+            (False, target_bg, n_bg_available),
+        ):
+            if target == 0:
+                continue
+            group_bins = out.loc[
+                out[foreground_col] == is_fg, "_maf_bin"
+            ].value_counts(sort=False)
+            expected = target * group_bins / available
+            allocated = np.floor(expected).astype(int)
+            remainder = target - int(allocated.sum())
+            if remainder:
+                fractional = expected - allocated
+                add_bins = fractional.sort_values(ascending=False).index[:remainder]
+                allocated.loc[add_bins] += 1
+            for maf_bin, count in allocated.items():
+                fixed_counts[maf_bin][is_fg] = int(count)
+
+    records = []
+
+    for maf_bin, n_bin in bin_counts.items():
+        subset = out["_maf_bin"] == maf_bin
+        fg_idx = out.index[subset & out[foreground_col]]
+        bg_idx = out.index[subset & ~out[foreground_col]]
+
+        n_fg = len(fg_idx)
+        n_bg = len(bg_idx)
+        n_causal = (int(causal_per_bin.loc[maf_bin])
+                    if causal_foreground_fraction is None else
+                    fixed_counts[maf_bin][True] + fixed_counts[maf_bin][False])
+
+        if n_causal == 0:
+            records.append({
+                "maf_bin": str(maf_bin),
+                "n_total": n_bin,
+                "n_fg": n_fg,
+                "n_bg": n_bg,
+                "n_causal": 0,
+                "n_causal_fg": 0,
+                "n_causal_bg": 0,
+                "fg_rate": np.nan,
+                "bg_rate": np.nan,
+                "realized_enrichment": np.nan,
+            })
+            continue
+
+        if causal_foreground_fraction is None:
+            denom = enrichment_ratio * n_fg + n_bg
+            if denom == 0:
+                raise ValueError(f"No SNPs available in MAF bin {maf_bin}")
+            # (C_F / N_F) / (C_B / N_B) = enrichment_ratio.
+            expected_fg = n_causal * enrichment_ratio * n_fg / denom
+            min_fg = max(0, n_causal - n_bg)
+            max_fg = min(n_fg, n_causal)
+            n_causal_fg = int(np.clip(round(expected_fg), min_fg, max_fg))
+            n_causal_bg = n_causal - n_causal_fg
+            q_bg = n_causal / denom
+            q_fg = enrichment_ratio * q_bg
+            if q_fg > 1 + 1e-12 or q_bg > 1 + 1e-12:
+                raise ValueError(
+                    f"Requested causal_fraction/enrichment_ratio is infeasible "
+                    f"in MAF bin {maf_bin}: expected FG rate={q_fg:.3f}, "
+                    f"BG rate={q_bg:.3f}"
+                )
+        else:
+            n_causal_fg = fixed_counts[maf_bin][True]
+            n_causal_bg = fixed_counts[maf_bin][False]
+
+        if n_causal_fg:
+            selected_fg = rng.choice(
+                fg_idx.to_numpy(),
+                size=n_causal_fg,
+                replace=False,
+            )
+            out.loc[selected_fg, causal_col] = True
+
+        if n_causal_bg:
+            selected_bg = rng.choice(
+                bg_idx.to_numpy(),
+                size=n_causal_bg,
+                replace=False,
+            )
+            out.loc[selected_bg, causal_col] = True
+
+        fg_rate = n_causal_fg / n_fg if n_fg else np.nan
+        bg_rate = n_causal_bg / n_bg if n_bg else np.nan
+        realized_enrichment = (
+            fg_rate / bg_rate
+            if np.isfinite(fg_rate) and bg_rate > 0
+            else np.nan
+        )
+
+        records.append({
+            "maf_bin": str(maf_bin),
+            "n_total": n_bin,
+            "n_fg": n_fg,
+            "n_bg": n_bg,
+            "n_causal": n_causal,
+            "n_causal_fg": n_causal_fg,
+            "n_causal_bg": n_causal_bg,
+            "fg_rate": fg_rate,
+            "bg_rate": bg_rate,
+            "realized_enrichment": realized_enrichment,
+        })
+
+    summary = pd.DataFrame(records)
+
+    if out[causal_col].sum() != n_causal_total:
+        raise RuntimeError(
+            "Internal error: incorrect total number of causal SNPs")
+
+    out = out.drop(columns="_maf_bin")
+
+    return out, summary
+
+
+def evaluate_causal_gwas_recovery(
+    causal_effect_df,
+    gwas_df,
+    causal_id_col="SNP_ID",
+    beta_col="beta_raw",
+    gwas_id_col="ID",
+    p_col="P_WALD",
+    top_fractions=(0.001, 0.01, 0.05, 0.10),
+):
+    """
+    Evaluate whether simulated causal SNPs are preferentially recovered by GWAS.
+
+    Parameters
+    ----------
+    causal_effect_df : pandas.DataFrame
+        Causal SNP table containing SNP ID and beta_raw.
+
+    gwas_df : pandas.DataFrame
+        Genome-wide GWAS result containing SNP ID and P_WALD.
+
+    causal_id_col : str
+        SNP ID column in causal_effect_df.
+
+    beta_col : str
+        Raw causal effect column.
+
+    gwas_id_col : str
+        SNP ID column in gwas_df.
+
+    p_col : str
+        GWAS P-value column.
+
+    top_fractions : iterable of float
+        GWAS top fractions used for recovery analysis.
+
+    Returns
+    -------
+    result : dict
+        Keys:
+            summary
+            recovery
+            causal_table
+    """
+    causal = causal_effect_df[[causal_id_col, beta_col]].copy()
+    gwas = gwas_df[[gwas_id_col, p_col]].copy()
+
+    causal[causal_id_col] = causal[causal_id_col].astype(str)
+    gwas[gwas_id_col] = gwas[gwas_id_col].astype(str)
+
+    if causal[causal_id_col].duplicated().any():
+        raise ValueError("Duplicated causal SNP IDs")
+    if gwas[gwas_id_col].duplicated().any():
+        raise ValueError("Duplicated GWAS SNP IDs")
+
+    causal[beta_col] = pd.to_numeric(causal[beta_col], errors="coerce")
+    gwas[p_col] = pd.to_numeric(gwas[p_col], errors="coerce")
+
+    if causal[beta_col].isna().any():
+        raise ValueError(f"{beta_col} contains missing/non-numeric values")
+    if gwas[p_col].isna().any():
+        raise ValueError(f"{p_col} contains missing/non-numeric values")
+    if ((gwas[p_col] < 0) | (gwas[p_col] > 1)).any():
+        raise ValueError(f"{p_col} must be in [0, 1]")
+
+    causal_ids = set(causal[causal_id_col])
+    gwas_ids = set(gwas[gwas_id_col])
+    missing_ids = causal_ids - gwas_ids
+
+    if missing_ids:
+        raise ValueError(
+            f"{len(missing_ids)} causal SNPs are missing from GWAS results; "
+            f"examples: {list(missing_ids)[:10]}"
+        )
+
+    tiny = np.finfo(float).tiny
+
+    gwas["gwas_score"] = -np.log10(
+        gwas[p_col].clip(lower=tiny)
+    )
+    gwas["is_causal"] = gwas[gwas_id_col].isin(causal_ids)
+
+    # Smaller percentile = stronger GWAS signal.
+    gwas["gwas_rank_percentile"] = (
+        gwas[p_col]
+        .rank(method="average", ascending=True)
+        / len(gwas)
+    )
+
+    causal_table = causal.merge(
+        gwas[
+            [
+                gwas_id_col,
+                p_col,
+                "gwas_score",
+                "gwas_rank_percentile",
+            ]
+        ],
+        left_on=causal_id_col,
+        right_on=gwas_id_col,
+        how="left",
+        validate="one_to_one",
+    )
+
+    if gwas_id_col != causal_id_col:
+        causal_table = causal_table.drop(columns=gwas_id_col)
+
+    causal_table["beta2"] = causal_table[beta_col] ** 2
+
+    beta2 = causal_table["beta2"].to_numpy()
+    causal_score = causal_table["gwas_score"].to_numpy()
+    noncausal_score = gwas.loc[
+        ~gwas["is_causal"],
+        "gwas_score",
+    ].to_numpy()
+
+    if np.std(beta2) > 0 and np.std(causal_score) > 0:
+        pearson_r, pearson_p = pearsonr(beta2, causal_score)
+        spearman_r, spearman_p = spearmanr(beta2, causal_score)
+    else:
+        pearson_r = pearson_p = np.nan
+        spearman_r = spearman_p = np.nan
+
+    if len(noncausal_score) > 0:
+        mw = mannwhitneyu(
+            causal_score,
+            noncausal_score,
+            alternative="greater",
+        )
+
+        # With "greater" and larger GWAS score = stronger signal,
+        # U/(n1*n0) equals the probability that a random causal SNP
+        # has a stronger score than a random noncausal SNP.
+        auc = mw.statistic / (
+            len(causal_score) * len(noncausal_score)
+        )
+
+        mw_u = mw.statistic
+        mw_p = mw.pvalue
+    else:
+        auc = mw_u = mw_p = np.nan
+
+    n_gwas = len(gwas)
+    n_causal = len(causal)
+    causal_fraction = n_causal / n_gwas
+
+    recovery_records = []
+
+    # Stable sort gives an exact number of top SNPs even if P-values tie.
+    ranked = gwas.sort_values(
+        p_col,
+        ascending=True,
+        kind="mergesort",
+    )
+
+    for fraction in top_fractions:
+        if not 0 < fraction <= 1:
+            raise ValueError(
+                "All top_fractions must be in (0, 1]"
+            )
+
+        n_top = max(
+            1,
+            int(np.ceil(n_gwas * fraction)),
+        )
+
+        top = ranked.iloc[:n_top]
+        n_causal_top = int(top["is_causal"].sum())
+
+        recovery_rate = n_causal_top / n_causal
+        expected_recovery = n_top / n_gwas
+        recovery_lift = (
+            recovery_rate / expected_recovery
+        )
+
+        precision = n_causal_top / n_top
+        precision_lift = (
+            precision / causal_fraction
+        )
+
+        recovery_records.append({
+            "top_fraction": fraction,
+            "n_top": n_top,
+            "n_causal_top": n_causal_top,
+
+            # Fraction of all true causal SNPs recovered.
+            "causal_recovery_rate": recovery_rate,
+
+            # Expected recovery if causal labels were random.
+            "random_expected_recovery": expected_recovery,
+
+            # >1 means causal SNPs are enriched among strong GWAS hits.
+            "recovery_lift": recovery_lift,
+
+            # Fraction of top GWAS SNPs that are causal.
+            "precision": precision,
+
+            # Baseline genome-wide causal fraction.
+            "baseline_causal_fraction": causal_fraction,
+
+            # >1 means top GWAS hits contain more causal SNPs than expected.
+            "precision_lift": precision_lift,
+        })
+
+    recovery_df = pd.DataFrame(recovery_records)
+
+    summary = {
+        "n_gwas": n_gwas,
+        "n_causal": n_causal,
+        "causal_fraction": causal_fraction,
+
+        "causal_gwas_score_mean": float(
+            np.mean(causal_score)
+        ),
+        "causal_gwas_score_median": float(
+            np.median(causal_score)
+        ),
+
+        "noncausal_gwas_score_mean": float(
+            np.mean(noncausal_score)
+        ),
+        "noncausal_gwas_score_median": float(
+            np.median(noncausal_score)
+        ),
+
+        "causal_rank_percentile_mean": float(
+            causal_table["gwas_rank_percentile"].mean()
+        ),
+        "causal_rank_percentile_median": float(
+            causal_table["gwas_rank_percentile"].median()
+        ),
+
+        "beta2_vs_gwas_score_pearson_r": float(
+            pearson_r
+        ),
+        "beta2_vs_gwas_score_pearson_p": float(
+            pearson_p
+        ),
+
+        "beta2_vs_gwas_score_spearman_r": float(
+            spearman_r
+        ),
+        "beta2_vs_gwas_score_spearman_p": float(
+            spearman_p
+        ),
+
+        "causal_vs_noncausal_auc": float(auc),
+        "causal_vs_noncausal_mannwhitney_u": float(
+            mw_u
+        ),
+        "causal_vs_noncausal_mannwhitney_p": float(
+            mw_p
+        ),
+    }
+
+    return {
+        "summary": summary,
+        "recovery": recovery_df,
+        "causal_table": causal_table,
+    }
+
+
+
+class SIMULATION_JOB:
+    """Run one reproducible causal-SNP phenotype simulation and GWAS.
+
+    ``config`` is a dictionary with these required keys:
+
+    * ``name``: readable run label; used in file names.
+    * ``output_dir``: root directory for hash-addressed completed runs.
+    * ``genome_fasta_file``: reference FASTA used by the GWAS plot.
+    * ``site_info_df_h5``: HDF5 site annotation table, always loaded.
+    * ``input_vcf_file``: VCF used for sample IDs, genotypes and GWAS.
+    * ``kinship_ibs_file``: comma-separated, headerless kinship matrix in
+      exactly the VCF sample order.
+    * ``foreground_col``: boolean site-annotation column whose causal rate
+      is enriched relative to the background.
+    * Exactly one of ``causal_site_num`` (positive count) or
+      ``causal_fraction`` (fraction of LD-pruned sites in [0, 1]).
+
+    Optional keys and defaults:
+
+    * ``site_info_key='df'``: HDF5 key for the annotation table.
+    * ``maf_col='MAF'``: minor allele frequency column used for stratification.
+    * ``enrichment_ratio=1.0``: target ratio of foreground to background
+      causal probabilities within each MAF bin; 1 means no enrichment.
+      Set to ``None`` when using ``causal_foreground_fraction``.
+    * ``causal_foreground_fraction=None``: alternatively set the target
+      fraction of causal SNPs in the foreground, from 0 to 1 inclusive.
+      The foreground count is ``round(n_causal * fraction)``. SNPs are then
+      sampled across MAF bins within each foreground/background group.
+      The two controls cannot both be set or both be ``None``; infeasible
+      counts raise an error.
+    * ``ld_window_size=15000``: bp window for automatic LD pruning.
+    * ``r2_threshold=0.5``: discard later SNP when pairwise r² exceeds this.
+    * ``pool_num=40``: worker processes for automatic LD pruning.
+    * ``pruned_site_parameters=None``: required provenance dictionary when
+      ``pruned_site_df`` is supplied; record the external pruning method,
+      window, threshold, seed and other parameters used to make that table.
+    * ``pruned_site_ids_file=None``: path to a plain or gzip text file with
+      one SNP ID per line. When set, reconstruct the pruned table from the
+      site annotation HDF5 in file order and skip LD pruning. Missing or
+      duplicated IDs are errors. Cannot be combined with ``pruned_site_df``.
+    * ``effect_assignment={'method': 'random_sign_uniform', 'low': 0.5,
+      'high': 1.5}``: rule for assigning raw causal SNP effects.
+      ``normal`` draws each beta independently from a normal distribution;
+      provide its mean ``beta_loc`` and positive SD ``scale``. The older
+      nested key ``beta_scale`` is also accepted and normalized to ``scale``.
+      ``{'method': 'constant', 'value': 1.0}`` assigns the same numeric
+      ``beta_raw`` to every causal SNP. ``{'method': 'random_sign',
+      'magnitude': 1.0}`` independently assigns +1 or -1 with equal
+      probability to each site; ``magnitude`` must be positive.
+      ``{'method': 'random_sign_uniform'}`` first samples independent +1/-1
+      signs with equal probability, then samples magnitudes uniformly from
+      ``[low, high)`` using the same RNG; defaults are ``low=0.5`` and
+      ``high=1.5``. Both bounds must be positive and ``high > low``.
+      ``{'method': 'vector', 'values': [0.5, -1.0, ...]}`` assigns a supplied
+      one-dimensional numeric sequence positionally in ``causal_site_df['ID']``
+      order. Its length must equal the number of sampled causal SNPs. The
+      phenotype simulator subsequently rescales the joint causal component
+      to ``causal_var``; these are raw, not final phenotype-scale effects.
+    * ``causal_var=0.1``, ``kinship_var=0.6``, ``residual_var=0.3``:
+      target realized sample variances of the three phenotype components;
+      nonnegative values must sum to one.
+    * ``seed=12345``: master seed; pruning, sampling, betas and phenotype
+      use seed+1 through seed+4 respectively.
+    * ``threshold_fdr=0.05``: FDR threshold for the GWAS summary plot.
+    * ``lmm=1``: GEMMA linear mixed model mode (1=Wald, 4=all tests).
+    * ``plot_bins=50``: number of bins in that plot.
+    * ``enrichment={'top_percent': 0.05, 'pool_num': 40,
+      'permutations': 1000, 'show_progress': True,
+      'progress_interval': 2.0}``: after GWAS, compare the foreground and
+      background top score quantiles using circular-shift permutations.
+      The GWAS score is ``-log10(P_WALD)``; zero P-values are clipped to
+      the smallest positive float. Results are saved as gzip JSON.
+
+    Pass an optional ``pruned_site_df`` (also accepted by ``run``) to skip
+    LD pruning. Every completed run stores ``pruned_site_ids_file`` in its
+    result; pass that file as a config value to reuse the site selection in
+    another run. The annotation HDF5 is always read. The exact effective
+    config, input metadata and supplied table/ID-list content determine the
+    run hash. Completed runs are returned from the manifest; a matching
+    archived GWAS or unfinished GEMMA HDF can also be reused after the
+    phenotype, VCF, kinship and LMM mode have been checked.
+    """
+
+    DEFAULTS = {
+        "site_info_key": "df", "maf_col": "MAF", "causal_site_num": None,
+        "causal_fraction": None, "enrichment_ratio": 1.0,
+        "causal_foreground_fraction": None,
+        "ld_window_size": 15000, "r2_threshold": 0.5, "pool_num": 40,
+        "pruned_site_parameters": None, "pruned_site_ids_file": None,
+        "effect_assignment": {"method": "random_sign_uniform",
+                              "low": 0.5, "high": 1.5},
+        "causal_var": 0.1, "kinship_var": 0.6,
+        "residual_var": 0.3, "seed": 12345, "threshold_fdr": 0.05,
+        "lmm": 1,
+        "plot_bins": 50,
+        "enrichment": {"top_percent": 0.05, "pool_num": 40,
+                       "permutations": 1000, "show_progress": True,
+                       "progress_interval": 2.0},
+    }
+    REQUIRED = {
+        "name", "output_dir", "genome_fasta_file", "site_info_df_h5",
+        "input_vcf_file", "kinship_ibs_file", "foreground_col",
+    }
+
+    def __init__(self, config, *, pruned_site_df=None):
+        if not isinstance(config, dict):
+            raise TypeError("config must be a dictionary")
+        if "beta_loc" in config or "beta_scale" in config:
+            raise ValueError("Move beta_loc and beta_scale into effect_assignment")
+        missing = self.REQUIRED - config.keys()
+        unknown = config.keys() - (self.REQUIRED | self.DEFAULTS.keys())
+        if missing or unknown:
+            raise ValueError(f"Missing config keys: {sorted(missing)}; unknown keys: {sorted(unknown)}")
+        self.config = {**self.DEFAULTS, **config}
+        self.name = str(self.config["name"])
+        if not self.name or Path(self.name).name != self.name or self.name in {".", ".."}:
+            raise ValueError("name must be a nonempty file-name component")
+        self.output_root = Path(self.config["output_dir"]).expanduser().resolve()
+        self.genome_fasta_file = str(self.config["genome_fasta_file"])
+        self.site_info_df_h5 = str(self.config["site_info_df_h5"])
+        self.input_vcf_file = str(self.config["input_vcf_file"])
+        self.kinship_ibs_file = str(self.config["kinship_ibs_file"])
+        self.foreground_col = self.config["foreground_col"]
+        self.site_info_key = self.config["site_info_key"]
+        self.maf_col = self.config["maf_col"]
+        self.pruned_site_df = pruned_site_df
+        self.pruned_site_parameters = self.config["pruned_site_parameters"]
+        self.input_pruned_site_ids_file = self.config["pruned_site_ids_file"]
+        if pruned_site_df is not None and self.input_pruned_site_ids_file is not None:
+            raise ValueError("Provide either pruned_site_df or pruned_site_ids_file, not both")
+        if pruned_site_df is not None and (not isinstance(self.pruned_site_parameters, dict) or not self.pruned_site_parameters):
+            raise ValueError("pruned_site_parameters must be a nonempty dictionary for supplied pruned_site_df")
+
+        causal_site_num = self.config["causal_site_num"]
+        causal_fraction = self.config["causal_fraction"]
+        if (causal_site_num is None) == (causal_fraction is None):
+            raise ValueError(
+                "Specify exactly one of causal_site_num or causal_fraction"
+            )
+
+        self.causal_site_num = causal_site_num
+        self.causal_fraction = causal_fraction
+        ratio = self.config["enrichment_ratio"]
+        foreground_fraction = self.config["causal_foreground_fraction"]
+        if (ratio is None) == (foreground_fraction is None):
+            raise ValueError(
+                "Specify exactly one of enrichment_ratio or causal_foreground_fraction"
+            )
+        if ratio is not None:
+            if isinstance(ratio, (bool, np.bool_)):
+                raise ValueError("enrichment_ratio must be a finite positive number")
+            try:
+                ratio = float(ratio)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("enrichment_ratio must be a finite positive number") from exc
+            if not np.isfinite(ratio) or ratio <= 0:
+                raise ValueError("enrichment_ratio must be a finite positive number")
+        else:
+            if isinstance(foreground_fraction, (bool, np.bool_)):
+                raise ValueError("causal_foreground_fraction must be in [0, 1]")
+            try:
+                foreground_fraction = float(foreground_fraction)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("causal_foreground_fraction must be in [0, 1]") from exc
+            if not np.isfinite(foreground_fraction) or not 0 <= foreground_fraction <= 1:
+                raise ValueError("causal_foreground_fraction must be in [0, 1]")
+        self.enrichment_ratio = ratio
+        self.causal_foreground_fraction = foreground_fraction
+        self.config["enrichment_ratio"] = ratio
+        self.config["causal_foreground_fraction"] = foreground_fraction
+
+        self.ld_window_size = int(self.config["ld_window_size"])
+        self.r2_threshold = float(self.config["r2_threshold"])
+        self.pool_num = int(self.config["pool_num"])
+
+        self.effect_assignment = self._validate_effect_assignment(
+            self.config["effect_assignment"]
+        )
+        self.config["effect_assignment"] = self.effect_assignment
+
+        self.causal_var = float(self.config["causal_var"])
+        self.kinship_var = float(self.config["kinship_var"])
+        self.residual_var = float(self.config["residual_var"])
+
+        if not np.isclose(
+            self.causal_var + self.kinship_var + self.residual_var,
+            1.0,
+        ):
+            raise ValueError(
+                "causal_var + kinship_var + residual_var must equal 1"
+            )
+        if (self.effect_assignment["method"] == "constant"
+                and self.effect_assignment["value"] == 0
+                and self.causal_var > 0):
+            raise ValueError(
+                "constant effect value cannot be zero when causal_var > 0"
+            )
+        if self.effect_assignment["method"] == "vector":
+            values = self.effect_assignment["values"]
+            if self.causal_site_num is not None and len(values) != self.causal_site_num:
+                raise ValueError(
+                    f"effect_assignment values has {len(values)} entries, "
+                    f"but causal_site_num is {self.causal_site_num}"
+                )
+            if self.causal_var > 0 and not any(values):
+                raise ValueError(
+                    "effect_assignment values cannot all be zero when causal_var > 0"
+                )
+
+        self.seed = int(self.config["seed"])
+        self.prune_seed = self.seed + 1
+        self.causal_sample_seed = self.seed + 2
+        self.beta_seed = self.seed + 3
+        self.phenotype_seed = self.seed + 4
+
+        self.threshold_fdr = float(self.config["threshold_fdr"])
+        self.lmm = self.config["lmm"]
+        if isinstance(self.lmm, (bool, np.bool_)) or self.lmm not in (1, 4):
+            raise ValueError("lmm must be 1 (Wald) or 4 (all tests)")
+        self.lmm = int(self.lmm)
+        self.config["lmm"] = self.lmm
+        self.plot_bins = int(self.config["plot_bins"])
+        self.enrichment = self._validate_enrichment(self.config["enrichment"])
+        self.config["enrichment"] = self.enrichment
+        self.output_dir = None
+
+        self._start_time = None
+
+    @staticmethod
+    def _validate_effect_assignment(value):
+        if not isinstance(value, dict):
+            raise TypeError("effect_assignment must be a dictionary")
+        method = value.get("method")
+        if method not in {"normal", "constant", "random_sign",
+                          "random_sign_uniform", "vector"}:
+            raise ValueError(f"Unknown effect_assignment method: {method!r}")
+        if method == "normal" and set(value) == {"method", "beta_loc", "beta_scale"}:
+            value = {"method": "normal", "beta_loc": value["beta_loc"],
+                     "scale": value["beta_scale"]}
+        if method == "random_sign_uniform":
+            value = {"low": 0.5, "high": 1.5, **value}
+        required = {
+            "normal": {"method", "beta_loc", "scale"},
+            "constant": {"method", "value"},
+            "random_sign": {"method", "magnitude"},
+            "random_sign_uniform": {"method", "low", "high"},
+            "vector": {"method", "values"},
+        }[method]
+        if set(value) != required:
+            raise ValueError(
+                f"effect_assignment method {method!r} requires exactly "
+                f"{sorted(required)}"
+            )
+        if method == "vector":
+            supplied = value["values"]
+            if isinstance(supplied, (str, bytes, dict)):
+                raise ValueError("effect_assignment values must be a one-dimensional numeric sequence")
+            try:
+                raw = np.asarray(supplied, dtype=object)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "effect_assignment values must be a one-dimensional numeric sequence"
+                ) from exc
+            if raw.ndim != 1 or len(raw) == 0 or any(
+                isinstance(item, (bool, np.bool_)) for item in raw
+            ):
+                raise ValueError("effect_assignment values must be a nonempty one-dimensional numeric sequence")
+            try:
+                values = raw.astype(float)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("effect_assignment values must be numeric") from exc
+            if not np.isfinite(values).all():
+                raise ValueError("effect_assignment values must be finite")
+            return {"method": "vector", "values": values.tolist()}
+        keys = required - {"method"}
+        for key in keys:
+            if isinstance(value[key], bool):
+                raise ValueError(f"effect_assignment {key} must be a finite number")
+            try:
+                number = float(value[key])
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"effect_assignment {key} must be a finite number"
+                ) from exc
+            if not np.isfinite(number):
+                raise ValueError(f"effect_assignment {key} must be a finite number")
+        result = {"method": method, **{key: float(value[key]) for key in keys}}
+        if method == "normal" and result["scale"] <= 0:
+            raise ValueError("effect_assignment scale must be > 0")
+        if method == "random_sign" and result["magnitude"] <= 0:
+            raise ValueError("effect_assignment magnitude must be > 0")
+        if method == "random_sign_uniform":
+            if result["low"] <= 0:
+                raise ValueError("effect_assignment low must be > 0")
+            if result["high"] <= result["low"]:
+                raise ValueError("effect_assignment high must be > low")
+        return result
+
+    @classmethod
+    def _validate_enrichment(cls, value):
+        if not isinstance(value, dict):
+            raise TypeError("enrichment must be a dictionary")
+        defaults = cls.DEFAULTS["enrichment"]
+        unknown = set(value) - set(defaults)
+        if unknown:
+            raise ValueError(f"Unknown enrichment keys: {sorted(unknown)}")
+        result = {**defaults, **value}
+        for key in ("top_percent", "progress_interval"):
+            if isinstance(result[key], (bool, np.bool_)):
+                raise ValueError(f"enrichment {key} must be a finite number")
+            try:
+                result[key] = float(result[key])
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"enrichment {key} must be a finite number") from exc
+            if not np.isfinite(result[key]):
+                raise ValueError(f"enrichment {key} must be a finite number")
+        if not 0 < result["top_percent"] < 1:
+            raise ValueError("enrichment top_percent must be in (0, 1)")
+        if result["progress_interval"] <= 0:
+            raise ValueError("enrichment progress_interval must be > 0")
+        for key in ("pool_num", "permutations"):
+            number = result[key]
+            if isinstance(number, (bool, np.bool_)) or not isinstance(number, (int, np.integer)) or number <= 0:
+                raise ValueError(f"enrichment {key} must be a positive integer")
+            result[key] = int(number)
+        if not isinstance(result["show_progress"], (bool, np.bool_)):
+            raise ValueError("enrichment show_progress must be boolean")
+        result["show_progress"] = bool(result["show_progress"])
+        return result
+
+    def _set_paths(self, directory):
+        self.output_dir = Path(directory)
+        self.output_prefix = self.output_dir / self.name
+        self.log_file = self.output_dir / f"{self.name}.simulation.log"
+        self.gemma_log_file = self.output_dir / f"{self.name}.gemma.log"
+        self.config_file = self.output_dir / f"{self.name}.config.json"
+        self.manifest_file = self.output_dir / f"{self.name}.manifest.json"
+        self.causal_site_file = self.output_dir / f"{self.name}.causal_sites.tsv"
+        self.causal_effect_file = self.output_dir / f"{self.name}.causal_effects.tsv"
+        self.causal_sampling_file = self.output_dir / f"{self.name}.causal_sampling.tsv"
+        self.qc_summary_file = self.output_dir / f"{self.name}.gwas_qc.json"
+        self.qc_recovery_file = self.output_dir / f"{self.name}.gwas_qc_recovery.tsv"
+        self.qc_causal_table_file = self.output_dir / f"{self.name}.gwas_qc_causal.tsv"
+        self.phenotype_archive = self.output_dir / f"{self.name}.phenotype.csv.gz"
+        self.gwas_archive = self.output_dir / f"{self.name}.gwas.csv.gz"
+        self.results_json_archive = self.output_dir / f"{self.name}.results.json.gz"
+        self.pruned_site_ids_file = self.output_dir / f"{self.name}.pruned_site_ids.txt.gz"
+        self.pruning_metadata_file = self.output_dir / f"{self.name}.pruning.json"
+        self.enrichment_file = self.output_dir / f"{self.name}.enrichment.json.gz"
+
+    def _now(self):
+        return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    def log(self, message):
+        line = f"[{self._now()}] {message}"
+        print(line, flush=True)
+        with open(self.log_file, "a") as f:
+            f.write(line + "\n")
+
+    def _step(self, i, n, message):
+        self.log(f"[{i}/{n}] {message}")
+
+    def _config(self):
+        return {
+            **self.config,
+            "prune_seed": self.prune_seed,
+            "causal_sample_seed": self.causal_sample_seed,
+            "beta_seed": self.beta_seed,
+            "phenotype_seed": self.phenotype_seed,
+        }
+
+    def _run_hash(self, pruned_site_df, plot):
+        inputs = {}
+        for key in ("genome_fasta_file", "site_info_df_h5", "input_vcf_file", "kinship_ibs_file"):
+            path = Path(self.config[key]).expanduser().resolve()
+            stat = path.stat()
+            inputs[key] = {"path": str(path), "size": stat.st_size,
+                           "mtime_ns": stat.st_mtime_ns}
+        if pruned_site_df is not None:
+            if not isinstance(pruned_site_df, pd.DataFrame) or pruned_site_df.empty:
+                raise ValueError("pruned_site_df must be a nonempty DataFrame")
+            h = hashlib.sha256()
+            h.update(pd.util.hash_pandas_object(pruned_site_df, index=True).values.tobytes())
+            h.update(json.dumps([(str(c), str(t)) for c, t in
+                                 zip(pruned_site_df.columns, pruned_site_df.dtypes)]).encode())
+            inputs["pruned_site_df_sha256"] = h.hexdigest()
+        if self.input_pruned_site_ids_file is not None:
+            path = Path(self.input_pruned_site_ids_file).expanduser().resolve()
+            inputs["pruned_site_ids_file"] = {
+                "path": str(path), "sha256": self._file_sha256(path),
+            }
+        pruning_mode = ("supplied_df" if pruned_site_df is not None else
+                        "id_list" if self.input_pruned_site_ids_file is not None else
+                        "automatic")
+        payload = {"config": self._config(), "inputs": inputs,
+                   "pruning_mode": pruning_mode,
+                   "plot": bool(plot), "pipeline_version": 5}
+        encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False,
+                             separators=(",", ":"), allow_nan=False).encode()
+        return hashlib.sha256(encoded).hexdigest(), payload
+
+    @staticmethod
+    def _file_sha256(path):
+        h = hashlib.sha256()
+        with open(path, "rb") as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                h.update(chunk)
+        return h.hexdigest()
+
+    @staticmethod
+    def _read_site_ids(path):
+        path = Path(path)
+        opener = gzip.open if path.suffix == ".gz" else open
+        with opener(path, "rt") as source:
+            ids = [line.rstrip("\r\n") for line in source]
+        if not ids or any(not item or item != item.strip() for item in ids):
+            raise ValueError(f"ID list has no IDs or contains blank/whitespace IDs: {path}")
+        if len(ids) != len(set(ids)):
+            raise ValueError(f"ID list contains duplicate SNP IDs: {path}")
+        return ids
+
+    @staticmethod
+    def _from_site_ids(site_info_df, ids):
+        if "ID" not in site_info_df.columns:
+            raise ValueError("site_info_df must contain ID")
+        site_ids = pd.Index(site_info_df["ID"].astype(str))
+        if not site_ids.is_unique:
+            raise ValueError("site_info_df contains duplicate SNP IDs")
+        positions = site_ids.get_indexer(ids)
+        missing = [ids[i] for i, position in enumerate(positions) if position < 0]
+        if missing:
+            raise ValueError(f"{len(missing)} pruned SNP IDs missing from site_info_df; examples: {missing[:10]}")
+        return site_info_df.iloc[positions].copy()
+
+    def _write_site_ids(self, pruned_site_df, pruning_record):
+        if "ID" not in pruned_site_df.columns:
+            raise ValueError("pruned_site_df must contain ID")
+        raw_ids = pruned_site_df["ID"]
+        if raw_ids.isna().any():
+            raise ValueError("pruned_site_df contains missing SNP IDs")
+        ids = raw_ids.astype(str).tolist()
+        if not ids or len(ids) != len(set(ids)):
+            raise ValueError("pruned_site_df must contain unique SNP IDs")
+        with gzip.open(self.pruned_site_ids_file, "wt") as out:
+            for item in ids:
+                out.write(item + "\n")
+        with open(self.pruning_metadata_file, "w") as out:
+            json.dump({"pruning_record": pruning_record,
+                       "n_sites": len(ids),
+                       "ids_sha256": self._file_sha256(self.pruned_site_ids_file)}, out, indent=2)
+        self.log(f"Saved {len(ids):,} pruned SNP IDs: {self.pruned_site_ids_file}")
+
+    def load_pruned_site_df(self):
+        """Rebuild the completed run's pruned table from saved IDs and annotations."""
+        if self.output_dir is None or not self.pruned_site_ids_file.is_file():
+            raise FileNotFoundError("No completed pruned-site ID list is available")
+        ids = self._read_site_ids(self.pruned_site_ids_file)
+        site_info_df = pd.read_hdf(self.site_info_df_h5, key=self.site_info_key)
+        return self._from_site_ids(site_info_df, ids)
+
+    def _result(self, cached):
+        with open(self.qc_summary_file) as f:
+            summary = json.load(f)
+        return {
+            "name": self.name, "run_hash": self.run_hash, "cached": cached,
+            "output_dir": self.output_dir, "config": self._config(),
+            "phenotype_file": self.phenotype_archive,
+            "gwas_file": self.gwas_archive,
+            "results_json_file": self.results_json_archive,
+            "pruned_site_ids_file": self.pruned_site_ids_file,
+            "pruning_metadata_file": self.pruning_metadata_file,
+            "enrichment_file": self.enrichment_file,
+            "enrichment_result": self._read_enrichment_result(),
+            "phenotype_df": pd.read_csv(self.phenotype_archive),
+            "gwas_df": pd.read_csv(self.gwas_archive),
+            "causal_site_df": pd.read_csv(self.causal_site_file, sep="\t"),
+            "causal_effect_df": pd.read_csv(self.causal_effect_file, sep="\t"),
+            "gwas_qc": {
+                "summary": summary,
+                "recovery": pd.read_csv(self.qc_recovery_file, sep="\t"),
+                "causal_table": pd.read_csv(self.qc_causal_table_file, sep="\t"),
+            },
+            "log_file": self.log_file, "gemma_log_file": self.gemma_log_file,
+            "config_file": self.config_file,
+        }
+
+    def _read_enrichment_result(self):
+        with gzip.open(self.enrichment_file, "rt") as source:
+            return json.load(source)
+
+    def _collect_gemma_logs(self, source_dir=None):
+        source_dir = self.output_dir if source_dir is None else Path(source_dir)
+        blocks = source_dir / f"{self.name}.gemma" / "blocks"
+        logs = sorted(blocks.glob("block_*.gemma/output/gemma_output.log.txt"))
+        with open(self.gemma_log_file, "w") as out:
+            for path in logs:
+                out.write(f"===== {path.parent.parent.name} =====\n")
+                with open(path, errors="replace") as source:
+                    shutil.copyfileobj(source, out)
+                out.write("\n")
+                wrapper_log = path.parent.parent / "gemma.log"
+                if wrapper_log.is_file():
+                    out.write("--- command output ---\n")
+                    with open(wrapper_log, errors="replace") as source:
+                        shutil.copyfileobj(source, out)
+                    out.write("\n")
+        self.log(f"Collected GEMMA logs from {len(logs)} blocks")
+
+    def _archive_and_cleanup(self, phenotype_outputs, gwas_df, gemma_job):
+        phenotype = pd.read_csv(phenotype_outputs["phenotype_file"], sep="\t")
+        phenotype[["sample_id", "phenotype"]].to_csv(
+            self.phenotype_archive, index=False, compression="gzip")
+        if not {"ID", "P_WALD"}.issubset(gwas_df.columns):
+            raise ValueError("GWAS table must contain ID and P_WALD")
+        gwas_df[["ID", "P_WALD"]].to_csv(
+            self.gwas_archive, index=False, compression="gzip")
+        with open(self.config_file) as source:
+            run_spec = json.load(source)
+        with open(self.qc_summary_file) as source:
+            qc_summary = json.load(source)
+        enrichment_result = self._read_enrichment_result()
+        with gzip.open(self.results_json_archive, "wt") as out:
+            json.dump({"run_hash": self.run_hash, "run_spec": run_spec,
+                       "gwas_qc_summary": qc_summary,
+                       "enrichment_stat": enrichment_result["stat"],
+                       "n_samples": len(phenotype), "n_gwas": len(gwas_df)}, out)
+        plot_file = Path(gemma_job.gwas_df_h5.replace(".h5", "_gwas_summary.png"))
+        if plot_file.is_file():
+            shutil.copy2(plot_file, self.output_dir / f"{self.name}.gwas_summary.png")
+        if not self.gemma_log_file.is_file():
+            self._collect_gemma_logs()
+        shutil.rmtree(self.output_dir / f"{self.name}.gemma")
+        for path in self.output_dir.glob(f"{self.name}.*"):
+            if path.name.endswith((".gemma.pheno", ".phenotype.tsv", ".components.tsv",
+                                   ".bimbam")):
+                path.unlink()
+        self.log("Archived phenotype and GWAS as gzip CSV; removed intermediate files")
+
+    def _load_inputs(self):
+        site_info_df = pd.read_hdf(
+            self.site_info_df_h5,
+            key=self.site_info_key,
+        )
+
+        sample_id_list = get_sample_list_from_vcf(
+            self.input_vcf_file
+        )
+
+        kinship_df = pd.read_csv(
+            self.kinship_ibs_file,
+            sep=",",
+            header=None,
+            names=sample_id_list,
+        )
+        kinship_df.index = sample_id_list
+
+        if self.foreground_col not in site_info_df.columns:
+            raise ValueError(
+                f"{self.foreground_col!r} not found in site_info_df"
+            )
+
+        if self.maf_col not in site_info_df.columns:
+            raise ValueError(
+                f"{self.maf_col!r} not found in site_info_df"
+            )
+
+        return site_info_df, sample_id_list, kinship_df
+
+    def _log_fg_bg(self, df, label):
+        fg_num = int(df[self.foreground_col].sum())
+        bg_num = len(df) - fg_num
+        fg_prop = fg_num / len(df)
+        bg_prop = bg_num / len(df)
+
+        self.log(
+            f"{label}: total={len(df):,}, "
+            f"FG={fg_num:,} ({fg_prop:.2%}), "
+            f"BG={bg_num:,} ({bg_prop:.2%})"
+        )
+
+    def _prune_sites(self, site_info_df):
+        self.log(
+            f"LD pruning started: window={self.ld_window_size:,} bp, "
+            f"r2>{self.r2_threshold}, seed={self.prune_seed}, "
+            f"pool={self.pool_num}"
+        )
+
+        t0 = time.time()
+
+        pruned_with_log_df = prune_sites_by_ld(
+            site_info_df.sample(
+                frac=1,
+                random_state=self.prune_seed,
+            ),
+            self.input_vcf_file,
+            ld_window_size=self.ld_window_size,
+            r2_threshold=self.r2_threshold,
+            pool_num=self.pool_num,
+            full_output=True,
+        )
+
+        pruned_with_log_df.sort_index(inplace=True)
+
+        pruned_site_df = pruned_with_log_df[
+            pruned_with_log_df["LD_PRUNING_KEEP"]
+        ].copy()
+
+        self.log(
+            f"LD pruning finished in {(time.time() - t0) / 60:.2f} min: "
+            f"{len(site_info_df):,} -> {len(pruned_site_df):,} SNPs "
+            f"({len(pruned_site_df) / len(site_info_df):.2%} retained)"
+        )
+
+        return pruned_site_df
+
+    def _sample_causal_sites(self, pruned_site_df):
+        if self.causal_site_num is not None:
+            if self.causal_site_num <= 0:
+                raise ValueError("causal_site_num must be > 0")
+            if self.causal_site_num > len(pruned_site_df):
+                raise ValueError(
+                    "causal_site_num exceeds number of pruned SNPs"
+                )
+
+            causal_fraction = (
+                self.causal_site_num / len(pruned_site_df)
+            )
+        else:
+            causal_fraction = float(self.causal_fraction)
+
+        control = (
+            f"enrichment_ratio={self.enrichment_ratio:g}"
+            if self.enrichment_ratio is not None else
+            f"causal_foreground_fraction={self.causal_foreground_fraction:g}"
+        )
+        self.log(
+            f"Sampling causal SNPs: target_fraction={causal_fraction:.6g}, "
+            f"target_n≈{causal_fraction * len(pruned_site_df):.1f}, "
+            f"{control}, "
+            f"seed={self.causal_sample_seed}"
+        )
+
+        sampled_df, summary = sample_causal_snps(
+            pruned_site_df,
+            causal_fraction=causal_fraction,
+            enrichment_ratio=self.enrichment_ratio,
+            causal_foreground_fraction=self.causal_foreground_fraction,
+            maf_col=self.maf_col,
+            foreground_col=self.foreground_col,
+            seed=self.causal_sample_seed,
+            causal_col="causal",
+        )
+
+        causal_site_df = sampled_df[
+            sampled_df["causal"]
+        ].copy()
+
+        fg = sampled_df[self.foreground_col].astype(bool)
+
+        fg_causal_rate = sampled_df.loc[
+            fg, "causal"
+        ].mean()
+
+        bg_causal_rate = sampled_df.loc[
+            ~fg, "causal"
+        ].mean()
+
+        realized_enrichment = (
+            fg_causal_rate / bg_causal_rate
+            if bg_causal_rate > 0
+            else np.nan
+        )
+
+        n_causal_fg = int(
+            causal_site_df[self.foreground_col].sum()
+        )
+        n_causal_bg = len(causal_site_df) - n_causal_fg
+
+        self.log(
+            f"Causal sampling finished: n={len(causal_site_df):,}, "
+            f"FG={n_causal_fg:,}, BG={n_causal_bg:,}, "
+            f"FG rate={fg_causal_rate:.4%}, "
+            f"BG rate={bg_causal_rate:.4%}, "
+            f"realized enrichment={realized_enrichment:.4f}"
+        )
+
+        summary.to_csv(
+            self.causal_sampling_file,
+            sep="\t",
+            index=False,
+        )
+
+        causal_site_df.to_csv(
+            self.causal_site_file,
+            sep="\t",
+            index=False,
+        )
+
+        return sampled_df, causal_site_df, summary
+
+    def _prepare_causal_effects(self, causal_site_df):
+        self.log(
+            f"Extracting genotype for {len(causal_site_df):,} causal SNPs"
+        )
+
+        t0 = time.time()
+
+        causal_genotype_df = (
+            get_genotype_df_from_vcf_by_site_df(
+                self.input_vcf_file,
+                causal_site_df,
+            )
+            .transpose()
+        )
+
+        self.log(
+            f"Causal genotype extraction finished in "
+            f"{time.time() - t0:.2f} s: "
+            f"shape={causal_genotype_df.shape}"
+        )
+
+        causal_ids = (
+            causal_site_df["ID"]
+            .astype(str)
+            .tolist()
+        )
+
+        causal_genotype_df.columns = (
+            causal_genotype_df.columns.astype(str)
+        )
+
+        if set(causal_genotype_df.columns) != set(causal_ids):
+            raise ValueError(
+                "Extracted causal genotype SNP IDs do not match causal_site_df"
+            )
+
+        causal_genotype_df = causal_genotype_df.loc[
+            :,
+            causal_ids,
+        ]
+
+        causal_effect_df = pd.DataFrame({
+            "SNP_ID": causal_ids,
+            "beta_raw": self._assign_effects(len(causal_ids)),
+        })
+
+        causal_effect_df.to_csv(
+            self.causal_effect_file,
+            sep="\t",
+            index=False,
+        )
+
+        if self.effect_assignment["method"] == "normal":
+            description = (
+                f"N({self.effect_assignment['beta_loc']:g}, "
+                f"{self.effect_assignment['scale']:g}^2), seed={self.beta_seed}"
+            )
+        elif self.effect_assignment["method"] == "constant":
+            description = f"constant={self.effect_assignment['value']:g}"
+        elif self.effect_assignment["method"] == "random_sign":
+            description = (
+                f"random_sign magnitude={self.effect_assignment['magnitude']:g}, "
+                f"P(+)=P(-)=0.5, seed={self.beta_seed}"
+            )
+        elif self.effect_assignment["method"] == "random_sign_uniform":
+            description = (
+                f"random_sign_uniform magnitude=U("
+                f"{self.effect_assignment['low']:g}, "
+                f"{self.effect_assignment['high']:g}), "
+                f"P(+)=P(-)=0.5, seed={self.beta_seed}"
+            )
+        else:
+            description = f"vector n={len(self.effect_assignment['values'])}"
+        self.log(
+            f"Beta assigned: {description}, "
+            f"mean={causal_effect_df['beta_raw'].mean():.4f}, "
+            f"sd={causal_effect_df['beta_raw'].std(ddof=0):.4f}"
+        )
+
+        return causal_genotype_df, causal_effect_df
+
+    def _assign_effects(self, n_sites):
+        """Assign raw betas according to the configured effect rule."""
+        rule = self.effect_assignment
+        if rule["method"] == "normal":
+            return np.random.default_rng(self.beta_seed).normal(
+                loc=rule["beta_loc"], scale=rule["scale"],
+                size=n_sites,
+            )
+        if rule["method"] == "constant":
+            return np.full(n_sites, rule["value"], dtype=float)
+        if rule["method"] == "random_sign":
+            signs = np.random.default_rng(self.beta_seed).choice(
+                [-1.0, 1.0], size=n_sites
+            )
+            return signs * rule["magnitude"]
+        if rule["method"] == "random_sign_uniform":
+            beta_rng = np.random.default_rng(self.beta_seed)
+            signs = beta_rng.choice([-1.0, 1.0], size=n_sites)
+            magnitudes = beta_rng.uniform(
+                rule["low"], rule["high"], size=n_sites
+            )
+            return signs * magnitudes
+        if rule["method"] == "vector":
+            values = rule["values"]
+            if len(values) != n_sites:
+                raise ValueError(
+                    f"effect_assignment values has {len(values)} entries, "
+                    f"but {n_sites} causal SNPs were sampled"
+                )
+            return np.asarray(values, dtype=float).copy()
+        raise RuntimeError(f"Unsupported effect assignment: {rule['method']}")
+
+    def _simulate_phenotype(
+        self,
+        causal_genotype_df,
+        causal_effect_df,
+        kinship_df,
+    ):
+        self.log(
+            f"Phenotype simulation started: "
+            f"causal_var={self.causal_var:g}, "
+            f"kinship_var={self.kinship_var:g}, "
+            f"residual_var={self.residual_var:g}, "
+            f"seed={self.phenotype_seed}"
+        )
+
+        t0 = time.time()
+
+        outputs = simulate_phenotype_with_kinship(
+            causal_genotype_df=causal_genotype_df,
+            causal_effect_df=causal_effect_df,
+            kinship_df=kinship_df,
+            output_prefix=self.output_prefix,
+            causal_var=self.causal_var,
+            kinship_var=self.kinship_var,
+            residual_var=self.residual_var,
+            seed=self.phenotype_seed,
+        )
+
+        meta = outputs["metadata"]
+
+        self.log(
+            f"Phenotype simulation finished in {time.time() - t0:.2f} s: "
+            f"n={meta['n_samples']}, causal={meta['n_causal']}, "
+            f"phenotype_var={meta['realized_phenotype_variance']:.4f}"
+        )
+
+        return outputs
+
+    def _prepare_gemma_pheno(self, outputs):
+        phenotype_file = str(
+            outputs["phenotype_file"]
+        )
+
+        gemma_pheno_file = (
+            str(self.output_prefix)
+            + ".bimbam"
+        )
+
+        pheno_df = pd.read_csv(
+            phenotype_file,
+            sep="\t",
+        )
+
+        pheno_df["phenotype"].to_csv(
+            gemma_pheno_file,
+            index=False,
+            header=False,
+        )
+
+        self.log(
+            f"GEMMA phenotype prepared: {gemma_pheno_file}"
+        )
+
+        return gemma_pheno_file
+
+    def _find_existing_gemma_result(self):
+        """Find a previous GWAS for the same phenotype, inputs and LMM mode."""
+        current_inputs = self._current_run_spec["inputs"]
+        current_phenotype = pd.read_csv(
+            f"{self.output_prefix}.phenotype.tsv", sep="\t"
+        )[["sample_id", "phenotype"]]
+        for directory in sorted(self.output_root.iterdir(),
+                                key=lambda path: path.stat().st_mtime_ns,
+                                reverse=True):
+            if not directory.is_dir() or directory == self.output_dir:
+                continue
+            spec_file = directory / f"{self.name}.config.json"
+            if not spec_file.is_file():
+                continue
+            try:
+                with open(spec_file) as source:
+                    spec = json.load(source)
+                candidate_inputs = spec["inputs"]
+                if any(candidate_inputs.get(key) != current_inputs.get(key)
+                       for key in ("input_vcf_file", "kinship_ibs_file")):
+                    continue
+                if spec["config"].get("lmm", 4) != self.lmm:
+                    continue
+                phenotype_file = directory / f"{self.name}.phenotype.csv.gz"
+                if phenotype_file.is_file():
+                    previous_phenotype = pd.read_csv(phenotype_file)
+                else:
+                    phenotype_file = directory / f"{self.name}.phenotype.tsv"
+                    if not phenotype_file.is_file():
+                        continue
+                    previous_phenotype = pd.read_csv(phenotype_file, sep="\t")
+                previous_phenotype = previous_phenotype[["sample_id", "phenotype"]]
+                if (previous_phenotype["sample_id"].astype(str).tolist()
+                        != current_phenotype["sample_id"].astype(str).tolist()
+                        or not np.array_equal(
+                            previous_phenotype["phenotype"].to_numpy(),
+                            current_phenotype["phenotype"].to_numpy(),
+                        )):
+                    continue
+                h5_file = (directory / f"{self.name}.gemma" /
+                           f"{self.name}.gemma.gwas_df.h5")
+                if h5_file.is_file():
+                    gwas_df = pd.read_hdf(h5_file, key="df")
+                    source_file = h5_file
+                else:
+                    source_file = directory / f"{self.name}.gwas.csv.gz"
+                    if not source_file.is_file():
+                        continue
+                    gwas_df = pd.read_csv(source_file)
+                if gwas_df.empty or not {"ID", "P_WALD"}.issubset(gwas_df.columns):
+                    continue
+                return directory, source_file, gwas_df
+            except (OSError, ValueError, KeyError, TypeError):
+                continue
+        return None
+
+    def _restore_gemma_result(self, existing, gemma_job):
+        directory, source_file, gwas_df = existing
+        if source_file.suffix == ".gz":
+            site_info_df = self._gemma_site_info_df[["ID", "CHROM", "POS"]].copy()
+            site_info_df["ID"] = site_info_df["ID"].astype(str)
+            gwas_df["ID"] = gwas_df["ID"].astype(str)
+            if site_info_df["ID"].duplicated().any() or gwas_df["ID"].duplicated().any():
+                raise ValueError("Cannot restore GWAS with duplicate SNP IDs")
+            gwas_df = gwas_df.merge(site_info_df, on="ID", how="left",
+                                    validate="one_to_one")
+            if gwas_df[["CHROM", "POS"]].isna().any().any():
+                raise ValueError("Archived GWAS SNP IDs are missing from site_info_df")
+            gwas_df["P_VALUE"] = gwas_df["P_WALD"]
+            gwas_df["FDR"] = multipletests(gwas_df["P_VALUE"], method="fdr_bh")[1]
+        Path(gemma_job.gwas_df_h5).parent.mkdir(parents=True, exist_ok=True)
+        if source_file.suffix == ".h5":
+            shutil.copy2(source_file, gemma_job.gwas_df_h5)
+        else:
+            gwas_df.to_hdf(gemma_job.gwas_df_h5, key="df", mode="w")
+        prior_log = directory / f"{self.name}.gemma.log"
+        if prior_log.is_file():
+            shutil.copy2(prior_log, self.gemma_log_file)
+        else:
+            self._collect_gemma_logs(directory)
+        with open(self.config_file) as source:
+            run_spec = json.load(source)
+        run_spec["gemma_reused_from"] = str(source_file)
+        with open(self.config_file, "w") as out:
+            json.dump(run_spec, out, indent=2, ensure_ascii=False)
+        self.log(f"Reused GEMMA GWAS from {source_file}")
+        return gwas_df
+
+    def _run_gemma(self, gemma_pheno_file):
+        self.log("GEMMA GWAS started")
+
+        t0 = time.time()
+
+        gemma_job = GEMMA_JOB(
+            self.name,
+            str(self.output_dir),
+            self.input_vcf_file,
+            gemma_pheno_file,
+            self.kinship_ibs_file,
+            self.lmm,
+        )
+
+        existing = self._find_existing_gemma_result()
+        if existing is None:
+            gemma_job.run()
+            gwas_df = pd.read_hdf(gemma_job.gwas_df_h5)
+        else:
+            gwas_df = self._restore_gemma_result(existing, gemma_job)
+
+        self.log(
+            f"GEMMA GWAS finished in {(time.time() - t0) / 60:.2f} min"
+        )
+
+        self.log(
+            f"GWAS result loaded: {len(gwas_df):,} SNPs"
+        )
+
+        return gemma_job, gwas_df
+
+    def _plot_gwas(self, gemma_job):
+        self.log("Generating GWAS summary plot")
+
+        plot_gwas_summary_panel(
+            gemma_job.gwas_df_h5,
+            self.genome_fasta_file,
+            threshold_fdr=self.threshold_fdr,
+            bins=self.plot_bins,
+            title=None,
+            figsize=(14, 6),
+            save=True,
+        )
+
+        self.log("GWAS summary plot finished")
+
+    def _evaluate_gwas(
+        self,
+        causal_effect_df,
+        gwas_df,
+    ):
+        self.log("Evaluating causal SNP GWAS recovery")
+
+        qc = evaluate_causal_gwas_recovery(
+            causal_effect_df=causal_effect_df,
+            gwas_df=gwas_df,
+        )
+
+        qc["recovery"].to_csv(
+            self.qc_recovery_file,
+            sep="\t",
+            index=False,
+        )
+
+        qc["causal_table"].to_csv(
+            self.qc_causal_table_file,
+            sep="\t",
+            index=False,
+        )
+
+        with open(
+            self.qc_summary_file,
+            "w",
+        ) as f:
+            json.dump(
+                qc["summary"],
+                f,
+                indent=2,
+            )
+
+        summary = qc["summary"]
+
+        self.log(
+            f"GWAS recovery QC: "
+            f"AUC={summary['causal_vs_noncausal_auc']:.4f}, "
+            f"causal median rank percentile="
+            f"{summary['causal_rank_percentile_median']:.4f}, "
+            f"beta2~GWAS Spearman="
+            f"{summary['beta2_vs_gwas_score_spearman_r']:.4f}"
+        )
+
+        for _, row in qc["recovery"].iterrows():
+            self.log(
+                f"Top {row['top_fraction']:.1%}: "
+                f"{int(row['n_causal_top'])} causal SNPs, "
+                f"recovery={row['causal_recovery_rate']:.3%}, "
+                f"lift={row['recovery_lift']:.3f}"
+            )
+
+        return qc
+
+    def _run_enrichment(self, site_info_df, gwas_df):
+        required = {"ID", "CHROM", "POS", self.maf_col, self.foreground_col}
+        missing = required - set(site_info_df.columns)
+        if missing:
+            raise ValueError(f"site_info_df missing enrichment columns: {sorted(missing)}")
+        if not {"ID", "P_WALD"}.issubset(gwas_df.columns):
+            raise ValueError("GWAS table must contain ID and P_WALD")
+
+        context = site_info_df[["ID", "CHROM", "POS", self.maf_col,
+                                self.foreground_col]].copy()
+        context = context.rename(columns={self.foreground_col: "foreground"})
+        context["ID"] = context["ID"].astype(str)
+        gwas = gwas_df[["ID", "P_WALD"]].copy()
+        gwas["ID"] = gwas["ID"].astype(str)
+        if context["ID"].duplicated().any() or gwas["ID"].duplicated().any():
+            raise ValueError("Enrichment requires unique site and GWAS IDs")
+        if not context["foreground"].isin([True, False]).all():
+            raise ValueError("Enrichment foreground must contain only True/False")
+        gwas["P_WALD"] = pd.to_numeric(gwas["P_WALD"], errors="coerce")
+        if gwas["P_WALD"].isna().any() or not np.isfinite(gwas["P_WALD"]).all():
+            raise ValueError("GWAS P_WALD must be finite numeric values")
+        if ((gwas["P_WALD"] < 0) | (gwas["P_WALD"] > 1)).any():
+            raise ValueError("GWAS P_WALD must be in [0, 1]")
+        context = context.merge(gwas, on="ID", how="left", validate="one_to_one")
+        context[self.name] = -np.log10(
+            context["P_WALD"].clip(lower=np.finfo(float).tiny)
+        )
+        for foreground in (True, False):
+            if not context.loc[context["foreground"] == foreground, self.name].notna().any():
+                raise ValueError(f"No GWAS P-values for enrichment foreground={foreground}")
+
+        options = self.enrichment
+        self.log(
+            f"Enrichment permutations started: top={options['top_percent']:.1%}, "
+            f"pool={options['pool_num']}, permutations={options['permutations']}"
+        )
+        started = time.time()
+        result = enrichment_permutation_analysis(
+            context, options["top_percent"], [self.name],
+            options["pool_num"], options["permutations"],
+            stratify_id="all", show_progress=options["show_progress"],
+            progress_interval=options["progress_interval"],
+        )
+        with gzip.open(self.enrichment_file, "wt") as out:
+            json.dump(result, out, allow_nan=False, default=lambda item: item.item())
+        stat = result["stat"][self.name]
+        self.log(
+            f"Enrichment finished in {(time.time() - started) / 60:.2f} min: "
+            f"fold={stat['obs_value']:.4g}, empirical p={stat['pval']:.4g}"
+        )
+        return result
+
+    def run(self, pruned_site_df=None, plot=False):
+        """Return archived results, or reuse a completed identical run."""
+        if pruned_site_df is None:
+            pruned_site_df = self.pruned_site_df
+        if pruned_site_df is not None and self.input_pruned_site_ids_file is not None:
+            raise ValueError("Provide either pruned_site_df or pruned_site_ids_file, not both")
+        if pruned_site_df is not None and (
+            not isinstance(self.pruned_site_parameters, dict)
+            or not self.pruned_site_parameters
+        ):
+            raise ValueError("pruned_site_parameters must document supplied pruned_site_df")
+        self.run_hash, run_spec = self._run_hash(pruned_site_df, plot)
+        self._current_run_spec = run_spec
+        self.output_root.mkdir(parents=True, exist_ok=True)
+        final_dir = self.output_root / f"{self.name}.{self.run_hash[:16]}"
+        if final_dir.exists():
+            self._set_paths(final_dir)
+            if not self.manifest_file.is_file():
+                raise FileExistsError(f"Incomplete run directory: {final_dir}")
+            with open(self.manifest_file) as f:
+                manifest = json.load(f)
+            if manifest.get("run_hash") != self.run_hash or manifest.get("status") != "complete":
+                raise ValueError(f"Run manifest does not match parameters: {self.manifest_file}")
+            for file_name in manifest["files"]:
+                if not (final_dir / file_name).is_file():
+                    raise FileNotFoundError(f"Cached result is incomplete: {file_name}")
+            self.log(f"Reusing completed run {self.run_hash}")
+            return self._result(cached=True)
+
+        stage_dir = Path(tempfile.mkdtemp(
+            prefix=f".{self.name}.{self.run_hash[:16]}.", dir=self.output_root))
+        self._set_paths(stage_dir)
+        self._start_time = time.time()
+        with open(self.config_file, "w") as f:
+            json.dump(run_spec, f, indent=2, ensure_ascii=False)
+        self.log("=" * 70)
+        self.log(f"Simulation job started: {self.name}; hash={self.run_hash}")
+        self.log(f"Seeds: prune={self.prune_seed}, causal={self.causal_sample_seed}, "
+                 f"beta={self.beta_seed}, phenotype={self.phenotype_seed}")
+
+        n_steps = 9
+        self._step(1, n_steps, "Loading site annotation, samples and kinship")
+        site_info_df, sample_id_list, kinship_df = self._load_inputs()
+        self._gemma_site_info_df = site_info_df
+        self._log_fg_bg(site_info_df, "All SNPs")
+        self.log(f"Samples={len(sample_id_list)}, kinship shape={kinship_df.shape}")
+
+        self._step(2, n_steps, "LD pruning")
+        if pruned_site_df is None and self.input_pruned_site_ids_file is None:
+            pruned_site_df = self._prune_sites(site_info_df)
+            pruning_record = {
+                "source": "automatic", "method": "prune_sites_by_ld",
+                "ld_window_size": self.ld_window_size,
+                "r2_threshold": self.r2_threshold,
+                "pool_num": self.pool_num, "seed": self.prune_seed,
+            }
+        elif self.input_pruned_site_ids_file is not None:
+            source_path = Path(self.input_pruned_site_ids_file).expanduser().resolve()
+            ids = self._read_site_ids(source_path)
+            pruned_site_df = self._from_site_ids(site_info_df, ids)
+            pruning_record = {
+                "source": "id_list", "id_list_file": str(source_path),
+                "ids_sha256": self._file_sha256(source_path),
+            }
+            sidecar = source_path.with_name(
+                source_path.name.replace(".pruned_site_ids.txt.gz", ".pruning.json"))
+            if sidecar != source_path and sidecar.is_file():
+                with open(sidecar) as source:
+                    source_metadata = json.load(source)
+                if source_metadata.get("ids_sha256") != pruning_record["ids_sha256"]:
+                    raise ValueError(f"Pruning metadata does not match ID list: {sidecar}")
+                pruning_record["source_pruning"] = source_metadata["pruning_record"]
+            self.log(f"Reconstructed {len(ids):,} pruned SNPs from {source_path}")
+        else:
+            pruned_site_df = pruned_site_df.copy()
+            pruning_record = {"source": "supplied", **self.pruned_site_parameters}
+            self.log(f"Using supplied pruned_site_df: {len(pruned_site_df):,} SNPs")
+        if self.input_pruned_site_ids_file is None and not set(
+            pruned_site_df["ID"].astype(str)
+        ).issubset(set(site_info_df["ID"].astype(str))):
+            raise ValueError("pruned_site_df contains SNP IDs absent from site_info_df")
+        self._write_site_ids(pruned_site_df, pruning_record)
+        run_spec["pruning_record"] = pruning_record
+        with open(self.config_file, "w") as f:
+            json.dump(run_spec, f, indent=2, ensure_ascii=False)
+        self._log_fg_bg(pruned_site_df, "Pruned SNPs")
+
+        self._step(3, n_steps, "Sampling causal SNPs")
+        _, causal_site_df, _ = self._sample_causal_sites(pruned_site_df)
+        self._step(4, n_steps, "Preparing causal genotypes and beta")
+        causal_genotype_df, causal_effect_df = self._prepare_causal_effects(causal_site_df)
+        causal_genotype_df = causal_genotype_df.loc[sample_id_list]
+        self._step(5, n_steps, "Simulating phenotype")
+        phenotype_outputs = self._simulate_phenotype(
+            causal_genotype_df, causal_effect_df, kinship_df)
+        self._step(6, n_steps, "Running GEMMA GWAS")
+        gemma_pheno_file = self._prepare_gemma_pheno(phenotype_outputs)
+        gemma_job, gwas_df = self._run_gemma(gemma_pheno_file)
+        self._step(7, n_steps, "GWAS visualization")
+        if plot:
+            self._plot_gwas(gemma_job)
+        else:
+            self.log("GWAS plotting skipped")
+        self._step(8, n_steps, "Causal recovery QC")
+        self._evaluate_gwas(causal_effect_df, gwas_df)
+        self._step(9, n_steps, "Foreground enrichment permutations")
+        self._run_enrichment(site_info_df, gwas_df)
+        self._archive_and_cleanup(phenotype_outputs, gwas_df, gemma_job)
+        elapsed = time.time() - self._start_time
+        self.log(f"Simulation job completed: {self.name}; runtime={elapsed / 60:.2f} min")
+        self.log("=" * 70)
+        files = sorted(path.name for path in stage_dir.iterdir() if path.is_file())
+        with open(self.manifest_file, "w") as f:
+            json.dump({"status": "complete", "run_hash": self.run_hash,
+                       "files": files}, f, indent=2)
+        if final_dir.exists():
+            raise FileExistsError(f"Another run completed this hash: {final_dir}")
+        stage_dir.rename(final_dir)
+        self._set_paths(final_dir)
+        return self._result(cached=False)
+
+
+if __name__ == "__main__":
+
+
+
+
+
+
+
+
+
+    import os
+    import pandas as pd
+    import numpy as np
+    from src.vcf import get_sample_list_from_vcf
+
+    genome_fasta_file = "/lustre/home/dobby/Work/Project/functional-genomic-local-adaptation-sorghum/data/source/Sbicolor_730_v5.0.fa.gz"
+    site_info_df_h5 = "/lustre/home/dobby/Work/Project/functional-genomic-local-adaptation-sorghum/data/results/site_contexts.genome.maf0.05.h5"
+    input_vcf_file = "/lustre/home/dobby/Work/Project/functional-genomic-local-adaptation-sorghum/data/results/landraces_qc_miss0.5_maf0.05_het0.05.vcf.gz"
+    kinship_ibs_file = "/lustre/home/dobby/Work/Project/functional-genomic-local-adaptation-sorghum/data/source/landraces_snp_pruned.win15000.miss0.5.maf0.01.het0.01.rq0.5.ibs.matrix"
+    site_info_df = pd.read_hdf(site_info_df_h5, key='df')
+    sample_id_list = get_sample_list_from_vcf(input_vcf_file)
+    kinship_df = pd.read_csv(kinship_ibs_file, sep=",",
+                             header=None, names=sample_id_list)
+    kinship_df.index = sample_id_list
+    prune_seed = 12345 + 1
+    ld_window_size = 15000
+    pool_num = 40
+    r2_threshold = 0.5
+
+    foreground_col = 'genic_2kb'
+    all_fg_num = site_info_df[foreground_col].sum()
+    all_fg_prop = all_fg_num / len(site_info_df)
+    all_bg_num = len(site_info_df) - all_fg_num
+    all_bg_prop = all_bg_num / len(site_info_df)
+    print(
+        f"All foreground number: {all_fg_num} ({all_fg_prop:.2%}), All background number: {all_bg_num} ({all_bg_prop:.2%})")
+
+    from src.ld import prune_sites_by_ld
+
+    pruned_site_with_log_df = prune_sites_by_ld(
+        site_info_df.sample(
+            frac=1,
+            random_state=prune_seed,
+        ),
+        input_vcf_file,
+        ld_window_size=ld_window_size,
+        r2_threshold=r2_threshold,
+        pool_num=pool_num,
+        full_output=True,
+    )
+
+    pruned_site_with_log_df.sort_index(inplace=True)
+    pruned_site_df = pruned_site_with_log_df[pruned_site_with_log_df['LD_PRUNING_KEEP']].copy(
+    )
+    pruned_fg_num = pruned_site_df[foreground_col].sum()
+    pruned_fg_prop = pruned_fg_num / len(pruned_site_df)
+    pruned_bg_num = len(pruned_site_df) - pruned_fg_num
+    pruned_bg_prop = pruned_bg_num / len(pruned_site_df)
+    print(
+        f"Pruned foreground number: {pruned_fg_num} ({pruned_fg_prop:.2%}), Pruned background number: {pruned_bg_num} ({pruned_bg_prop:.2%})")
+
+    simulate_causal_site_num = 5
+    simulate_causal_site_proportion = simulate_causal_site_num / \
+        len(pruned_site_df)
+
+    causal_sample_seed = 12345 + 2
+
+    pruned_site_df, summary = sample_causal_snps(
+        pruned_site_df,
+        causal_fraction=simulate_causal_site_proportion,
+        enrichment_ratio=1.0,
+        maf_col="MAF",
+        foreground_col=foreground_col,
+        seed=causal_sample_seed,
+        causal_col="causal",
+    )
+
+    causal_site_df = pruned_site_df[pruned_site_df['causal']]
+    print(f"Sampled causal SNPs summary: {summary}")
+
+    from src.vcf import get_genotype_df_from_vcf_by_site_df, get_sample_list_from_vcf
+
+    causal_site_genotype_df = get_genotype_df_from_vcf_by_site_df(
+        input_vcf_file, causal_site_df)
+    causal_site_genotype_df = causal_site_genotype_df.transpose()
+
+    beta_seed = 12345 + 3
+    beta_rng = np.random.default_rng(beta_seed)
+
+    causal_effect_df = pd.DataFrame({
+        "SNP_ID": causal_site_df["ID"].astype(str).tolist(),
+        "beta_raw": beta_rng.normal(
+            loc=0,
+            scale=1,
+            size=len(causal_site_df),
+        ),
+    })
+
+    output_dir = "/lustre/home/dobby/Work/Project/functional-genomic-local-adaptation-sorghum/data/results/simulate"
+    output_prefix = os.path.join(output_dir, "e1")
+
+    from src.sim.phenotype_simulator_wrap import simulate_phenotype_with_kinship
+
+    outputs = simulate_phenotype_with_kinship(
+        causal_genotype_df=causal_site_genotype_df,
+        causal_effect_df=causal_effect_df,
+        kinship_df=kinship_df,
+        output_prefix=output_prefix,
+        causal_var=0.3,
+        kinship_var=0.5,
+        residual_var=0.2,
+        seed=12345 + 4,
+    )
+
+    phenotype_file = str(outputs["phenotype_file"])
+    gemma_pheno_file = phenotype_file.replace(".tsv", ".bimbam")
+    pheno_df = pd.read_csv(phenotype_file, sep="\t")
+    pheno_df['phenotype'].to_csv(gemma_pheno_file, index=False, header=False)
+
+    from src.gwas import GEMMA_JOB, plot_gwas_summary_panel
+
+    gemma_job = GEMMA_JOB("e1", output_dir, input_vcf_file,
+                          gemma_pheno_file, kinship_ibs_file)
+    gemma_job.run()
+
+    gwas_df = pd.read_hdf(gemma_job.gwas_df_h5)
+
+    plot_gwas_summary_panel(gemma_job.gwas_df_h5, genome_fasta_file,
+                            threshold_fdr=0.05,
+                            bins=50,
+                            title=None,
+                            figsize=(14, 6),
+                            save=True)
+
+    gwas_qc_dict = evaluate_causal_gwas_recovery(
+        causal_effect_df=causal_effect_df,
+        gwas_df=gwas_df,
+    )
+
+    gwas_qc_dict
+
+
+    from src.simulate import SIMULATION_JOB
+
+    PROJECT = "/lustre/home/dobby/Work/Project/functional-genomic-local-adaptation-sorghum"
+
+    config = {
+        "name": "causal_5_snp",
+        "output_dir": f"{PROJECT}/data/results/simulate",
+        "genome_fasta_file": f"{PROJECT}/data/source/Sbicolor_730_v5.0.fa.gz",
+        "site_info_df_h5": f"{PROJECT}/data/results/site_contexts.genome.maf0.05.h5",
+        "input_vcf_file": f"{PROJECT}/data/results/landraces_qc_miss0.5_maf0.05_het0.05.vcf.gz",
+        "kinship_ibs_file": (
+            f"{PROJECT}/data/source/"
+            "landraces_snp_pruned.win15000.miss0.5.maf0.01.het0.01.rq0.5.ibs.matrix"
+        ),
+        "foreground_col": "genic_2kb",
+        "causal_site_num": 5,
+        "enrichment_ratio": 1.0,
+        "ld_window_size": 15000,
+        "r2_threshold": 0.5,
+        "pool_num": 40,
+        "effect_assignment": {"method": "normal", "beta_loc": 0.0,
+                              "scale": 1.0},
+        "causal_var": 0.3,
+        "kinship_var": 0.5,
+        "residual_var": 0.2,
+        "seed": 42,
+    }
+
+    result = SIMULATION_JOB(config).run(plot=True)
+    print(f"cached={result['cached']}")
+    print(f"output_dir={result['output_dir']}")
+    print(f"run_hash={result['run_hash']}")
