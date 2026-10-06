@@ -24,7 +24,7 @@ import pandas as pd
 from .ld import prune_sites_by_ld
 from .vcf import get_sample_list_from_vcf, get_genotype_df_from_vcf_by_site_df
 from .gwas import GEMMA_JOB, plot_gwas_summary_panel
-from .enrich import enrichment_permutation_analysis
+from .enrich import enrichment_permutation_analysis, build_enrich_data_df
 from .sim.phenotype_simulator_wrap import simulate_phenotype_with_kinship
 
 # ============================================================
@@ -5936,8 +5936,12 @@ class SIMULATION_JOB:
     * ``input_vcf_file``: VCF used for sample IDs, genotypes and GWAS.
     * ``kinship_ibs_file``: comma-separated, headerless kinship matrix in
       exactly the VCF sample order.
-    * ``foreground_col``: boolean site-annotation column whose causal rate
-      is enriched relative to the background.
+    * ``contrast_id`` and ``contrasts_settings_json_file``: select a SNP
+      contrast from the settings JSON. Its foreground/background union is
+      the candidate universe, with foreground membership in ``foreground``.
+      The input HDF5 must correspond to the contrast's dataset.
+    * ``foreground_col='foreground'``: boolean site-annotation column. Legacy
+      direct-column mode remains available when no contrast is configured.
     * Exactly one of ``causal_site_num`` (positive count) or
       ``causal_fraction`` (fraction of LD-pruned sites in [0, 1]).
 
@@ -5963,9 +5967,14 @@ class SIMULATION_JOB:
     * ``pruned_site_ids_file=None``: path to a plain or gzip text file with
       one SNP ID per line. When set, reconstruct the pruned table from the
       site annotation HDF5 in file order and skip LD pruning. Missing or
-      duplicated IDs are errors. Cannot be combined with ``pruned_site_df``.
-    * ``effect_assignment={'method': 'random_sign_uniform', 'low': 0.5,
-      'high': 1.5}``: rule for assigning raw causal SNP effects.
+      duplicated IDs are errors. A matching provenance sidecar is mandatory:
+      the candidate-universe SHA256 and output checksum/count are verified.
+      Generated names include the first 16 characters of the universe SHA256.
+      Preserve the returned ``pruning_metadata_file`` beside the ID list.
+      Cannot be combined with ``pruned_site_df``.
+    * ``effect_assignment={'method': 'random_sign_lognormal',
+      'log_mean': 0.0, 'log_std': 1.0}``: rule for assigning raw causal SNP
+      effects.
       ``normal`` draws each beta independently from a normal distribution;
       provide its mean ``beta_loc`` and positive SD ``scale``. The older
       nested key ``beta_scale`` is also accepted and normalized to ``scale``.
@@ -5977,6 +5986,24 @@ class SIMULATION_JOB:
       signs with equal probability, then samples magnitudes uniformly from
       ``[low, high)`` using the same RNG; defaults are ``low=0.5`` and
       ``high=1.5``. Both bounds must be positive and ``high > low``.
+      ``{'method': 'random_sign_normal', 'mean': 1.0, 'std': 0.2}``
+      samples from a normal distribution with the given mean and SD, takes
+      absolute values as magnitudes, then independently assigns +/- signs.
+      ``mean`` must be nonnegative and ``std`` positive. The absolute value
+      makes the resulting magnitude distribution folded normal.
+      ``{'method': 'random_sign_lognormal', 'log_mean': 0.0,
+      'log_std': 1.0}`` draws each magnitude with
+      ``log(abs(beta_raw)) ~ N(log_mean, log_std^2)``, then independently
+      assigns +/- signs. ``log_std`` must be positive.
+      ``{'method': 'normal_mixture', 'components': [
+      {'weight': 0.5, 'std': 0.1}, {'weight': 0.3, 'std': 0.5},
+      {'weight': 0.2, 'std': 1.0}]}`` chooses a component for each SNP and
+      draws its beta from a zero-mean normal distribution with that SD.
+      Supply at least two components with positive weights summing to one
+      and positive standard deviations. Weights are probabilities among
+      selected causal SNPs, not proportions of heritability. Both new rules
+      model raw causal betas; they do not directly reproduce a marginal
+      effect-size distribution measured through LD.
       ``{'method': 'vector', 'values': [0.5, -1.0, ...]}`` assigns a supplied
       one-dimensional numeric sequence positionally in ``causal_site_df['ID']``
       order. Its length must equal the number of sampled causal SNPs. The
@@ -6009,12 +6036,14 @@ class SIMULATION_JOB:
 
     DEFAULTS = {
         "site_info_key": "df", "maf_col": "MAF", "causal_site_num": None,
+        "contrast_id": None, "contrasts_settings_json_file": None,
+        "foreground_col": "foreground",
         "causal_fraction": None, "enrichment_ratio": 1.0,
         "causal_foreground_fraction": None,
         "ld_window_size": 15000, "r2_threshold": 0.5, "pool_num": 40,
         "pruned_site_parameters": None, "pruned_site_ids_file": None,
-        "effect_assignment": {"method": "random_sign_uniform",
-                              "low": 0.5, "high": 1.5},
+        "effect_assignment": {"method": "random_sign_lognormal",
+                              "log_mean": 0.0, "log_std": 1.0},
         "causal_var": 0.1, "kinship_var": 0.6,
         "residual_var": 0.3, "seed": 12345, "threshold_fdr": 0.05,
         "lmm": 1,
@@ -6025,7 +6054,7 @@ class SIMULATION_JOB:
     }
     REQUIRED = {
         "name", "output_dir", "genome_fasta_file", "site_info_df_h5",
-        "input_vcf_file", "kinship_ibs_file", "foreground_col",
+        "input_vcf_file", "kinship_ibs_file",
     }
 
     def __init__(self, config, *, pruned_site_df=None):
@@ -6046,6 +6075,24 @@ class SIMULATION_JOB:
         self.site_info_df_h5 = str(self.config["site_info_df_h5"])
         self.input_vcf_file = str(self.config["input_vcf_file"])
         self.kinship_ibs_file = str(self.config["kinship_ibs_file"])
+        self.contrast_id = self.config["contrast_id"]
+        self.contrast = None
+        contrast_file = self.config["contrasts_settings_json_file"]
+        if (self.contrast_id is None) != (contrast_file is None):
+            raise ValueError("Provide both contrast_id and contrasts_settings_json_file")
+        if contrast_file is not None:
+            with open(contrast_file) as source:
+                contrasts = json.load(source)
+            if self.contrast_id not in contrasts:
+                raise ValueError(f"Unknown contrast_id: {self.contrast_id!r}")
+            self.contrast = contrasts[self.contrast_id]
+            if not isinstance(self.contrast, dict) or not all(
+                isinstance(self.contrast.get(key), str) for key in ("foreground", "background")
+            ):
+                raise ValueError("Contrast must define foreground and background expressions")
+            if self.config["foreground_col"] != "foreground":
+                raise ValueError("contrast_id requires foreground_col='foreground'")
+        self.site_universe = None
         self.foreground_col = self.config["foreground_col"]
         self.site_info_key = self.config["site_info_key"]
         self.maf_col = self.config["maf_col"]
@@ -6158,7 +6205,8 @@ class SIMULATION_JOB:
             raise TypeError("effect_assignment must be a dictionary")
         method = value.get("method")
         if method not in {"normal", "constant", "random_sign",
-                          "random_sign_uniform", "vector"}:
+                          "random_sign_uniform", "random_sign_normal",
+                          "random_sign_lognormal", "normal_mixture", "vector"}:
             raise ValueError(f"Unknown effect_assignment method: {method!r}")
         if method == "normal" and set(value) == {"method", "beta_loc", "beta_scale"}:
             value = {"method": "normal", "beta_loc": value["beta_loc"],
@@ -6170,6 +6218,9 @@ class SIMULATION_JOB:
             "constant": {"method", "value"},
             "random_sign": {"method", "magnitude"},
             "random_sign_uniform": {"method", "low", "high"},
+            "random_sign_normal": {"method", "mean", "std"},
+            "random_sign_lognormal": {"method", "log_mean", "log_std"},
+            "normal_mixture": {"method", "components"},
             "vector": {"method", "values"},
         }[method]
         if set(value) != required:
@@ -6177,6 +6228,31 @@ class SIMULATION_JOB:
                 f"effect_assignment method {method!r} requires exactly "
                 f"{sorted(required)}"
             )
+        if method == "normal_mixture":
+            components = value["components"]
+            if not isinstance(components, (list, tuple)) or len(components) < 2:
+                raise ValueError("normal_mixture requires at least two components")
+            normalized = []
+            for component in components:
+                if not isinstance(component, dict) or set(component) != {"weight", "std"}:
+                    raise ValueError("normal_mixture components require weight and std")
+                numbers = {}
+                for key in ("weight", "std"):
+                    item = component[key]
+                    if isinstance(item, (bool, np.bool_)):
+                        raise ValueError(f"normal_mixture {key} must be finite and > 0")
+                    try:
+                        item = float(item)
+                    except (TypeError, ValueError) as exc:
+                        raise ValueError(f"normal_mixture {key} must be finite and > 0") from exc
+                    if not np.isfinite(item) or item <= 0:
+                        raise ValueError(f"normal_mixture {key} must be finite and > 0")
+                    numbers[key] = item
+                normalized.append(numbers)
+            if not np.isclose(sum(item["weight"] for item in normalized), 1.0,
+                              rtol=0, atol=1e-8):
+                raise ValueError("normal_mixture weights must sum to one")
+            return {"method": method, "components": normalized}
         if method == "vector":
             supplied = value["values"]
             if isinstance(supplied, (str, bytes, dict)):
@@ -6200,7 +6276,7 @@ class SIMULATION_JOB:
             return {"method": "vector", "values": values.tolist()}
         keys = required - {"method"}
         for key in keys:
-            if isinstance(value[key], bool):
+            if isinstance(value[key], (bool, np.bool_)):
                 raise ValueError(f"effect_assignment {key} must be a finite number")
             try:
                 number = float(value[key])
@@ -6220,6 +6296,13 @@ class SIMULATION_JOB:
                 raise ValueError("effect_assignment low must be > 0")
             if result["high"] <= result["low"]:
                 raise ValueError("effect_assignment high must be > low")
+        if method == "random_sign_normal":
+            if result["mean"] < 0:
+                raise ValueError("effect_assignment mean must be >= 0")
+            if result["std"] <= 0:
+                raise ValueError("effect_assignment std must be > 0")
+        if method == "random_sign_lognormal" and result["log_std"] <= 0:
+            raise ValueError("effect_assignment log_std must be > 0")
         return result
 
     @classmethod
@@ -6272,6 +6355,12 @@ class SIMULATION_JOB:
         self.results_json_archive = self.output_dir / f"{self.name}.results.json.gz"
         self.pruned_site_ids_file = self.output_dir / f"{self.name}.pruned_site_ids.txt.gz"
         self.pruning_metadata_file = self.output_dir / f"{self.name}.pruning.json"
+        universe = self.site_universe
+        if universe is None and self.pruning_metadata_file.is_file():
+            universe = json.loads(self.pruning_metadata_file.read_text()).get("site_universe")
+        if universe is not None:
+            self.pruned_site_ids_file = self.output_dir / (
+                f"{self.name}.{universe['sha256'][:16]}.pruned_site_ids.txt.gz")
         self.enrichment_file = self.output_dir / f"{self.name}.enrichment.json.gz"
 
     def _now(self):
@@ -6315,12 +6404,17 @@ class SIMULATION_JOB:
             inputs["pruned_site_ids_file"] = {
                 "path": str(path), "sha256": self._file_sha256(path),
             }
+            sidecar = self._pruning_sidecar(path)
+            if not sidecar.is_file():
+                raise ValueError(f"Missing pruning provenance metadata: {sidecar}")
+            inputs["pruning_metadata_sha256"] = self._file_sha256(sidecar)
         pruning_mode = ("supplied_df" if pruned_site_df is not None else
                         "id_list" if self.input_pruned_site_ids_file is not None else
                         "automatic")
         payload = {"config": self._config(), "inputs": inputs,
                    "pruning_mode": pruning_mode,
-                   "plot": bool(plot), "pipeline_version": 5}
+                   "contrast": self.contrast,
+                   "plot": bool(plot), "pipeline_version": 6}
         encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False,
                              separators=(",", ":"), allow_nan=False).encode()
         return hashlib.sha256(encoded).hexdigest(), payload
@@ -6372,7 +6466,7 @@ class SIMULATION_JOB:
                 out.write(item + "\n")
         with open(self.pruning_metadata_file, "w") as out:
             json.dump({"pruning_record": pruning_record,
-                       "n_sites": len(ids),
+                       "n_sites": len(ids), "site_universe": self.site_universe,
                        "ids_sha256": self._file_sha256(self.pruned_site_ids_file)}, out, indent=2)
         self.log(f"Saved {len(ids):,} pruned SNP IDs: {self.pruned_site_ids_file}")
 
@@ -6381,7 +6475,9 @@ class SIMULATION_JOB:
         if self.output_dir is None or not self.pruned_site_ids_file.is_file():
             raise FileNotFoundError("No completed pruned-site ID list is available")
         ids = self._read_site_ids(self.pruned_site_ids_file)
-        site_info_df = pd.read_hdf(self.site_info_df_h5, key=self.site_info_key)
+        site_info_df = self._build_site_info_df(
+            pd.read_hdf(self.site_info_df_h5, key=self.site_info_key))
+        self._validate_pruning_source(self.pruned_site_ids_file, site_info_df, ids)
         return self._from_site_ids(site_info_df, ids)
 
     def _result(self, cached):
@@ -6462,11 +6558,69 @@ class SIMULATION_JOB:
                 path.unlink()
         self.log("Archived phenotype and GWAS as gzip CSV; removed intermediate files")
 
+    def _build_site_info_df(self, site_df):
+        if self.contrast is None:
+            return site_df
+        # Dataset selection belongs to the input HDF5; its name supplies the
+        # universal set marker used by notebook contrasts (e.g. genome=True).
+        site_df = site_df.copy()
+        dataset = self.contrast.get("dataset")
+        if dataset == "gene":
+            raise ValueError("SIMULATION_JOB requires a SNP contrast, not a gene contrast")
+        if dataset is not None:
+            site_df[dataset] = True
+        result = build_enrich_data_df(
+            site_df, self.contrast, [], other_columns=[self.maf_col])
+        if result.empty or result["foreground"].nunique() != 2:
+            raise ValueError("Contrast must contain both foreground and background SNPs")
+        return result
+
+    @staticmethod
+    def _site_universe(site_df):
+        if "ID" not in site_df or site_df["ID"].isna().any():
+            raise ValueError("Candidate SNPs must contain nonmissing IDs")
+        ids = site_df["ID"].astype(str)
+        if site_df.empty or ids.duplicated().any():
+            raise ValueError("Candidate SNPs must contain unique SNP IDs and be nonempty")
+        columns = [key for key in ("ID", "CHROM", "POS") if key in site_df]
+        canonical = site_df[columns].astype(str).sort_values("ID")
+        encoded = json.dumps({"columns": columns, "sites": canonical.values.tolist()},
+                             ensure_ascii=False, separators=(",", ":")).encode()
+        return {"sha256": hashlib.sha256(encoded).hexdigest(), "n_sites": len(ids)}
+
+    @staticmethod
+    def _pruning_sidecar(path):
+        path = Path(path)
+        suffix = ".pruned_site_ids.txt.gz"
+        if path.name.endswith(suffix):
+            stem = path.name[:-len(suffix)]
+            name, separator, tag = stem.rpartition(".")
+            if separator and len(tag) == 16 and all(c in "0123456789abcdef" for c in tag):
+                stem = name
+            return path.with_name(stem + ".pruning.json")
+        return path.with_name(path.name + ".pruning.json")
+
+    def _validate_pruning_source(self, path, site_df, ids):
+        metadata_path = self._pruning_sidecar(path)
+        if not metadata_path.is_file():
+            raise ValueError(f"Missing pruning provenance metadata: {metadata_path}")
+        with open(metadata_path) as source:
+            metadata = json.load(source)
+        if metadata.get("site_universe") != self._site_universe(site_df):
+            raise ValueError("Pruned SNP provenance does not match current candidate SNP universe")
+        if metadata.get("ids_sha256") != self._file_sha256(path):
+            raise ValueError("Pruning metadata does not match ID list checksum")
+        if metadata.get("n_sites") != len(ids):
+            raise ValueError("Pruning metadata does not match ID list count")
+        return metadata
+
     def _load_inputs(self):
         site_info_df = pd.read_hdf(
             self.site_info_df_h5,
             key=self.site_info_key,
         )
+
+        site_info_df = self._build_site_info_df(site_info_df)
 
         sample_id_list = get_sample_list_from_vcf(
             self.input_vcf_file
@@ -6695,6 +6849,25 @@ class SIMULATION_JOB:
                 f"{self.effect_assignment['high']:g}), "
                 f"P(+)=P(-)=0.5, seed={self.beta_seed}"
             )
+        elif self.effect_assignment["method"] == "random_sign_normal":
+            description = (
+                f"random_sign_normal magnitude=abs(N("
+                f"{self.effect_assignment['mean']:g}, "
+                f"{self.effect_assignment['std']:g}^2)), "
+                f"P(+)=P(-)=0.5, seed={self.beta_seed}"
+            )
+        elif self.effect_assignment["method"] == "random_sign_lognormal":
+            description = (
+                f"random_sign_lognormal log_magnitude=N("
+                f"{self.effect_assignment['log_mean']:g}, "
+                f"{self.effect_assignment['log_std']:g}^2), "
+                f"P(+)=P(-)=0.5, seed={self.beta_seed}"
+            )
+        elif self.effect_assignment["method"] == "normal_mixture":
+            description = (
+                f"normal_mixture components="
+                f"{self.effect_assignment['components']}, seed={self.beta_seed}"
+            )
         else:
             description = f"vector n={len(self.effect_assignment['values'])}"
         self.log(
@@ -6727,6 +6900,35 @@ class SIMULATION_JOB:
                 rule["low"], rule["high"], size=n_sites
             )
             return signs * magnitudes
+        if rule["method"] == "random_sign_normal":
+            beta_rng = np.random.default_rng(self.beta_seed)
+            magnitudes = np.abs(beta_rng.normal(
+                loc=rule["mean"], scale=rule["std"], size=n_sites,
+            ))
+            signs = beta_rng.choice([-1.0, 1.0], size=n_sites)
+            return signs * magnitudes
+        if rule["method"] == "random_sign_lognormal":
+            beta_rng = np.random.default_rng(self.beta_seed)
+            magnitudes = beta_rng.lognormal(
+                mean=rule["log_mean"], sigma=rule["log_std"], size=n_sites,
+            )
+            signs = beta_rng.choice([-1.0, 1.0], size=n_sites)
+            if not np.isfinite(magnitudes).all():
+                raise ValueError("random_sign_lognormal generated non-finite effects")
+            return signs * magnitudes
+        if rule["method"] == "normal_mixture":
+            beta_rng = np.random.default_rng(self.beta_seed)
+            components = rule["components"]
+            weights = np.asarray([item["weight"] for item in components])
+            weights = weights / weights.sum()
+            selected = beta_rng.choice(
+                len(components), size=n_sites, p=weights,
+            )
+            scales = np.asarray([item["std"] for item in components])
+            effects = beta_rng.normal(loc=0.0, scale=scales[selected])
+            if not np.isfinite(effects).all():
+                raise ValueError("normal_mixture generated non-finite effects")
+            return effects
         if rule["method"] == "vector":
             values = rule["values"]
             if len(values) != n_sites:
@@ -7085,6 +7287,8 @@ class SIMULATION_JOB:
         n_steps = 9
         self._step(1, n_steps, "Loading site annotation, samples and kinship")
         site_info_df, sample_id_list, kinship_df = self._load_inputs()
+        self.site_universe = self._site_universe(site_info_df)
+        self._set_paths(self.output_dir)
         self._gemma_site_info_df = site_info_df
         self._log_fg_bg(site_info_df, "All SNPs")
         self.log(f"Samples={len(sample_id_list)}, kinship shape={kinship_df.shape}")
@@ -7106,14 +7310,9 @@ class SIMULATION_JOB:
                 "source": "id_list", "id_list_file": str(source_path),
                 "ids_sha256": self._file_sha256(source_path),
             }
-            sidecar = source_path.with_name(
-                source_path.name.replace(".pruned_site_ids.txt.gz", ".pruning.json"))
-            if sidecar != source_path and sidecar.is_file():
-                with open(sidecar) as source:
-                    source_metadata = json.load(source)
-                if source_metadata.get("ids_sha256") != pruning_record["ids_sha256"]:
-                    raise ValueError(f"Pruning metadata does not match ID list: {sidecar}")
-                pruning_record["source_pruning"] = source_metadata["pruning_record"]
+            source_metadata = self._validate_pruning_source(source_path, site_info_df, ids)
+            pruning_record["source_pruning"] = source_metadata["pruning_record"].get(
+                "source_pruning", source_metadata["pruning_record"])
             self.log(f"Reconstructed {len(ids):,} pruned SNPs from {source_path}")
         else:
             pruned_site_df = pruned_site_df.copy()
@@ -7165,12 +7364,6 @@ class SIMULATION_JOB:
 
 
 if __name__ == "__main__":
-
-
-
-
-
-
 
 
 

@@ -18,7 +18,7 @@ base_config = {
         f"{PROJECT}/data/source/"
         "landraces_snp_pruned.win15000.miss0.5.maf0.01.het0.01.rq0.5.ibs.matrix"
     ),
-    "foreground_col": "genic_2kb",
+    "contrasts_settings_json_file": f"{PROJECT}/config/contrasts_settings.json",
     "ld_window_size": 15000,
     "r2_threshold": 0.5,
     "pool_num": 40,
@@ -27,83 +27,113 @@ base_config = {
     "residual_var": 0.2,
 }
 
-# Test1
-name = "five"
-causal_site_num = 5
-enrichment_ratio = 1.0
-seed = 42
 
-config = base_config.copy()
-config.update({
-    "name": name,
-    "causal_site_num": causal_site_num,
-    "enrichment_ratio": enrichment_ratio,
-    # "pruned_site_ids_file": f"{PROJECT}/data/results/simulate/pruned_site_ids.txt.gz",
-    "seed": seed,
-})
-
-result = SIMULATION_JOB(config).run()
-
-# Test2
-name = "s500"
-causal_site_num = 500
-causal_foreground_fraction = 0.7
-seed = 42
-
-config = base_config.copy()
-config.update({
-    "name": name,
-    "causal_site_num": causal_site_num,
-    "causal_foreground_fraction": causal_foreground_fraction,
-    "enrichment_ratio": None,
-    "pruned_site_ids_file": f"{PROJECT}/data/results/simulate/pruned_site_ids.txt.gz",
-    "seed": seed,
-})
-
-result = SIMULATION_JOB(config).run()
-
-# To make 70% of causal SNPs foreground instead of using an enrichment ratio:
-# config["enrichment_ratio"] = None
-# config["causal_foreground_fraction"] = 0.7
-
-
-# Test set
-
+# genic_2kb_vs_genome
+contrast_id = "genic_2kb_vs_genome"
+causal_site_nums = [50,500,5000]
 causal_foreground_fractions = [0.01, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.99]
 seeds = range(42, 42 + 30)
 
+# The first run generates a tagged ID list and provenance metadata. Reuse
+# its returned path only after SIMULATION_JOB validates the candidate universe.
+pruned_site_ids_file = None
 set_results = []
 
-for causal_foreground_fraction in causal_foreground_fractions:
-    print(f"Running simulation for causal_foreground_fraction={causal_foreground_fraction}")
-    for seed in seeds:
-        seed = seed * 100
-        print(f"Running simulation for seed={seed}")
-        name = f"s5000f{int(causal_foreground_fraction*100)}"
-        causal_site_num = 5000
+for causal_site_num in causal_site_nums:
+    for causal_foreground_fraction in causal_foreground_fractions:
+        print(f"Running simulation for causal_foreground_fraction={causal_foreground_fraction}")
+        for seed in seeds:
+            seed = seed * 100
+            print(f"Running simulation for seed={seed}")
+            name = f"{contrast_id}.c{causal_site_num}.f{int(causal_foreground_fraction*100)}.s{seed}"
 
-        config = base_config.copy()
-        config.update({
-            "name": name,
-            "causal_site_num": causal_site_num,
-            "causal_foreground_fraction": causal_foreground_fraction,
-            "enrichment_ratio": None,
-            "pruned_site_ids_file": f"{PROJECT}/data/results/simulate/pruned_site_ids.txt.gz",
-            "seed": seed,
-        })
+            config = base_config.copy()
+            config.update({
+                "name": name,
+                "contrast_id": contrast_id,
+                "causal_site_num": causal_site_num,
+                "causal_foreground_fraction": causal_foreground_fraction,
+                "enrichment_ratio": None,
+                "pruned_site_ids_file": pruned_site_ids_file,
+                "seed": seed,
+            })
 
-        result = SIMULATION_JOB(config).run(plot=False)
-        pval = result['enrichment_result']['stat'][name]['pval']
-        obs = result['enrichment_result']['stat'][name]['obs_value']
-        set_results.append({
-            "name": name,
-            "causal_foreground_fraction": causal_foreground_fraction,
-            "enrichment_ratio": None,
-            "seed": seed,
-            "pval": pval,
-            "obs": obs,
-        })
-        
+            if seed == 4200:
+                result = SIMULATION_JOB(config).run(plot=True)
+            else:
+                result = SIMULATION_JOB(config).run(plot=False)
+
+            if pruned_site_ids_file is None:
+                pruned_site_ids_file = str(result["pruned_site_ids_file"])
+
+            pval = result['enrichment_result']['stat'][name]['pval']
+            obs = result['enrichment_result']['stat'][name]['obs_value']
+            set_results.append({
+                "name": name,
+                "contrast_id": contrast_id,
+                "causal_site_num": causal_site_num,
+                "causal_foreground_fraction": causal_foreground_fraction,
+                "seed": seed,
+                "pval": pval,
+                "obs": obs,
+            })
+
 import pandas as pd
 set_results_df = pd.DataFrame(set_results)
-set_results_df.to_csv("simulation_results.csv", index=False)
+set_results_df.to_csv(f"{PROJECT}/data/results/simulate/f{contrast_id}_simulation_results.csv", index=False)
+
+
+
+# proximal_ACR_vs_proximal
+contrast_id = "proximal_ACR_vs_proximal"
+causal_site_nums = [50,500,5000]
+causal_foreground_fractions = [0.01, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.99]
+seeds = range(42, 42 + 30)
+
+# The first run generates a tagged ID list and provenance metadata. Reuse
+# its returned path only after SIMULATION_JOB validates the candidate universe.
+pruned_site_ids_file = None
+set_results = []
+
+for causal_site_num in causal_site_nums:
+    for causal_foreground_fraction in causal_foreground_fractions:
+        print(f"Running simulation for causal_foreground_fraction={causal_foreground_fraction}")
+        for seed in seeds:
+            seed = seed * 100
+            print(f"Running simulation for seed={seed}")
+            name = f"{contrast_id}.c{causal_site_num}.f{int(causal_foreground_fraction*100)}.s{seed}"
+
+            config = base_config.copy()
+            config.update({
+                "name": name,
+                "contrast_id": contrast_id,
+                "causal_site_num": causal_site_num,
+                "causal_foreground_fraction": causal_foreground_fraction,
+                "enrichment_ratio": None,
+                "pruned_site_ids_file": pruned_site_ids_file,
+                "seed": seed,
+            })
+
+            if seed == 4200:
+                result = SIMULATION_JOB(config).run(plot=True)
+            else:
+                result = SIMULATION_JOB(config).run(plot=False)
+
+            if pruned_site_ids_file is None:
+                pruned_site_ids_file = str(result["pruned_site_ids_file"])
+
+            pval = result['enrichment_result']['stat'][name]['pval']
+            obs = result['enrichment_result']['stat'][name]['obs_value']
+            set_results.append({
+                "name": name,
+                "contrast_id": contrast_id,
+                "causal_site_num": causal_site_num,
+                "causal_foreground_fraction": causal_foreground_fraction,
+                "seed": seed,
+                "pval": pval,
+                "obs": obs,
+            })
+
+import pandas as pd
+set_results_df = pd.DataFrame(set_results)
+set_results_df.to_csv(f"{PROJECT}/data/results/simulate/f{contrast_id}_simulation_results.csv", index=False)

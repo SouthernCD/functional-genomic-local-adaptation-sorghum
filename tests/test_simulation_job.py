@@ -26,6 +26,66 @@ class SimulationJobTests(unittest.TestCase):
             "pruned_site_parameters": {"method": "test", "seed": 7},
         }
 
+    def test_contrast_build_and_hash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = self._config(root)
+            settings = root / "contrasts.json"
+            settings.write_text(json.dumps({"te": {
+                "foreground": "proximal & TE", "background": "proximal",
+                "dataset": "genome"}}))
+            config.update(contrast_id="te", contrasts_settings_json_file=str(settings))
+            config.pop("foreground_col")
+            job = SIMULATION_JOB(config)
+            table = pd.DataFrame({"ID": ["a", "b", "c"], "CHROM": [1, 1, 1],
+                                  "POS": [1, 2, 3], "MAF": [0.1, 0.2, 0.3],
+                                  "proximal": [True, True, False], "TE": [True, False, True]})
+            built = job._build_site_info_df(table)
+            self.assertEqual(built["ID"].tolist(), ["a", "b"])
+            self.assertEqual(built["foreground"].tolist(), [True, False])
+            self.assertEqual(built["MAF"].tolist(), [0.1, 0.2])
+            self.assertNotIn("genome", table)
+            universe = job._site_universe(built)
+            self.assertEqual(universe, job._site_universe(built.iloc[::-1]))
+            self.assertNotEqual(universe, job._site_universe(table))
+            changed = built.copy()
+            changed["foreground"] = ~changed["foreground"]
+            self.assertEqual(universe, job._site_universe(changed))
+            original_hash = job._run_hash(None, False)[0]
+            job.contrast = {**job.contrast, "foreground": "TE"}
+            self.assertNotEqual(original_hash, job._run_hash(None, False)[0])
+            with self.assertRaisesRegex(ValueError, "Unknown contrast_id"):
+                SIMULATION_JOB({**config, "contrast_id": "absent"})
+            with self.assertRaisesRegex(ValueError, "Provide both"):
+                SIMULATION_JOB({**config, "contrasts_settings_json_file": None})
+            with self.assertRaisesRegex(ValueError, "requires foreground_col"):
+                SIMULATION_JOB({**config, "foreground_col": "TE"})
+
+    def test_pruning_universe_provenance(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            job = SIMULATION_JOB(self._config(root))
+            table = pd.DataFrame({"ID": ["a", "b", "c"], "foreground": [True, False, False],
+                                  "MAF": [0.1, 0.2, 0.3]})
+            job.site_universe = job._site_universe(table)
+            job._set_paths(root)
+            job._write_site_ids(table.iloc[:2], {"source": "automatic", "seed": 1})
+            path = job.pruned_site_ids_file
+            self.assertIn(job.site_universe["sha256"][:16], path.name)
+            self.assertEqual(job._pruning_sidecar(path), job.pruning_metadata_file)
+            ids = job._read_site_ids(path)
+            job._validate_pruning_source(path, table.iloc[::-1], ids)
+            # All retained IDs still exist, but a discarded candidate was removed.
+            with self.assertRaisesRegex(ValueError, "candidate SNP universe"):
+                job._validate_pruning_source(path, table.iloc[:2], ids)
+            with gzip.open(path, "wt") as out:
+                out.write("b\na\n")
+            with self.assertRaisesRegex(ValueError, "checksum"):
+                job._validate_pruning_source(path, table, job._read_site_ids(path))
+            job.pruning_metadata_file.unlink()
+            with self.assertRaisesRegex(ValueError, "Missing pruning provenance"):
+                job._validate_pruning_source(path, table, ids)
+
     def test_supplied_table_changes_hash_and_requires_provenance(self):
         with tempfile.TemporaryDirectory() as tmp:
             config = self._config(Path(tmp))
@@ -240,20 +300,14 @@ class SimulationJobTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             config = self._config(root)
-            implicit_job = SIMULATION_JOB(config)
             default_job = SIMULATION_JOB({**config, "effect_assignment": {
                 "method": "random_sign_uniform"}})
-            self.assertEqual(implicit_job.effect_assignment,
-                             default_job.effect_assignment)
-            self.assertEqual(implicit_job._run_hash(None, False)[0],
-                             default_job._run_hash(None, False)[0])
             self.assertEqual(default_job.effect_assignment, {
                 "method": "random_sign_uniform", "low": 0.5, "high": 1.5})
             beta_rng = np.random.default_rng(default_job.beta_seed)
             expected_signs = beta_rng.choice([-1.0, 1.0], size=4)
             expected_magnitudes = beta_rng.uniform(0.5, 1.5, size=4)
             expected = expected_signs * expected_magnitudes
-            np.testing.assert_array_equal(implicit_job._assign_effects(4), expected)
             np.testing.assert_array_equal(default_job._assign_effects(4), expected)
             np.testing.assert_array_equal(default_job._assign_effects(4), expected)
 
@@ -299,6 +353,128 @@ class SimulationJobTests(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, message):
                         SIMULATION_JOB({**config, "effect_assignment": {
                             "method": "random_sign_uniform", **options}})
+
+    def test_random_sign_normal_effect_assignment(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._config(Path(tmp))
+            std_job = SIMULATION_JOB({**config, "effect_assignment": {
+                "method": "random_sign_normal", "mean": 1.0, "std": 0.2}})
+
+            rng = np.random.default_rng(std_job.beta_seed)
+            magnitudes = np.abs(rng.normal(1.0, 0.2, size=10000))
+            signs = rng.choice([-1.0, 1.0], size=10000)
+            effects = std_job._assign_effects(10000)
+            np.testing.assert_array_equal(effects, signs * magnitudes)
+            np.testing.assert_array_equal(std_job._assign_effects(10000), effects)
+            self.assertAlmostEqual(np.median(np.abs(effects)), 1.0, delta=0.01)
+            self.assertAlmostEqual(np.std(np.abs(effects)), 0.2, delta=0.01)
+            self.assertTrue(0.47 < np.mean(effects > 0) < 0.53)
+
+    def test_random_sign_normal_validation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._config(Path(tmp))
+            invalid = [
+                ({"mean": 1.0}, "requires exactly"),
+                ({"mean": 1.0, "std": 0.2, "variance": 0.04}, "requires exactly"),
+                ({"mean": -1.0, "std": 0.2}, "mean"),
+                ({"mean": 1.0, "std": 0}, "std"),
+                ({"mean": 1.0, "std": float("inf")}, "finite number"),
+                ({"mean": 1.0, "std": True}, "finite number"),
+                ({"mean": 1.0, "std": 0.2, "extra": 1}, "requires exactly"),
+            ]
+            for options, message in invalid:
+                with self.subTest(options=options):
+                    with self.assertRaisesRegex(ValueError, message):
+                        SIMULATION_JOB({**config, "effect_assignment": {
+                            "method": "random_sign_normal", **options}})
+
+    def test_random_sign_lognormal_effect_assignment(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = self._config(root)
+            job = SIMULATION_JOB({**config, "effect_assignment": {
+                "method": "random_sign_lognormal", "log_mean": 0.0,
+                "log_std": 1.0}})
+            implicit_job = SIMULATION_JOB(config)
+            self.assertEqual(implicit_job.effect_assignment,
+                             job.effect_assignment)
+            self.assertEqual(implicit_job._run_hash(None, False)[0],
+                             job._run_hash(None, False)[0])
+            rng = np.random.default_rng(job.beta_seed)
+            expected = rng.lognormal(0.0, 1.0, size=10000)
+            expected *= rng.choice([-1.0, 1.0], size=10000)
+            effects = job._assign_effects(10000)
+            np.testing.assert_array_equal(effects, expected)
+            np.testing.assert_array_equal(implicit_job._assign_effects(10000),
+                                          expected)
+            np.testing.assert_array_equal(job._assign_effects(10000), effects)
+            self.assertTrue(0.47 < np.mean(effects > 0) < 0.53)
+            self.assertGreater(np.quantile(np.abs(effects), 0.9) /
+                               np.quantile(np.abs(effects), 0.1), 10)
+
+            other = SIMULATION_JOB({**config, "effect_assignment": {
+                "method": "random_sign_lognormal", "log_mean": 0.0,
+                "log_std": 0.5}})
+            self.assertNotEqual(job._run_hash(None, False)[0],
+                                other._run_hash(None, False)[0])
+            job._set_paths(root)
+            sites = pd.DataFrame({"ID": ["s2", "s1"]})
+            genotypes = pd.DataFrame([[0, 1], [2, 1]],
+                                     index=["s1", "s2"], columns=["a", "b"])
+            with patch("src.simulate.get_genotype_df_from_vcf_by_site_df",
+                       return_value=genotypes):
+                _, saved_effects = job._prepare_causal_effects(sites)
+            self.assertEqual(saved_effects["SNP_ID"].tolist(), ["s2", "s1"])
+            np.testing.assert_array_equal(saved_effects["beta_raw"],
+                                          job._assign_effects(2))
+            np.testing.assert_allclose(
+                pd.read_csv(job.causal_effect_file, sep="\t")["beta_raw"],
+                job._assign_effects(2))
+
+    def test_normal_mixture_effect_assignment(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._config(Path(tmp))
+            components = [
+                {"weight": 0.5, "std": 0.1},
+                {"weight": 0.3, "std": 0.5},
+                {"weight": 0.2, "std": 1.0},
+            ]
+            job = SIMULATION_JOB({**config, "effect_assignment": {
+                "method": "normal_mixture", "components": components}})
+            components[0]["std"] = 99.0
+            self.assertEqual(job.effect_assignment["components"][0]["std"], 0.1)
+            rng = np.random.default_rng(job.beta_seed)
+            selected = rng.choice(3, size=10000, p=[0.5, 0.3, 0.2])
+            expected = rng.normal(0.0, np.array([0.1, 0.5, 1.0])[selected])
+            np.testing.assert_array_equal(job._assign_effects(10000), expected)
+            np.testing.assert_array_equal(job._assign_effects(10000), expected)
+            self.assertTrue(0.47 < np.mean(expected > 0) < 0.53)
+            self.assertGreater(np.quantile(np.abs(expected), 0.99),
+                               10 * np.quantile(np.abs(expected), 0.5))
+
+    def test_new_effect_assignment_validation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._config(Path(tmp))
+            invalid = [
+                ({"method": "random_sign_lognormal", "log_mean": 0}, "requires exactly"),
+                ({"method": "random_sign_lognormal", "log_mean": 0,
+                  "log_std": 0}, "log_std"),
+                ({"method": "random_sign_lognormal", "log_mean": float("nan"),
+                  "log_std": 1}, "finite number"),
+                ({"method": "normal_mixture", "components": []}, "at least two"),
+                ({"method": "normal_mixture", "components": [
+                    {"weight": 0.5, "std": 0.1}, {"weight": 0.5, "std": 0}]}, "std"),
+                ({"method": "normal_mixture", "components": [
+                    {"weight": 0.5, "std": 0.1}, {"weight": 0.4, "std": 1.0}]},
+                 "sum to one"),
+                ({"method": "normal_mixture", "components": [
+                    {"weight": True, "std": 0.1}, {"weight": 0.5, "std": 1.0}]},
+                 "weight"),
+            ]
+            for assignment, message in invalid:
+                with self.subTest(assignment=assignment):
+                    with self.assertRaisesRegex(ValueError, message):
+                        SIMULATION_JOB({**config, "effect_assignment": assignment})
 
     def test_vector_effect_assignment_order_and_hash(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -535,7 +711,7 @@ class SimulationJobTests(unittest.TestCase):
                               "pruned_site_ids_file": str(missing)}
             with patch.object(SIMULATION_JOB, "_load_inputs", return_value=load), \
                  patch.object(SIMULATION_JOB, "_prune_sites", side_effect=AssertionError("LD was rerun")):
-                with self.assertRaisesRegex(ValueError, "missing from site_info_df"):
+                with self.assertRaisesRegex(ValueError, "Missing pruning provenance metadata"):
                     SIMULATION_JOB(missing_config).run(plot=False)
             duplicate = root / "duplicate_ids.txt"
             duplicate.write_text("s1\ns1\n")

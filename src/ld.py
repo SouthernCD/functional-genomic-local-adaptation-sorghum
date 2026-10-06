@@ -1967,6 +1967,694 @@ def calculate_ld_matrix(
             'R2': pairs['R2'].to_numpy()[keep],
         })
 
+def summarize_ld_decay_pairs(ld_pairs, site_info_df, *, max_decay_size=35000,
+                             curve_bin_size=100):
+    """Summarize unthresholded INDEX_1/INDEX_2/R2 pairs by chromosome.
+
+    Pass pairs computed with min_r2=0; filtering low R2 before this step
+    biases the mean upwards. Each unordered coordinate pair must occur once.
+    Bins are (0, B], (B, 2B], ...; zero-distance pairs are excluded.
+    Returns CHROM, bin_right, ld_sum, pair_count and ld_mean.
+    """
+    max_decay_size, curve_bin_size = index(max_decay_size), index(curve_bin_size)
+    if min(max_decay_size, curve_bin_size) < 1:
+        raise ValueError('Distance limit and bin size must be positive integers')
+    if not site_info_df.index.is_unique:
+        raise ValueError('site_info_df.index must uniquely identify sites')
+    for frame, columns in ((ld_pairs, ['INDEX_1', 'INDEX_2', 'R2']),
+                           (site_info_df, ['CHROM', 'POS'])):
+        if not set(columns).issubset(frame.columns):
+            raise ValueError(f'Required columns: {columns}')
+    a = site_info_df.index.get_indexer(ld_pairs['INDEX_1'])
+    b = site_info_df.index.get_indexer(ld_pairs['INDEX_2'])
+    if (a < 0).any() or (b < 0).any():
+        raise ValueError('LD pair labels are absent from site_info_df.index')
+    positions = site_info_df['POS'].to_numpy(dtype=np.int64)
+    chromosomes = site_info_df['CHROM'].to_numpy()
+    distances = np.abs(positions[a] - positions[b])
+    values = ld_pairs['R2'].to_numpy(dtype=float)
+    keep = ((chromosomes[a] == chromosomes[b]) & (distances > 0)
+            & (distances <= max_decay_size) & np.isfinite(values))
+    if ((values[keep] < 0) | (values[keep] > 1)).any():
+        raise ValueError('Finite R2 values must be in [0, 1]')
+    data = pd.DataFrame({
+        'CHROM': chromosomes[a[keep]],
+        'bin_right': np.minimum(
+            ((distances[keep] - 1) // curve_bin_size + 1) * curve_bin_size,
+            max_decay_size),
+        'R2': values[keep],
+    })
+    summary = data.groupby(['CHROM', 'bin_right'], sort=False, observed=True)['R2'].agg(
+        ld_sum='sum', pair_count='size').reset_index()
+    if not summary.empty:
+        bin_right = np.minimum(
+            np.arange(1, (max_decay_size + curve_bin_size - 1) // curve_bin_size + 1)
+            * curve_bin_size, max_decay_size)
+        grid = pd.MultiIndex.from_product(
+            [data['CHROM'].unique(), bin_right], names=['CHROM', 'bin_right'])
+        summary = summary.set_index(['CHROM', 'bin_right']).reindex(grid).reset_index()
+        summary['ld_sum'] = summary['ld_sum'].fillna(0.0)
+        summary['pair_count'] = summary['pair_count'].fillna(0).astype(np.int64)
+    summary['ld_mean'] = summary['ld_sum'] / summary['pair_count'].replace(0, np.nan)
+    return summary
+
+
+def calculate_ld_decay(site_info_df, input_vcf_file, *, max_decay_size=35000,
+                       curve_bin_size=100, pool_num=1, show_progress=True):
+    """Calculate all windowed LD pairs once per chromosome, then bin them.
+
+    Calls calculate_ld_matrix(..., output_format='pairs', min_r2=0) once
+    for each chromosome, reusing the backend's VCF readers and genotype
+    caches across its tasks. Every distinct coordinate pair with
+    0 < distance <= max_decay_size is counted once. Duplicate input
+    coordinates are collapsed. All finite pairs for one chromosome are
+    held in memory until aggregation; only bin summaries persist afterwards.
+    Missing-call handling is inherited from calculate_ld_matrix unchanged.
+    Undefined R2 is excluded; pair_count records the finite observations.
+    This function performs computation only when explicitly called.
+    """
+    max_decay_size, curve_bin_size = index(max_decay_size), index(curve_bin_size)
+    pool_num = index(pool_num)
+    if min(max_decay_size, curve_bin_size, pool_num) < 1:
+        raise ValueError('Distance, bin and worker settings must be positive integers')
+    sites = site_info_df[['CHROM', 'POS']].copy()
+    if sites.isna().any().any():
+        raise ValueError('CHROM and POS must not contain missing values')
+    if not pd.api.types.is_integer_dtype(sites['POS']) or (sites['POS'] < 1).any():
+        raise ValueError('POS must contain positive integer coordinates')
+    sites = sites.drop_duplicates(['CHROM', 'POS']).reset_index(drop=True)
+    n_bins = (max_decay_size + curve_bin_size - 1) // curve_bin_size
+    bin_right = np.minimum(np.arange(1, n_bins + 1) * curve_bin_size, max_decay_size)
+    chromosome_summaries = []
+    for chr_id, chromosome in sites.groupby('CHROM', sort=False, observed=True):
+        chromosome = chromosome.sort_values('POS', kind='stable')
+        if show_progress:
+            print(f'LD decay {chr_id}: calculating windowed LD for {len(chromosome)} sites',
+                  flush=True)
+        pairs = calculate_ld_matrix(
+            chromosome, input_vcf_file,
+            ld_window_size=max_decay_size + 1, output_format='pairs',
+            min_r2=0, pool_num=pool_num, show_progress=show_progress,
+        )
+        summary = summarize_ld_decay_pairs(
+            pairs, chromosome, max_decay_size=max_decay_size,
+            curve_bin_size=curve_bin_size,
+        )
+        del pairs
+        # Retain empty bins/chromosomes as zero counts and undefined means.
+        summary = summary.set_index('bin_right').reindex(bin_right)
+        summary.index.name = 'bin_right'
+        summary['CHROM'] = chr_id
+        summary['ld_sum'] = summary['ld_sum'].fillna(0.0)
+        summary['pair_count'] = summary['pair_count'].fillna(0).astype(np.int64)
+        summary['ld_mean'] = summary['ld_sum'] / summary['pair_count'].replace(0, np.nan)
+        chromosome_summaries.append(summary.reset_index()[
+            ['CHROM', 'bin_right', 'ld_sum', 'pair_count', 'ld_mean']])
+    if not chromosome_summaries:
+        return pd.DataFrame(columns=['CHROM', 'bin_right', 'ld_sum', 'pair_count', 'ld_mean'])
+    return pd.concat(chromosome_summaries, ignore_index=True)
+
+
+def plot_ld_decay(ld_decay_df, *, half_ld_value=0.5, figsize=(12, 9),
+                  xlim=(-1000, 35000), save_fig_path=None, ax=None):
+    """Plot binned decay with the Landraces notebook's style.
+
+    Input is calculate_ld_decay/summarize_ld_decay_pairs output. Returns
+    (fig, ax, half_ld_df). The first downward threshold crossing is linearly
+    interpolated along distance, without sorting by R2 or extrapolating.
+    The (0, 1) origin is a display convention, not an observed pair/bin.
+    Crossings use observed bins only. A first bin already below threshold
+    yields NaN with status 'below_in_first_bin'; a missing-bin gap is not
+    interpolated. No crossing yields NaN with status 'not_reached'.
+    """
+    half_ld_value = float(half_ld_value)
+    if not np.isfinite(half_ld_value) or not 0 < half_ld_value < 1:
+        raise ValueError('half_ld_value must be in (0, 1)')
+    required = ['CHROM', 'bin_right', 'ld_mean', 'pair_count']
+    if not set(required).issubset(ld_decay_df.columns) or ld_decay_df.empty:
+        raise ValueError(f'Expected nonempty decay data with columns {required}')
+    if ld_decay_df.duplicated(['CHROM', 'bin_right']).any():
+        raise ValueError('Each chromosome/bin must appear once')
+    rows = []
+    with plt.rc_context():
+        set_plot_style()
+        if ax is None:
+            fig, ax = plt.subplots(figsize=figsize)
+        else:
+            fig = ax.figure
+        for chr_id, curve in ld_decay_df.groupby('CHROM', sort=False, observed=True):
+            curve = curve.sort_values('bin_right')
+            x = curve['bin_right'].to_numpy(dtype=float)
+            y = curve['ld_mean'].to_numpy(dtype=float).copy()
+            y[curve['pair_count'].to_numpy() <= 0] = np.nan
+            finite = np.flatnonzero(np.isfinite(y))
+            distance, status = np.nan, 'no_finite_pairs'
+            if finite.size:
+                first = finite[0]
+                if y[first] == half_ld_value:
+                    distance, status = x[first], 'reached'
+                elif y[first] < half_ld_value:
+                    status = 'below_in_first_bin'
+                else:
+                    status = 'not_reached'
+                    for i in range(first + 1, len(x)):
+                        if (np.isfinite(y[i - 1]) and np.isfinite(y[i])
+                                and y[i - 1] > half_ld_value >= y[i]):
+                            distance = x[i - 1] + (half_ld_value - y[i - 1]) * (
+                                x[i] - x[i - 1]) / (y[i] - y[i - 1])
+                            status = 'reached'
+                            break
+            if np.isfinite(distance):
+                suffix = f'{int(distance)} bp'
+            elif status == 'below_in_first_bin':
+                suffix = f'<{x[finite[0]]:g} bp'
+            else:
+                suffix = {
+                    'not_reached': 'not reached',
+                    'no_finite_pairs': 'no finite pairs',
+                }[status]
+            ax.plot(np.r_[0, x], np.r_[1, y], marker='o', markersize=3,
+                    label=f'{chr_id}: {suffix}')
+            rows.append({'CHROM': chr_id, 'half_ld_value': half_ld_value,
+                         'half_ld_dist': distance, 'status': status})
+        ax.axhline(half_ld_value, color='gray', linestyle='dashed')
+        ax.set_xlabel('Distance (bp)')
+        ax.set_ylabel('Linkage Disequilibrium (r²)')
+        ax.set_xlim(xlim)
+        ax.set_ylim(0, 1.05)
+        ax.set_yticks(np.arange(0, 1.1, 0.1))
+        ax.legend(loc='upper right',
+                  title=f'LD decay distance\n(r² = {half_ld_value:g})')
+        ax.grid(True)
+        if save_fig_path is not None:
+            fig.savefig(save_fig_path, facecolor='none', edgecolor='none', bbox_inches='tight')
+    return fig, ax, pd.DataFrame(rows)
+
+
+# Multiscale bins use (left, right]; the final bin has no upper bound.
+_MULTISCALE_LD_EDGES = np.array([
+    0, 500, 1000, 2000, 5000, 10000, 20000, 30000, 50000, 75000,
+    100000, 125000, 150000, 175000, 200000, 225000, 250000, 300000,
+    400000, 500000, 600000, 700000, 800000, 900000, 1000000,
+    1500000, 2000000, 2500000, 3000000, 5000000, 10000000,
+    15000000, 20000000, 30000000, 50000000, np.inf,
+], dtype=float)
+_MULTISCALE_LD_LABELS = [
+    '0–0.5 kb', '0.5–1 kb', '1–2 kb', '2–5 kb', '5–10 kb',
+    '10–20 kb', '20–30 kb', '30–50 kb', '50–75 kb', '75–100 kb',
+    '100–125 kb', '125–150 kb', '150–175 kb', '175–200 kb',
+    '200–225 kb', '225–250 kb', '250–300 kb', '300–400 kb',
+    '400–500 kb', '500–600 kb', '600–700 kb', '700–800 kb',
+    '800–900 kb', '900 kb–1 Mb', '1–1.5 Mb', '1.5–2 Mb',
+    '2–2.5 Mb', '2.5–3 Mb', '3–5 Mb', '5–10 Mb', '10–15 Mb',
+    '15–20 Mb', '20–30 Mb', '30–50 Mb', '>50 Mb',
+]
+
+
+def _multiscale_pair_bounds(positions, left, right):
+    """Implicit unordered-pair population; allocate O(number of sites)."""
+    lower = np.searchsorted(positions, positions + int(left), side='right')
+    upper = (np.full(len(positions), len(positions), dtype=np.int64)
+             if np.isinf(right) else
+             np.searchsorted(positions, positions + int(right), side='right'))
+    counts = upper - lower
+    return lower, np.cumsum(counts, dtype=np.int64)
+
+
+def _multiscale_sample_ranks(total, count, rng):
+    """Floyd sampling: uniform without replacement, O(count) memory."""
+    selected = set()
+    for stop in range(total - count, total):
+        draw = int(rng.integers(stop + 1))
+        selected.add(stop if draw in selected else draw)
+    return np.array(sorted(selected), dtype=np.int64)
+
+
+def _plan_multiscale_ld_pairs(positions, chr_seed, random_seed, full_distance, max_pairs):
+    """Count implicit populations and select only bounded long-range pairs."""
+    populations = np.zeros(len(_MULTISCALE_LD_LABELS), dtype=np.int64)
+    evaluated = np.zeros_like(populations)
+    long_a, long_b, long_bins = [], [], []
+    for bin_id, (left, right) in enumerate(zip(
+            _MULTISCALE_LD_EDGES[:-1], _MULTISCALE_LD_EDGES[1:])):
+        lower, cumulative = _multiscale_pair_bounds(positions, left, right)
+        total = int(cumulative[-1]) if len(cumulative) else 0
+        populations[bin_id] = total
+        number = min(total, max_pairs) if right > full_distance else total
+        evaluated[bin_id] = number
+        if right <= full_distance or not number:
+            continue
+        rng = np.random.default_rng(np.random.SeedSequence([random_seed, chr_seed, bin_id]))
+        ranks = (_multiscale_sample_ranks(total, number, rng) if number < total
+                 else np.arange(number, dtype=np.int64))
+        a = np.searchsorted(cumulative, ranks, side='right')
+        before = np.where(a > 0, cumulative[np.maximum(a - 1, 0)], 0)
+        long_a.append(a)
+        long_b.append(lower[a] + ranks - before)
+        long_bins.append(np.full(number, bin_id, dtype=np.int64))
+    empty = np.empty(0, dtype=np.int64)
+    return populations, evaluated, tuple(
+        np.concatenate(parts) if parts else empty for parts in (long_a, long_b, long_bins))
+
+
+def _iter_multiscale_ld_tasks(positions, long_pairs, full_distance,
+                              matrix_block_size, pair_batch_size):
+    # Exhaustive local pairs: only the upper triangle is emitted, across all
+    # short-distance bins at once, rather than rescanning pairs for every bin.
+    near_right = np.searchsorted(positions, positions + full_distance, side='right')
+    for start in range(0, len(positions), matrix_block_size):
+        end = min(start + matrix_block_size, len(positions))
+        if (near_right[start:end] > np.arange(start, end) + 1).any():
+            yield ('short', start, end)
+    a, b, bin_ids = long_pairs
+    # Cluster all long-distance bins by lead-coordinate block for page reuse.
+    order = np.argsort(a // matrix_block_size, kind='stable')
+    for start in range(0, len(order), pair_batch_size):
+        rows = order[start:start + pair_batch_size]
+        yield ('long', a[rows], b[rows], bin_ids[rows])
+
+
+def _calculate_multiscale_ld_batch(task, positions, normalized, full_distance,
+                                  matrix_block_size):
+    n_bins = len(_MULTISCALE_LD_LABELS)
+    attempted = np.zeros(n_bins, dtype=np.int64)
+    counts = np.zeros(n_bins, dtype=np.int64)
+    sums = np.zeros(n_bins)
+    distance_min = np.full(n_bins, np.inf)
+    distance_max = np.full(n_bins, -np.inf)
+
+    def aggregate(bin_ids, r2, distances):
+        # Distance QC is requested only for the last two bins; avoid adding
+        # indexed min/max work to billions of exhaustive short-range pairs.
+        tail = bin_ids >= n_bins - 2
+        if tail.any():
+            np.minimum.at(distance_min, bin_ids[tail], distances[tail])
+            np.maximum.at(distance_max, bin_ids[tail], distances[tail])
+        attempted[:] += np.bincount(bin_ids, minlength=n_bins)
+        finite = np.isfinite(r2)
+        counts[:] += np.bincount(bin_ids[finite], minlength=n_bins)
+        sums[:] += np.bincount(bin_ids[finite], weights=r2[finite], minlength=n_bins)
+
+    if task[0] == 'long':
+        _, a, b, bin_ids = task
+        distances = np.abs(positions[b] - positions[a])
+        if ((bin_ids < 0) | (bin_ids >= n_bins)).any():
+            raise ValueError('Invalid multiscale distance bin index')
+        eligible = ((a < b) & (distances > _MULTISCALE_LD_EDGES[bin_ids])
+                    & (distances <= _MULTISCALE_LD_EDGES[bin_ids + 1]))
+        if not eligible.all():
+            raise ValueError('Long-range LD pair is outside its explicit (left, right] bin')
+        r2 = np.einsum('ij,ij->i', normalized[a], normalized[b])
+        np.clip(r2, -1, 1, out=r2)
+        np.square(r2, out=r2)
+        aggregate(bin_ids, r2, distances)
+    else:
+        _, start, end = task
+        query_indices = np.arange(start, end)
+        query = normalized[start:end]
+        stop = np.searchsorted(positions, positions[end - 1] + full_distance, side='right')
+        # Bound temporary distance/R2 matrices, including very dense SNP regions.
+        for left in range(start + 1, stop, matrix_block_size * 8):
+            right = min(left + matrix_block_size * 8, stop)
+            subject_indices = np.arange(left, right)
+            distances = positions[subject_indices][None, :] - positions[query_indices][:, None]
+            eligible = ((subject_indices[None, :] > query_indices[:, None])
+                        & (distances > 0) & (distances <= full_distance))
+            if not eligible.any():
+                continue
+            r2 = query @ normalized[left:right].T
+            np.clip(r2, -1, 1, out=r2)
+            np.square(r2, out=r2)
+            bin_ids = np.searchsorted(_MULTISCALE_LD_EDGES, distances[eligible], side='left') - 1
+            aggregate(bin_ids, r2[eligible], distances[eligible])
+    return attempted, counts, sums, distance_min, distance_max
+
+
+_multiscale_worker_state = None
+_multiscale_worker_error = None
+
+
+def _close_multiscale_ld_worker():
+    global _multiscale_worker_state
+    if _multiscale_worker_state is not None:
+        matrix, limiter = _multiscale_worker_state[1], _multiscale_worker_state[-1]
+        matrix._mmap.close()
+        limiter.restore_original_limits()
+        _multiscale_worker_state = None
+
+
+def _init_multiscale_ld_worker(filename, shape, positions, full_distance, matrix_block_size):
+    global _multiscale_worker_state, _multiscale_worker_error
+    _multiscale_worker_state = None
+    _multiscale_worker_error = None
+    limiter = None
+    try:
+        limiter = threadpool_limits(limits=1, user_api='blas')
+        matrix = np.memmap(filename, dtype=np.float64, mode='r', shape=shape)
+        _multiscale_worker_state = (positions, matrix, full_distance, matrix_block_size, limiter)
+        Finalize(None, _close_multiscale_ld_worker, exitpriority=10)
+    except Exception as error:
+        if limiter is not None:
+            limiter.restore_original_limits()
+        _multiscale_worker_error = str(error)
+
+
+def _run_multiscale_ld_batch(task):
+    if _multiscale_worker_error is not None:
+        raise RuntimeError(f'Could not initialize multiscale LD worker: {_multiscale_worker_error}')
+    return _calculate_multiscale_ld_batch(task, *_multiscale_worker_state[:-1])
+
+
+def _load_multiscale_ld_result(data):
+    """A standalone CSV is sufficient for plotting, without input VCF/JSON."""
+    if isinstance(data, (str, os.PathLike)):
+        data = pd.read_csv(data)
+    required = {'CHROM', 'BIN_LEFT', 'BIN_RIGHT', 'BIN_LABEL', 'PAIR_COUNT', 'LD_MEAN'}
+    if not required.issubset(data.columns):
+        raise ValueError(f'Multiscale LD result requires columns {sorted(required)}')
+    return data
+
+
+def calculate_multiscale_ld_decay(
+    site_info_df, input_vcf_file, *, min_maf=None, max_het=None,
+    full_distance=200000, max_pairs_per_bin=50000, random_seed=42,
+    pool_num=1, pair_batch_size=4096, cache_max_tiles=4,
+    show_progress=True, silence=False, progress_interval=2.0,
+    matrix_block_size=128, scratch_dir=None, cache_file=None, force_recompute=False,
+):
+    """Exhaustive short-range and sampled long-range chromosome-wide LD.
+
+    Normalize each chromosome once into a temporary float64 disk array,
+    shared read-only by workers. Exhaustive bins <= full_distance (200 kb)
+    use bounded block matrix multiplication; only unordered pairs contribute.
+    More distant bins use uniform sampling without replacement with at most
+    50,000 pairs/bin by default. No R2 filtering; no dense chromosome LD
+    matrix or exhaustive pair list is stored. Same bin definitions, seeded
+    pair selection and genotype/missing-call semantics as the previous version.
+
+    site_info_df accepts a DataFrame or notebook 02's var_stat HDF path.
+    PAIR_COUNT counts finite LD; EVALUATED_PAIR_COUNT includes undefined
+    pairs; POPULATION_PAIR_COUNT counts all eligible coordinate pairs.
+    PAIR_DISTANCE_MIN/MAX record min/max physical distance (bp) for the
+    last two bins across evaluated pairs, including undefined LD. Other bins
+    and bins without evaluated pairs have NaN distance extrema.
+    The >50 Mb bin explicitly requires distance >50,000,000; it is not a
+    catch-all for unassigned pairs. Multiple VCF records per coordinate raise.
+    Empty bins have LD_MEAN=NaN.
+    silence=True suppresses messages regardless of show_progress. Otherwise
+    report loading/normalization and pair-count progress with elapsed time,
+    throughput and ETA every progress_interval seconds. pool_num>1 uses fork,
+    one BLAS thread/worker, with workers opening the shared temporary array.
+    scratch_dir selects temporary storage (approximately 8*n_sites*n_samples
+    bytes/chromosome); arrays are removed after workers finish. cache_max_tiles
+    bounds the VCF tile cache used only during the one-time normalization.
+
+    An existing cache_file is read immediately, without loading inputs or
+    checking a JSON fingerprint. Set force_recompute=True after changing
+    inputs/parameters. CSV output is written atomically when all chromosomes
+    finish. Background jobs can compute/save this CSV without creating plots.
+    """
+    import hashlib
+    import math
+    import tempfile
+    from pathlib import Path
+
+    verbose = bool(show_progress) and not silence
+    if cache_file is not None and not force_recompute and Path(cache_file).is_file():
+        if verbose:
+            print(f'Reading existing multiscale LD CSV: {cache_file}', flush=True)
+        return _load_multiscale_ld_result(cache_file)
+    full_distance = index(full_distance)
+    max_pairs_per_bin, random_seed = index(max_pairs_per_bin), index(random_seed)
+    pool_num, pair_batch_size = index(pool_num), index(pair_batch_size)
+    cache_max_tiles, matrix_block_size = index(cache_max_tiles), index(matrix_block_size)
+    if (full_distance not in _MULTISCALE_LD_EDGES[1:-1]
+            or min(max_pairs_per_bin, pool_num, pair_batch_size, cache_max_tiles, matrix_block_size) < 1
+            or random_seed < 0):
+        raise ValueError('Use a finite bin edge, positive sizes, and seed >= 0')
+    if verbose and (not np.isfinite(progress_interval) or progress_interval <= 0):
+        raise ValueError('progress_interval must be finite and positive')
+    if pool_num > 1 and mp.get_start_method() != 'fork':
+        raise RuntimeError("Parallel LD requires 'fork'; use pool_num=1 in this kernel.")
+    start_time = perf_counter()
+    if verbose:
+        print('Multiscale LD: loading and selecting sites', flush=True)
+    if isinstance(site_info_df, (str, os.PathLike)):
+        with pd.HDFStore(site_info_df, mode='r') as store:
+            site_info_df = pd.concat([store[key] for key in store.keys()], ignore_index=True)
+    sites = site_info_df.copy()
+    for column, cutoff, comparison in [('MAF', min_maf, 'min'), ('HETF', max_het, 'max')]:
+        if cutoff is not None:
+            cutoff = float(cutoff)
+            if not np.isfinite(cutoff) or not 0 <= cutoff <= 1:
+                raise ValueError(f'{column} cutoff must be finite and in [0, 1]')
+            sites = sites.loc[sites[column] >= cutoff] if comparison == 'min' else sites.loc[sites[column] <= cutoff]
+    sites = sites[['CHROM', 'POS']].copy()
+    if sites.isna().any().any() or not pd.api.types.is_integer_dtype(sites['POS']) or (sites['POS'] < 1).any():
+        raise ValueError('Require nonmissing CHROM and positive integer POS')
+    sites['CHROM'] = sites['CHROM'].astype(str)
+    sites = sites.drop_duplicates().sort_values(['CHROM', 'POS']).reset_index(drop=True)
+    if sites.empty:
+        raise ValueError('No sites remain for multiscale LD')
+    rows = []
+    n_chromosomes = sites['CHROM'].nunique()
+    for chr_number, (chr_id, chromosome) in enumerate(
+            sites.groupby('CHROM', sort=False, observed=True), 1):
+        positions = chromosome['POS'].to_numpy(dtype=np.int64)
+        chromosomes = [(chr_id, positions, np.arange(len(positions)))]
+        chr_seed = int.from_bytes(hashlib.sha256(chr_id.encode()).digest()[:4], 'little')
+        populations, expected, long_pairs = _plan_multiscale_ld_pairs(
+            positions, chr_seed, random_seed, full_distance, max_pairs_per_bin)
+        total_pairs = int(expected.sum())
+        n_bins = len(_MULTISCALE_LD_LABELS)
+        evaluated, counts = np.zeros(n_bins, dtype=np.int64), np.zeros(n_bins, dtype=np.int64)
+        batch_sums = [[] for _ in range(n_bins)]
+        distance_min = np.full(n_bins, np.inf)
+        distance_max = np.full(n_bins, -np.inf)
+        chr_start = perf_counter()
+        if verbose:
+            print(f'[{chr_number}/{n_chromosomes}] {chr_id}: {len(positions):,} sites; '
+                  f'{total_pairs:,} pairs planned; elapsed {chr_start - start_time:.1f}s', flush=True)
+        if total_pairs:
+            with tempfile.TemporaryDirectory(prefix='multiscale_ld_', dir=scratch_dir) as temporary:
+                reader = VCF(input_vcf_file)
+                matrix = None
+                try:
+                    n_samples = len(reader.samples)
+                    if n_samples < 2:
+                        raise ValueError('LD requires at least two samples')
+                    filename = os.path.join(temporary, 'normalized.f64')
+                    matrix = np.memmap(filename, dtype=np.float64, mode='w+',
+                                       shape=(len(positions), n_samples))
+                    cache = _LDPruningGenotypeCache(
+                        chromosomes, reader, full_distance, max_tiles=cache_max_tiles)
+                    tiles = (positions - 1) // full_distance
+                    unique_tiles = np.unique(tiles)
+                    last_report = perf_counter()
+                    for tile in unique_tiles:
+                        # Sorted coordinates make rows for one tile contiguous.
+                        left = np.searchsorted(tiles, tile)
+                        right = np.searchsorted(tiles, tile, side='right')
+                        matrix[left:right] = np.nan
+                        _, normalized, groups = cache.get(0, tile)
+                        for row in range(left, right):
+                            records = groups.get(int(positions[row]), [])
+                            if len(records) > 1:
+                                raise ValueError(f'Multiple VCF records at {chr_id}:{positions[row]}')
+                            if records:
+                                matrix[row] = normalized[records[0]]
+                        now = perf_counter()
+                        if verbose and (now - last_report >= progress_interval or right == len(positions)):
+                            print(f'{chr_id} normalize: {right:,}/{len(positions):,} sites '
+                                  f'({100 * right / len(positions):.1f}%); '
+                                  f'elapsed {now - chr_start:.1f}s', flush=True)
+                            last_report = now
+                    matrix.flush()
+                    del cache
+                finally:
+                    reader.close()
+                    if matrix is not None:
+                        matrix._mmap.close()
+                shape = (len(positions), n_samples)
+                matrix = np.memmap(filename, dtype=np.float64, mode='r', shape=shape)
+                tasks = _iter_multiscale_ld_tasks(
+                    positions, long_pairs, full_distance, matrix_block_size, pair_batch_size)
+                pair_start = last_report = perf_counter()
+                pool = None
+                try:
+                    if pool_num == 1:
+                        results = (_calculate_multiscale_ld_batch(
+                            task, positions, matrix, full_distance, matrix_block_size) for task in tasks)
+                    else:
+                        pool = mp.Pool(
+                            processes=pool_num, initializer=_init_multiscale_ld_worker,
+                            initargs=(filename, shape, positions, full_distance, matrix_block_size))
+                        results = _iter_parallel_ld_results(
+                            pool, tasks, pool_num, progress_interval if verbose else None,
+                            worker=_run_multiscale_ld_batch)
+                    for result in results:
+                        if result is not None:
+                            attempted, finite, sums, batch_min, batch_max = result
+                            distance_min = np.minimum(distance_min, batch_min)
+                            distance_max = np.maximum(distance_max, batch_max)
+                            evaluated += attempted
+                            counts += finite
+                            for bin_id in np.flatnonzero(finite):
+                                batch_sums[bin_id].append(float(sums[bin_id]))
+                        now = perf_counter()
+                        if verbose and (now - last_report >= progress_interval
+                                        or int(evaluated.sum()) == total_pairs):
+                            done = int(evaluated.sum())
+                            elapsed = now - pair_start
+                            rate = done / elapsed if elapsed else 0
+                            eta = f'{(total_pairs - done) / rate:.1f}s' if rate else '--'
+                            print(f'{chr_id} LD: {done:,}/{total_pairs:,} pairs '
+                                  f'({100 * done / total_pairs:.1f}%); elapsed {now - chr_start:.1f}s; '
+                                  f'{rate:,.0f} pairs/s; ETA {eta}', flush=True)
+                            last_report = now
+                    if pool is not None:
+                        pool.close()
+                        pool.join()
+                except BaseException:
+                    if pool is not None:
+                        pool.terminate()
+                        pool.join()
+                    raise
+                finally:
+                    matrix._mmap.close()
+        if not np.array_equal(evaluated, expected):
+            raise RuntimeError(f'Pair-count mismatch while computing {chr_id}')
+        for bin_id, label in enumerate(_MULTISCALE_LD_LABELS):
+            rows.append({
+                'CHROM': chr_id, 'BIN_LEFT': _MULTISCALE_LD_EDGES[bin_id],
+                'BIN_RIGHT': _MULTISCALE_LD_EDGES[bin_id + 1], 'BIN_LABEL': label,
+                'PAIR_COUNT': counts[bin_id],
+                'LD_MEAN': math.fsum(batch_sums[bin_id]) / counts[bin_id] if counts[bin_id] else np.nan,
+                'EVALUATED_PAIR_COUNT': evaluated[bin_id],
+                'PAIR_DISTANCE_MIN': distance_min[bin_id] if np.isfinite(distance_min[bin_id]) else np.nan,
+                'PAIR_DISTANCE_MAX': distance_max[bin_id] if np.isfinite(distance_max[bin_id]) else np.nan,
+                'POPULATION_PAIR_COUNT': populations[bin_id],
+                'SAMPLED': bool(_MULTISCALE_LD_EDGES[bin_id + 1] > full_distance
+                                and populations[bin_id] > max_pairs_per_bin),
+            })
+        if verbose:
+            print(f'{chr_id} complete: {perf_counter() - chr_start:.1f}s; '
+                  f'total elapsed {perf_counter() - start_time:.1f}s', flush=True)
+    result = pd.DataFrame(rows)
+    if cache_file is not None:
+        output = Path(cache_file)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        # Do not expose a partial CSV to a separate plotting process.
+        with tempfile.NamedTemporaryFile(dir=output.parent, prefix=output.name + '.',
+                                         suffix='.tmp', delete=False) as handle:
+            temporary_output = Path(handle.name)
+        try:
+            result.to_csv(temporary_output, index=False,
+                          compression='gzip' if str(output).endswith('.gz') else None)
+            os.replace(temporary_output, output)
+        finally:
+            temporary_output.unlink(missing_ok=True)
+        if verbose:
+            print(f'Saved {output}; total elapsed {perf_counter() - start_time:.1f}s', flush=True)
+    return result
+
+
+def summarize_multiscale_ld_overflow(ld_decay_df):
+    """QC 30–50 Mb and >50 Mb bins from a DataFrame or standalone CSV.
+
+    POPULATION_PAIR_COUNT is candidate count; EVALUATED_PAIR_COUNT is actual
+    attempted count; PAIR_COUNT is finite R2 count used for LD_MEAN.
+    Distance extrema refer to attempted pairs. Legacy CSVs lacking these
+    columns are marked not_recorded; no distances are inferred or fabricated.
+    """
+    data = _load_multiscale_ld_result(ld_decay_df)
+    result = data.loc[data['BIN_LABEL'].isin(['30–50 Mb', '>50 Mb'])].copy()
+    columns = ['CHROM', 'BIN_LABEL', 'POPULATION_PAIR_COUNT',
+               'EVALUATED_PAIR_COUNT', 'PAIR_COUNT', 'LD_MEAN',
+               'PAIR_DISTANCE_MIN', 'PAIR_DISTANCE_MAX']
+    result = result.reindex(columns=columns)
+    recorded = (np.isfinite(result['PAIR_DISTANCE_MIN'])
+                & np.isfinite(result['PAIR_DISTANCE_MAX']))
+    lower = np.where(result['BIN_LABEL'] == '>50 Mb', 50000000, 30000000)
+    upper = np.where(result['BIN_LABEL'] == '>50 Mb', np.inf, 50000000)
+    valid = ((result['PAIR_DISTANCE_MIN'] > lower)
+             & (result['PAIR_DISTANCE_MAX'] <= upper)
+             & (result['PAIR_DISTANCE_MIN'] <= result['PAIR_DISTANCE_MAX']))
+    result['DISTANCE_QC'] = np.where(
+        result['EVALUATED_PAIR_COUNT'] == 0, 'no_pairs',
+        np.where(~recorded, 'not_recorded', np.where(valid, 'pass', 'out_of_bin')))
+    return result.reset_index(drop=True)
+
+
+def summarize_ld_decay_thresholds(ld_decay_df, thresholds=(0.2, 0.1)):
+    """Read a DataFrame/CSV and return the first bin below each threshold; no interpolation."""
+    ld_decay_df = _load_multiscale_ld_result(ld_decay_df)
+    rows = []
+    for chr_id, curve in ld_decay_df.groupby('CHROM', sort=False, observed=True):
+        curve = curve.sort_values('BIN_LEFT')
+        valid = (curve['PAIR_COUNT'] > 0) & np.isfinite(curve['LD_MEAN'])
+        for threshold in thresholds:
+            threshold = float(threshold)
+            if not np.isfinite(threshold) or not 0 < threshold < 1:
+                raise ValueError('Thresholds must be finite and in (0, 1)')
+            below = curve.loc[valid & (curve['LD_MEAN'] < threshold)]
+            first = below.iloc[0] if not below.empty else None
+            rows.append({
+                'CHROM': chr_id, 'THRESHOLD': threshold,
+                'BIN_LEFT': first['BIN_LEFT'] if first is not None else np.nan,
+                'BIN_RIGHT': first['BIN_RIGHT'] if first is not None else np.nan,
+                'BIN_LABEL': first['BIN_LABEL'] if first is not None else None,
+                'STATUS': ('below_threshold' if first is not None else
+                           'not_reached' if valid.any() else 'no_finite_pairs'),
+            })
+    return pd.DataFrame(rows)
+
+
+def plot_multiscale_ld_decay(ld_decay_df, *, figsize=(12, 9), save_fig_path=None,
+                             ax=None):
+    """Plot bin means at equal spacing, labeled by distance-bin right edges.
+
+    Prepend (0, 1) for display only, as in plot_ld_decay; it is not an
+    observed pair and does not alter the data or threshold summaries.
+    The open-ended overflow bin retains the label '>50 MB'.
+    """
+    ld_decay_df = _load_multiscale_ld_result(ld_decay_df)
+    if ld_decay_df.empty or ld_decay_df.duplicated(['CHROM', 'BIN_LABEL']).any():
+        raise ValueError('Require nonempty, unique chromosome/bin rows')
+    if not ld_decay_df['BIN_LABEL'].isin(_MULTISCALE_LD_LABELS).all():
+        raise ValueError('Unknown multiscale distance bin')
+    with plt.rc_context():
+        set_plot_style()
+        if ax is None:
+            fig, ax = plt.subplots(figsize=figsize)
+        else:
+            fig = ax.figure
+        x = np.arange(len(_MULTISCALE_LD_LABELS) + 1)
+        tick_labels = ['0'] + [
+            '>50 MB' if np.isinf(right) else
+            f'{right / 1_000_000:g}MB' if right >= 1_000_000 else
+            f'{right / 1_000:g}K'
+            for right in _MULTISCALE_LD_EDGES[1:]
+        ]
+        for chr_id, curve in ld_decay_df.groupby('CHROM', sort=False, observed=True):
+            curve = curve.set_index('BIN_LABEL').reindex(_MULTISCALE_LD_LABELS)
+            values = curve['LD_MEAN'].where(curve['PAIR_COUNT'] > 0)
+            ax.plot(x, np.r_[1, values.to_numpy(dtype=float)], marker='o',
+                    markersize=3, label=chr_id)
+        ax.set_xticks(x)
+        ax.set_xticklabels(tick_labels, rotation=90, ha='center', fontsize=10)
+        ax.set_xlim(-0.5, len(x) - 0.5)
+        ax.set_ylim(0, 1.05)
+        ax.set_yticks(np.arange(0, 1.1, 0.1))
+        ax.set_xlabel('Distance')
+        ax.set_ylabel('Linkage Disequilibrium (r²)')
+        ax.grid(True)
+        ax.legend(loc='upper right')
+        fig.tight_layout()
+        if save_fig_path is not None:
+            fig.savefig(save_fig_path, facecolor='none', edgecolor='none', bbox_inches='tight')
+    return fig, ax
+
 
 def weighted_ld_jaccard_sparse(
     r2_df,
@@ -2150,10 +2838,11 @@ def calculate_ld_overlap_from_vcf(
         input_vcf_file,
         ld_window_size=ld_window_size,
         pool_num=pool_num,
+        min_r2=min_R2,
         site_info_df2=top_GEA_background_df
     )
 
-    # R2 <= 0.5 -> 0
+    # R2 <= min_R2 -> 0
     # R2 = 1 -> 1
     top_GEA_R2_df['R2_scale'] = (
         (top_GEA_R2_df['R2'] - min_R2)

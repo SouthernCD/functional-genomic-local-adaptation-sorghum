@@ -5,9 +5,195 @@ import os
 import gc
 import time
 import random
+import subprocess
+import tempfile
 from .utils import cmd_run, log_print, have_file, multiprocess_running
 from .feature import read_gff_file
 from interlap import InterLap
+
+
+def _window_maf_chunk(args):
+    """Read one indexed region; each worker owns its VCF handle."""
+    vcf_file, chrom, start, end, window_size, min_maf = args
+    first_bin = (start - 1) // window_size
+    n_bins = (end - 1) // window_size - first_bin + 1
+    sums = np.zeros(n_bins, dtype=float)
+    counts = np.zeros(n_bins, dtype=np.int64)
+    snp_counts = np.zeros(n_bins, dtype=np.int64)
+    rare_snp_counts = np.zeros(n_bins, dtype=np.int64)
+    skipped_multiallelic = skipped_missing = 0
+    vcf = VCF(vcf_file)
+    try:
+        for variant in vcf(f'{chrom}:{start}-{end}'):
+            # Indexed queries may also return variants overlapping the boundary.
+            # Assign by POS so spanning variants cannot be counted twice.
+            if not start <= variant.POS <= end:
+                continue
+            bin_index = (variant.POS - 1) // window_size - first_bin
+            is_snp = variant.is_snp
+            if is_snp:
+                snp_counts[bin_index] += 1
+            if len(variant.ALT) != 1:
+                skipped_multiallelic += 1
+                continue
+            # The final column is the phase flag; negative entries are missing
+            # allele copies or padding for mixed ploidy.
+            alleles = variant.genotype.array()[:, :-1]
+            called_count = np.count_nonzero(alleles >= 0)
+            if called_count == 0:
+                skipped_missing += 1
+                continue
+            if np.any(alleles > 1):
+                raise ValueError(f'Invalid biallelic genotype at {chrom}:{variant.POS}')
+            alt_frequency = np.count_nonzero(alleles == 1) / called_count
+            site_maf = min(alt_frequency, 1 - alt_frequency)
+            if site_maf < min_maf:
+                if is_snp:
+                    rare_snp_counts[bin_index] += 1
+                continue
+            sums[bin_index] += site_maf
+            counts[bin_index] += 1
+    finally:
+        vcf.close()
+    return (chrom, first_bin, sums, counts, snp_counts, rare_snp_counts,
+            skipped_multiallelic, skipped_missing)
+
+
+def calculate_window_maf(vcf_file, chromosome_lengths, window_size=250_000,
+                         n_jobs=8, chunk_size=5_000_000, min_maf=0.05):
+    """Compute common-site mean MAF and total/rare SNP counts in parallel.
+
+    All samples and biallelic variant types are included. Missing copies and
+    mixed-ploidy padding are excluded; fully missing/non-biallelic sites are
+    skipped for MAF. Only sites with MAF >= min_maf contribute to mean MAF
+    (default 0.05). Windows without qualifying sites retain MAF=NaN.
+    SNP_COUNT counts all SNP records, including multiallelic and missing sites.
+    RARE_SNP_COUNT counts biallelic SNPs with called alleles and MAF < min_maf.
+    Non-SNP variants contribute to mean MAF but neither SNP count.
+    chromosome_lengths maps chromosome IDs to their plotted lengths in bp.
+    Chunks align to window boundaries and return only sums/counts, never full
+    genotype matrices. n_jobs=1 runs serially. A VCF index is required.
+    Returns CHROM, BIN (zero-based), MAF, MAF_SITE_COUNT (qualifying sites),
+    SNP_COUNT and RARE_SNP_COUNT; exclusion counts
+    are stored in DataFrame.attrs. tqdm reports completed genomic chunks.
+
+    按基因组区间并行读取有索引的 VCF，计算各窗口二等位位点的平均 MAF。
+    MAF 使用全部样品，忽略缺失拷贝，跳过全缺失及非二等位位点；仅纳入
+    MAF >= min_maf（默认 0.05）的位点，无符合条件的位点时均值为 NaN。
+    SNP_COUNT 为全部 SNP 记录数；RARE_SNP_COUNT 为可计算 MAF 且
+    MAF < min_maf 的二等位 SNP 数。非 SNP 位点只参与 MAF，不计入 SNP 数。
+    n_jobs 控制进程数，chunk_size 控制区间大小（自动对齐绘图窗口）。
+    n_jobs=1 时串行执行；tqdm 显示已完成的区间数。
+    """
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+    from multiprocessing import get_context
+    from operator import index
+    from tqdm.auto import tqdm
+
+    window_size, n_jobs, chunk_size = map(index, (window_size, n_jobs, chunk_size))
+    if min(window_size, n_jobs, chunk_size) < 1:
+        raise ValueError('window_size, n_jobs and chunk_size must be positive integers.')
+    min_maf = float(min_maf)
+    if not np.isfinite(min_maf) or not 0 <= min_maf <= 0.5:
+        raise ValueError('min_maf must be between 0 and 0.5.')
+    lengths = {str(chrom): index(length) for chrom, length in chromosome_lengths.items()}
+    if not lengths or min(lengths.values()) < 1:
+        raise ValueError('chromosome_lengths must contain positive lengths.')
+    vcf_file = os.fspath(vcf_file)
+    vcf = VCF(vcf_file)
+    try:
+        # Fail before dispatch if the index is absent.
+        vcf.num_records
+        available_chromosomes = set(vcf.seqnames)
+    finally:
+        vcf.close()
+    if not available_chromosomes.intersection(lengths):
+        raise ValueError('VCF and plotted chromosomes have no matching chromosome IDs.')
+
+    aligned_chunk_size = max(1, chunk_size // window_size) * window_size
+    tasks = [(vcf_file, chrom, start, min(start + aligned_chunk_size - 1, length), window_size, min_maf)
+             for chrom, length in lengths.items() if chrom in available_chromosomes
+             for start in range(1, length + 1, aligned_chunk_size)]
+    sums = {chrom: np.zeros((length + window_size - 1) // window_size, dtype=float)
+            for chrom, length in lengths.items()}
+    counts = {chrom: np.zeros(len(values), dtype=np.int64) for chrom, values in sums.items()}
+    snp_counts = {chrom: np.zeros(len(values), dtype=np.int64) for chrom, values in sums.items()}
+    rare_snp_counts = {chrom: np.zeros(len(values), dtype=np.int64) for chrom, values in sums.items()}
+    skipped_multiallelic = skipped_missing = 0
+
+    def collect(result):
+        nonlocal skipped_multiallelic, skipped_missing
+        (chrom, first_bin, chunk_sums, chunk_counts, chunk_snps, chunk_rare_snps,
+         multiallelic, missing) = result
+        destination = slice(first_bin, first_bin + len(chunk_sums))
+        sums[chrom][destination] = chunk_sums
+        counts[chrom][destination] = chunk_counts
+        snp_counts[chrom][destination] = chunk_snps
+        rare_snp_counts[chrom][destination] = chunk_rare_snps
+        skipped_multiallelic += multiallelic
+        skipped_missing += missing
+
+    if n_jobs == 1:
+        for task in tqdm(tasks, desc='Calculating window MAF', unit='chunk'):
+            collect(_window_maf_chunk(task))
+    else:
+        # Spawn avoids inheriting active Jupyter threads or open htslib handles.
+        with ProcessPoolExecutor(max_workers=min(n_jobs, len(tasks)),
+                                 mp_context=get_context('spawn')) as executor:
+            futures = [executor.submit(_window_maf_chunk, task) for task in tasks]
+            for future in tqdm(as_completed(futures), total=len(futures),
+                               desc='Calculating window MAF', unit='chunk'):
+                collect(future.result())
+
+    frames = []
+    for chrom in lengths:
+        means = np.divide(sums[chrom], counts[chrom],
+                          out=np.full(len(sums[chrom]), np.nan), where=counts[chrom] > 0)
+        frames.append(pd.DataFrame({'CHROM': chrom, 'BIN': np.arange(len(means)),
+                                    'MAF': means, 'MAF_SITE_COUNT': counts[chrom],
+                                    'SNP_COUNT': snp_counts[chrom],
+                                    'RARE_SNP_COUNT': rare_snp_counts[chrom]}))
+    result = pd.concat(frames, ignore_index=True)
+    result.attrs['skipped_multiallelic'] = skipped_multiallelic
+    result.attrs['skipped_missing'] = skipped_missing
+    return result
+
+
+def extract_samples_vcf(input_vcf_file, sample_list, output_vcf_file):
+    """Extract samples with bcftools view -c 1 and index the output.
+
+    The input VCF is assumed to be indexed. Sample names are supplied as a
+    non-empty list and retain their requested order. Output is BGZF-compressed;
+    '.gz' is appended if needed. Returns the output path after its TBI index
+    has been created. bcftools must be available on PATH.
+
+    从已建立索引的 VCF 中提取指定样品，使用 -c 1 保留至少含一个非参考
+    等位基因的位点。输出为 BGZF 压缩 VCF，并建立 .tbi 索引。
+    """
+    input_vcf_file = os.fspath(input_vcf_file)
+    output_vcf_file = os.fspath(output_vcf_file)
+    if not output_vcf_file.endswith('.gz'):
+        output_vcf_file += '.gz'
+    if os.path.realpath(input_vcf_file) == os.path.realpath(output_vcf_file):
+        raise ValueError('Input and output VCF paths must be different.')
+    if isinstance(sample_list, str) or not sample_list:
+        raise ValueError('sample_list must be a non-empty list of sample names.')
+    if any(not isinstance(sample, str) or not sample or
+           any(char.isspace() for char in sample) for sample in sample_list):
+        raise ValueError('Sample names must be non-empty strings without whitespace.')
+
+    # A sample file avoids command-line length limits for large sample lists.
+    with tempfile.TemporaryDirectory(prefix='vcf_samples_') as temp_dir:
+        sample_file = os.path.join(temp_dir, 'samples.txt')
+        with open(sample_file, 'w', encoding='utf-8') as handle:
+            handle.write('\n'.join(sample_list) + '\n')
+        subprocess.run([
+            'bcftools', 'view', '-S', sample_file, '-c', '1',
+            '-Oz', '-o', output_vcf_file, input_vcf_file,
+        ], check=True)
+
+    subprocess.run(['bcftools', 'index', '-t', '-f', output_vcf_file], check=True)
+    return output_vcf_file
 
 
 def extract_cds_vcf(input_vcf_file, ref_gff_file, output_vcf_file, min_maf=0.01, max_het=0.1, max_miss=0.5):

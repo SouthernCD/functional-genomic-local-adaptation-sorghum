@@ -16,6 +16,9 @@ from .plot import set_plot_style
 
 
 CHROMOSOME_PERMUTATION_SCHEME = 'within_chromosome_roll_v1'
+GENE_PERMUTATION_SCHEME = 'gene_complete_case_within_chromosome_roll_v1'
+WINDOW_PERMUTATION_SCHEME = 'window_boolean_complete_case_within_chromosome_roll_v1'
+SITE_JACCARD_PERMUTATION_SCHEME = 'site_boolean_complete_case_within_chromosome_roll_v1'
 
 
 def filter_df_by_set_expr(df, expr):
@@ -368,8 +371,12 @@ def build_enrich_data_df(context_df, contrast_json, env_id_list, other_columns=[
     enrich_data_df = enrich_data_df.loc[foreground_mask | background_mask].copy(
     )
 
-    enrich_data_df = enrich_data_df[[
-        'ID', 'CHROM', 'POS', 'foreground'] + env_id_list + other_columns].copy()
+    if 'POS' in enrich_data_df.columns:
+        enrich_data_df = enrich_data_df[[
+            'ID', 'CHROM', 'POS', 'foreground'] + env_id_list + other_columns].copy()
+    elif 'START' in enrich_data_df.columns and 'END' in enrich_data_df.columns:
+        enrich_data_df = enrich_data_df[[
+            'ID', 'CHROM', 'START', 'END', 'foreground'] + env_id_list + other_columns].copy()
 
     return enrich_data_df
 
@@ -433,66 +440,229 @@ def get_jaccard(set1_mask, set2_mask):
 
 
 def gene_contrast_runner(contrast_id, contrast_json, context_df, env_id_list, output_dir, permutations=1000, top_percent=0.05):
+    """Test gene-set overlap using chromosome-local shifts on per-environment backgrounds.
 
+    Each background excludes missing scores, target labels, and coordinates, and
+    is sorted by CHROM/START. All filtering and sorting use private copies.
+    """
+    if not 0 < top_percent <= 1:
+        raise ValueError("top_percent must be in (0, 1]")
+    if permutations < 1:
+        raise ValueError("permutations must be positive")
+    env_id_list = list(env_id_list)
+    target = contrast_json["target"]
     results_json_file = os.path.join(
         output_dir, f"{contrast_id}.enrichment.json.gz")
 
-    if not have_file(results_json_file):
-        enrich_data_df = context_df.copy()
-        target = contrast_json["target"]
-        target_mask = enrich_data_df[target]
+    # Old global-roll results must not be reused under the new null model.
+    if have_file(results_json_file):
+        try:
+            with gzip.open(results_json_file, 'rt', encoding='utf-8') as f:
+                existing = json.load(f)['all']
+            if (existing.get('permutation_scheme') == GENE_PERMUTATION_SCHEME
+                    and existing.get('permutations') == permutations
+                    and existing.get('top_percent') == top_percent
+                    and existing.get('env_id_list') == env_id_list
+                    and existing.get('target') == target):
+                print(f"Enrichment results already exist for contrast {contrast_id}, skipping.")
+                return results_json_file
+        except (OSError, EOFError, UnicodeError, ValueError, KeyError, TypeError, AttributeError):
+            pass
 
-        results_json = {}
-        results_json['obs_values'] = {}
+    results_json = {
+        'obs_values': {}, 'perm_values': {}, 'stat': {}, 'background_info': {},
+        'permutation_scheme': GENE_PERMUTATION_SCHEME,
+        'permutations': permutations, 'top_percent': top_percent,
+        'env_id_list': env_id_list, 'target': target,
+    }
+    for env_id in env_id_list:
+        columns = list(dict.fromkeys(['CHROM', 'START', target, env_id]))
+        run_context_df = context_df[columns].dropna(subset=columns).copy()
+        run_context_df = run_context_df.sort_values(
+            ['CHROM', 'START'], kind='stable').reset_index(drop=True)
+        if run_context_df.empty:
+            raise ValueError(f"No complete genes for {env_id} ({contrast_id})")
+        if not set(run_context_df[target].unique()) <= {True, False}:
+            raise ValueError(f"Target column {target!r} must contain boolean labels")
+        scores = run_context_df[env_id].to_numpy(dtype=float)
+        if not np.all(np.isfinite(scores)):
+            raise ValueError(f"Non-finite gene scores for {env_id} ({contrast_id})")
+        target_mask = run_context_df[target].to_numpy(dtype=bool)
+        threshold = np.quantile(scores, 1 - top_percent)
+        env_top_mask = scores >= threshold
+        chrom_slices = chromosome_slices(run_context_df['CHROM'].to_numpy())
+        obs_value = get_jaccard(target_mask, env_top_mask)
+        perm_values = [
+            get_jaccard(permute_array_within_chromosomes(
+                target_mask, chrom_slices, seed=perm_id), env_top_mask)
+            for perm_id in range(permutations)
+        ]
+        results_json['obs_values'][env_id] = obs_value
+        results_json['perm_values'][env_id] = perm_values
+        results_json['stat'][env_id] = two_sided_empirical_pvalue(obs_value, perm_values)
+        results_json['background_info'][env_id] = {
+            'n_input': len(context_df), 'n_genes': len(run_context_df),
+            'n_excluded': len(context_df) - len(run_context_df),
+            'n_target': int(target_mask.sum()), 'n_top': int(env_top_mask.sum()),
+            'top_score_threshold': float(threshold),
+            'chromosome_counts': {
+                str(chrom): int(count) for chrom, count in
+                run_context_df.groupby('CHROM', observed=True).size().items()
+            },
+        }
+        print(f"{contrast_id} / {env_id}: {len(run_context_df)}/{len(context_df)} genes "
+              f"retained; {int(target_mask.sum())} target, {int(env_top_mask.sum())} top genes")
 
-        for env_id in env_id_list:
-            top_pvalue_threshold = np.quantile(
-                enrich_data_df[env_id].dropna(), 1 - top_percent)
-            env_top_mask = enrich_data_df[env_id] >= top_pvalue_threshold
-            enrich_data_df[f"{env_id}_top"] = env_top_mask
-            results_json['obs_values'][env_id] = get_jaccard(
-                target_mask, env_top_mask
-            )
+    with gzip.open(results_json_file, 'wt', encoding='utf-8') as f:
+        json.dump({'all': results_json}, f, indent=4)
+    return results_json_file
 
-        results_json['perm_values'] = {env_id: [] for env_id in env_id_list}
-        for perm_id in range(permutations):
-            permuted_target_mask = permute_array(
-                target_mask.to_numpy(), seed=perm_id)
-            for env_id in env_id_list:
-                env_top_mask = enrich_data_df[f"{env_id}_top"].to_numpy()
-                results_json['perm_values'][env_id].append(get_jaccard(
-                    permuted_target_mask, env_top_mask
-                ))
 
-        results_json['stat'] = {}
-        for env_id in env_id_list:
-            perm_array = np.array(results_json['perm_values'][env_id])
-            obs_value = results_json['obs_values'][env_id]
-            if perm_array.size == 0 or not np.isfinite(obs_value) or not np.all(np.isfinite(perm_array)):
-                raise ValueError(
-                    f"Cannot calculate empirical P for {env_id} ({contrast_id}): "
-                    "the observed statistic and a non-empty permutation distribution must be finite."
-                )
-            # Two-sided empirical P: double the smaller inclusive tail, with +1 correction.
-            n_perm = perm_array.size
-            p_lower = (np.sum(perm_array <= obs_value) + 1) / (n_perm + 1)
-            p_upper = (np.sum(perm_array >= obs_value) + 1) / (n_perm + 1)
-            pval = float(min(1.0, 2 * min(p_lower, p_upper)))
-            results_json['stat'][env_id] = {
-                "obs_value": obs_value,
-                "pval": pval,
-                "mean_perm": np.mean(perm_array),
-                "std_perm": np.std(perm_array),
-            }
+def win_contrast_runner(contrast_id, contrast_json, context_df, trait_id_list, output_dir, permutations=1000):
+    """Test overlap of a boolean window target with boolean window traits.
 
-        json_file = os.path.join(
-            output_dir, f"{contrast_id}.enrichment.json.gz")
-        with gzip.open(json_file, 'wt', encoding='utf-8') as f:
-            json.dump({'all': results_json}, f, indent=4)
-    else:
-        print(
-            f"Enrichment results already exist for contrast {contrast_id}, skipping.")
+    For each trait, exclude missing CHROM/START/END, target, or trait values,
+    then sort a private copy by CHROM/START/END. Keep the trait fixed and
+    independently circular-shift target labels within each chromosome.
+    No score threshold is applied; both sets use their True-valued windows.
+    Return the gzip JSON path, with results under 'all' as in gene_contrast_runner.
+    """
+    if permutations < 1:
+        raise ValueError("permutations must be positive")
+    trait_id_list = list(trait_id_list)
+    target = contrast_json["target"]
+    results_json_file = os.path.join(
+        output_dir, f"{contrast_id}.enrichment.json.gz")
 
+    if have_file(results_json_file):
+        try:
+            with gzip.open(results_json_file, 'rt', encoding='utf-8') as f:
+                existing = json.load(f)['all']
+            if (existing.get('permutation_scheme') == WINDOW_PERMUTATION_SCHEME
+                    and existing.get('permutations') == permutations
+                    and existing.get('trait_id_list') == trait_id_list
+                    and existing.get('target') == target):
+                print(f"Enrichment results already exist for contrast {contrast_id}, skipping.")
+                return results_json_file
+        except (OSError, EOFError, UnicodeError, ValueError, KeyError, TypeError, AttributeError):
+            pass
+
+    results_json = {
+        'obs_values': {}, 'perm_values': {}, 'stat': {}, 'background_info': {},
+        'permutation_scheme': WINDOW_PERMUTATION_SCHEME,
+        'permutations': permutations, 'trait_id_list': trait_id_list,
+        'target': target,
+    }
+    for trait_id in trait_id_list:
+        columns = list(dict.fromkeys(['CHROM', 'START', 'END', target, trait_id]))
+        run_context_df = context_df[columns].dropna(subset=columns).copy()
+        run_context_df = run_context_df.sort_values(
+            ['CHROM', 'START', 'END'], kind='stable').reset_index(drop=True)
+        if run_context_df.empty:
+            raise ValueError(f"No complete windows for {trait_id} ({contrast_id})")
+        for label in dict.fromkeys([target, trait_id]):
+            if not set(run_context_df[label].unique()) <= {True, False}:
+                raise ValueError(f"Window column {label!r} must contain boolean labels")
+        target_mask = run_context_df[target].to_numpy(dtype=bool)
+        trait_mask = run_context_df[trait_id].to_numpy(dtype=bool)
+        chrom_slices = chromosome_slices(run_context_df['CHROM'].to_numpy())
+        obs_value = get_jaccard(target_mask, trait_mask)
+        perm_values = [
+            get_jaccard(permute_array_within_chromosomes(
+                target_mask, chrom_slices, seed=perm_id), trait_mask)
+            for perm_id in range(permutations)
+        ]
+        results_json['obs_values'][trait_id] = obs_value
+        results_json['perm_values'][trait_id] = perm_values
+        results_json['stat'][trait_id] = two_sided_empirical_pvalue(obs_value, perm_values)
+        results_json['background_info'][trait_id] = {
+            'n_input': len(context_df), 'n_windows': len(run_context_df),
+            'n_excluded': len(context_df) - len(run_context_df),
+            'n_target': int(target_mask.sum()), 'n_trait': int(trait_mask.sum()),
+            'chromosome_counts': {
+                str(chrom): int(count) for chrom, count in
+                run_context_df.groupby('CHROM', observed=True).size().items()
+            },
+        }
+        print(f"{contrast_id} / {trait_id}: {len(run_context_df)}/{len(context_df)} windows "
+              f"retained; {int(target_mask.sum())} target, {int(trait_mask.sum())} trait windows")
+
+    with gzip.open(results_json_file, 'wt', encoding='utf-8') as f:
+        json.dump({'all': results_json}, f, indent=4)
+    return results_json_file
+
+
+def site_jaccard_contrast_runner(contrast_id, contrast_json, context_df, trait_id_list, output_dir, permutations=1000):
+    """Test overlap of a boolean site target with boolean site traits.
+
+    For each trait, exclude missing CHROM/POS, target, or trait values,
+    then sort a private copy by CHROM/POS. Keep the trait fixed and
+    independently circular-shift target labels within each chromosome.
+    No score threshold is applied; both sets use their True-valued sites.
+    Return the gzip JSON path, with results under 'all' as in gene_contrast_runner.
+    """
+    if permutations < 1:
+        raise ValueError("permutations must be positive")
+    trait_id_list = list(trait_id_list)
+    target = contrast_json["target"]
+    results_json_file = os.path.join(
+        output_dir, f"{contrast_id}.enrichment.json.gz")
+
+    if have_file(results_json_file):
+        try:
+            with gzip.open(results_json_file, 'rt', encoding='utf-8') as f:
+                existing = json.load(f)['all']
+            if (existing.get('permutation_scheme') == SITE_JACCARD_PERMUTATION_SCHEME
+                    and existing.get('permutations') == permutations
+                    and existing.get('trait_id_list') == trait_id_list
+                    and existing.get('target') == target):
+                print(f"Enrichment results already exist for contrast {contrast_id}, skipping.")
+                return results_json_file
+        except (OSError, EOFError, UnicodeError, ValueError, KeyError, TypeError, AttributeError):
+            pass
+
+    results_json = {
+        'obs_values': {}, 'perm_values': {}, 'stat': {}, 'background_info': {},
+        'permutation_scheme': SITE_JACCARD_PERMUTATION_SCHEME,
+        'permutations': permutations, 'trait_id_list': trait_id_list,
+        'target': target,
+    }
+    for trait_id in trait_id_list:
+        columns = list(dict.fromkeys(['CHROM', 'POS', target, trait_id]))
+        run_context_df = context_df[columns].dropna(subset=columns).copy()
+        run_context_df = run_context_df.sort_values(
+            ['CHROM', 'POS'], kind='stable').reset_index(drop=True)
+        if run_context_df.empty:
+            raise ValueError(f"No complete sites for {trait_id} ({contrast_id})")
+        for label in dict.fromkeys([target, trait_id]):
+            if not set(run_context_df[label].unique()) <= {True, False}:
+                raise ValueError(f"Site column {label!r} must contain boolean labels")
+        target_mask = run_context_df[target].to_numpy(dtype=bool)
+        trait_mask = run_context_df[trait_id].to_numpy(dtype=bool)
+        chrom_slices = chromosome_slices(run_context_df['CHROM'].to_numpy())
+        obs_value = get_jaccard(target_mask, trait_mask)
+        perm_values = [
+            get_jaccard(permute_array_within_chromosomes(
+                target_mask, chrom_slices, seed=perm_id), trait_mask)
+            for perm_id in range(permutations)
+        ]
+        results_json['obs_values'][trait_id] = obs_value
+        results_json['perm_values'][trait_id] = perm_values
+        results_json['stat'][trait_id] = two_sided_empirical_pvalue(obs_value, perm_values)
+        results_json['background_info'][trait_id] = {
+            'n_input': len(context_df), 'n_sites': len(run_context_df),
+            'n_excluded': len(context_df) - len(run_context_df),
+            'n_target': int(target_mask.sum()), 'n_trait': int(trait_mask.sum()),
+            'chromosome_counts': {
+                str(chrom): int(count) for chrom, count in
+                run_context_df.groupby('CHROM', observed=True).size().items()
+            },
+        }
+        print(f"{contrast_id} / {trait_id}: {len(run_context_df)}/{len(context_df)} sites "
+              f"retained; {int(target_mask.sum())} target, {int(trait_mask.sum())} trait sites")
+
+    with gzip.open(results_json_file, 'wt', encoding='utf-8') as f:
+        json.dump({'all': results_json}, f, indent=4)
     return results_json_file
 
 
