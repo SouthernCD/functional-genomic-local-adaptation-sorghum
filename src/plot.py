@@ -1,6 +1,15 @@
 import matplotlib.pyplot as plt
 
 def set_plot_style():
+    """Apply the shared Arial typography and line widths to future figures.
+
+    Returns
+    -------
+    None
+        Updates Matplotlib rcParams; creates no figure and saves no files.
+        Call explicitly during notebook initialization. Import has no styling
+        side effects; individual figures can adjust canvas size and layout.
+    """
     # Set figure size
     plt.rcParams['figure.figsize'] = (6, 6)
 

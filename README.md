@@ -8,7 +8,7 @@ This repository accompanies the manuscript **“Functional genomic map of local 
 
 | Notebook | Purpose | Main output |
 |---|---|---|
-| `00_define_and_build_genomic_contexts.ipynb` | Accession audits and site- and gene-level genomic contexts | Site and gene context tables |
+| `01_define_and_build_genomic_contexts.ipynb` | Accession audits and site- and gene-level genomic contexts | Site and gene context tables |
 | `01_environment_and_population_structure.ipynb` | Environmental variables and population structure | Figure 1 |
 | `02_environmental_gwas.ipynb` | envGWAS, diagnostics, MAGMA, and focal loci | Figure 2 |
 | `03_functional_enrichment.ipynb` | Site- and gene-level enrichment and sensitivity analyses | Figure 3 |
@@ -78,9 +78,15 @@ Open the notebooks locally and connect them to a kernel running where the data r
 
 To repeat a particular step, first move or remove only the output files identified by that step, then rerun the corresponding cell. Existing outputs should not be overwritten silently. Because a file's presence alone does not establish that it was generated with the current inputs and settings, each notebook should display the paths and key metadata of reused results before continuing.
 
-Long-running envGWAS, MAGMA, LD, and LDAK commands remain explicit manual steps. The notebooks show their inputs, expected outputs, and continuation point and do not submit scheduler jobs automatically. Their reusable outputs are also stored under `data/results`. Notebook 00 writes `site_contexts.h5` and `gene_contexts.h5` there for use by subsequent notebooks.
+Notebook 01 retains its upstream preparation cells as described below. The intended manual handoff for long-running envGWAS, MAGMA, LD, and LDAK commands still needs reconciliation with the existing later notebooks. The notebooks show their inputs, expected outputs, and continuation point and do not submit scheduler jobs automatically. Their reusable outputs are also stored under `data/results`. Notebook 01 writes `site_contexts.genome.maf0.05.h5`, `site_contexts.cds.maf0.01.h5`, and `gene_contexts.h5` there for subsequent notebooks.
 
 Reviewer-requested conditional-background, LD-aware, and MAF/LoF sensitivity analyses are recorded in notebook 03. The global-selection/derived-allele-frequency section remains a method placeholder and does not report unconfirmed results.
+
+## Genomic context construction
+
+Notebook 01 contains VCF merging, sample extraction, genome-wide and CDS quality control, and construction of site- and gene-level contexts. Computational cells reuse existing results when inputs and parameters are unchanged. Context tables use HDF key `df`; variant-statistics tables are organized by chromosome.
+
+The final summaries are saved as `data/results/contexts.{genome,cds,gene}.summary.csv.gz`. Each table reports the count and fraction of sites or genes in a context, with the corresponding dataset total as its denominator. Contexts may overlap.
 
 ## Citation and license
 

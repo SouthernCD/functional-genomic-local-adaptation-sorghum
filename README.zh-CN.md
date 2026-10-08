@@ -8,7 +8,7 @@
 
 | Notebook | 内容 | 主要输出 |
 |---|---|---|
-| `00_define_and_build_genomic_contexts.ipynb` | 样本审计及 site/gene genomic contexts | site 和 gene context 表格 |
+| `01_define_and_build_genomic_contexts.ipynb` | 样本审计及 site/gene genomic contexts | site 和 gene context 表格 |
 | `01_environment_and_population_structure.ipynb` | 环境变量和群体结构 | Figure 1 |
 | `02_environmental_gwas.ipynb` | envGWAS、诊断、MAGMA 和重点位点 | Figure 2 |
 | `03_functional_enrichment.ipynb` | 位点及基因富集和敏感性分析 | Figure 3 |
@@ -78,9 +78,15 @@ conda activate laenrich
 
 如果需要重新运行某一步，应先移动或删除该步骤明确列出的输出文件，再重新运行相应 cell。已有结果不应被默默覆盖。由于文件存在本身不能证明它由当前输入和参数产生，notebook 在继续之前应显示被重用结果的路径及关键 metadata。
 
-耗时的 envGWAS、MAGMA、LD 和 LDAK 命令仍作为明确的人工步骤保留。Notebook 会给出其输入、预期输出及继续位置，但不会自动提交 scheduler jobs。这些可重用输出同样保存在 `data/results` 下。Notebook 00 将 `site_contexts.h5` 和 `gene_contexts.h5` 写入该目录，供后续 notebooks 使用。
+Notebook 01 保留上游准备 cells，详见下方说明。耗时 envGWAS、MAGMA、LD 和 LDAK 的预期人工交接方式仍需与后续 notebook 的现有实现核对。Notebook 会给出其输入、预期输出及继续位置，但不会自动提交 scheduler jobs。这些可重用输出同样保存在 `data/results` 下。Notebook 01 将 `site_contexts.genome.maf0.05.h5`、`site_contexts.cds.maf0.01.h5` 及 `gene_contexts.h5` 写入该目录，供后续 notebooks 使用。
 
 Notebook 03 记录审稿人要求的 conditional-background、LD-aware 和 MAF/LoF sensitivity analyses。global-selection/derived-allele-frequency 部分仍仅为方法占位，不报告未经确认的结果。
+
+## 基因组 context 构建
+
+Notebook 01 包含 VCF 合并、样本提取、全基因组及 CDS 质控，以及位点和基因级 context 构建。输入和参数未变时，计算 cells 复用已有结果。Context 表采用 HDF key `df`；变异统计表按染色体组织。
+
+最终汇总保存为 `data/results/contexts.{genome,cds,gene}.summary.csv.gz`。每份表报告 context 中位点或基因的数量和比例，分母为对应数据集总数。Contexts 可以重叠。
 
 ## 引用与许可
 

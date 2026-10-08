@@ -464,7 +464,22 @@ def sf2gf(sf, chr_id):
 
 
 def read_gff_file(gff_file):
-    """读取普通或gzip压缩GFF，按feature类型和ID组织记录。"""
+    """
+    Read GFF/GFF.gz into ordered feature dictionaries.
+
+    Parameters
+    ----------
+    gff_file : str
+        GFF path parsed by BCBio; gzip is selected by the .gz suffix.
+
+    Returns
+    -------
+    collections.OrderedDict
+        Top-level feature type to ID to GenomeFeature, with recursive
+        subfeatures and qualifiers preserved. Coordinates are converted
+        from BCBio half-open locations to 1-based inclusive endpoints.
+        Missing IDs receive sequential NoID names. Reads only; no files saved.
+    """
 
     feature_dict = OrderedDict()
     no_id = 0

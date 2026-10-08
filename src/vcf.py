@@ -160,15 +160,25 @@ def calculate_window_maf(vcf_file, chromosome_lengths, window_size=250_000,
 
 
 def extract_samples_vcf(input_vcf_file, sample_list, output_vcf_file):
-    """Extract samples with bcftools view -c 1 and index the output.
+    """
+    Extract an explicitly ordered sample panel with bcftools.
 
-    The input VCF is assumed to be indexed. Sample names are supplied as a
-    non-empty list and retain their requested order. Output is BGZF-compressed;
-    '.gz' is appended if needed. Returns the output path after its TBI index
-    has been created. bcftools must be available on PATH.
+    Parameters
+    ----------
+    input_vcf_file : str
+        Indexed VCF; sample IDs must be present.
+    sample_list : list of str
+        Nonempty requested sample IDs in output order.
+    output_vcf_file : str
+        Output path; append .gz when absent. Must differ from the input.
 
-    从已建立索引的 VCF 中提取指定样品，使用 -c 1 保留至少含一个非参考
-    等位基因的位点。输出为 BGZF 压缩 VCF，并建立 .tbi 索引。
+    Returns
+    -------
+    str
+        BGZF VCF path, with a TBI index. Uses bcftools view -c 1 to retain
+        records with at least one ALT allele. Writes the selected VCF and
+        index; existing output paths can be overwritten, so the manual caller
+        owns reuse and baseline preservation. No scheduler submission.
     """
     input_vcf_file = os.fspath(input_vcf_file)
     output_vcf_file = os.fspath(output_vcf_file)
@@ -197,20 +207,31 @@ def extract_samples_vcf(input_vcf_file, sample_list, output_vcf_file):
 
 
 def merge_snp_indel_vcf(snp_vcf_file, indel_vcf_file, output_vcf_file):
-    """Combine SNP and indel VCFs, keeping one record per CHROM/POS.
+    """
+    Combine coordinate-sorted SNP and indel inputs, one record per position.
 
-    Inputs must be coordinate-sorted and have identical sample names/order.
-    At each position, keep the first SNP if present, otherwise the first
-    record. REF/ALT and genotypes are retained from that record, not merged.
-    No quality filtering or variant normalization is performed. Output is
-    BGZF-compressed; '.gz' is appended if needed. Returns the output path
-    after its TBI index has been created. bcftools must be available on PATH.
-    Temporary files are cleaned up automatically; records are streamed.
+    Workflow
+    --------
+    1. Check identical sample identities and ordering.
+    2. Concatenate and sort using bcftools.
+    3. Retain the first SNP per position, or first record if no SNP exists.
+    4. Index and publish the completed VCF, cleaning temporary files.
 
-    合并按坐标排序、样品及顺序一致的 SNP 和 indel VCF。同一染色体位置
-    仅保留一条记录，优先第一条 SNP，否则保留第一条记录；不融合等位
-    基因或基因型，不做质控及变异标准化。输出为 BGZF 压缩 VCF，自动
-    补充 .gz 后缀并建立 .tbi 索引，返回输出路径。
+    Parameters
+    ----------
+    snp_vcf_file, indel_vcf_file : str
+        Coordinate-sorted input VCFs with identical sample names and order.
+    output_vcf_file : str
+        Distinct BGZF destination; append .gz when absent.
+
+    Returns
+    -------
+    str
+        Output VCF path and associated TBI index. No variant normalization,
+        quality filtering, or genotype/allele merging is performed. REF, ALT,
+        genotypes and ANN are retained from the chosen record. Existing output
+        is replaced only after successful preparation; caller owns reuse.
+        External bcftools must be available. No scheduler submission.
     """
     snp_vcf_file = os.fspath(snp_vcf_file)
     indel_vcf_file = os.fspath(indel_vcf_file)
@@ -266,6 +287,31 @@ def merge_snp_indel_vcf(snp_vcf_file, indel_vcf_file, output_vcf_file):
 
 
 def extract_cds_vcf(input_vcf_file, ref_gff_file, output_vcf_file, min_maf=0.01, max_het=0.1, max_miss=0.5):
+    """
+    Extract longest-transcript CDS records using genotype-derived QC.
+
+    Parameters
+    ----------
+    input_vcf_file : str
+        Diploid VCF; the existing dosage formula assumes a biallelic record.
+    ref_gff_file : str
+        Gene GFF with transcript qualifier longest=1. CDS coordinates are
+        1-based inclusive after parsing; overlap is determined by record POS.
+    output_vcf_file : str
+        Destination VCF path, compressed using bgzip and indexed with tabix.
+    min_maf, max_het, max_miss : float
+        Inclusive lower MAF and upper heterozygosity/missingness bounds.
+        MAF and heterozygosity use called diploid genotypes; missingness uses
+        all samples. Defaults are 0.01, 0.1, and 0.5 respectively.
+
+    Returns
+    -------
+    str
+        Compressed VCF path with TBI index. Reads GFF/VCF and writes output;
+        this function has no cache policy. The manual caller preserves existing
+        outputs. Multiallelic and zero-called-genotype behavior remain legacy
+        assumptions for scientific review; this migration does not repair them.
+    """
     gff_dict = read_gff_file(ref_gff_file)['gene']
 
     cds_interlap = {}
@@ -573,7 +619,36 @@ def get_var_stat_num_parallel(genotype_matrix, chunk_size=1000, n_jobs=8):
 
 
 def build_var_stat_table(input_vcf_file, output_h5_file, *, n_jobs=8):
-    """Write per-chromosome variant statistics; n_jobs controls chunk workers."""
+    """
+    Write the established chromosome-keyed variant statistics format.
+
+    Workflow
+    --------
+    1. Create a missing TBI index with tabix.
+    2. Traverse chromosomes and load one chromosome genotype matrix.
+    3. Calculate genotype statistics and append its HDF table.
+
+    Parameters
+    ----------
+    input_vcf_file : str
+        VCF with genotype calls and variant IDs; existing diploid/biallelic
+        dosage assumptions apply. REF and first ALT are recorded. Negative or
+        partially missing alleles produce missing dosage.
+    output_h5_file : str
+        HDF path with one key per nonempty chromosome, preserving record order.
+        This legacy layout is retained for existing LD/GWAS consumers.
+    n_jobs : int
+        Number of chunk workers; default 8. One full chromosome genotype
+        matrix remains in memory regardless of worker count.
+
+    Returns
+    -------
+    str
+        Output path. Writes chromosome tables incrementally, not atomically;
+        an interrupted file may contain only some chromosomes. The manual caller
+        must inspect completeness and retain baseline results before reuse.
+        Displays stage progress and never submits scheduler jobs.
+    """
     if not have_file(input_vcf_file + ".tbi"):
         cmd_run(f'tabix -p vcf {input_vcf_file}')
 

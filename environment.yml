@@ -5,6 +5,15 @@ channels:
 dependencies:
   - python=3.11
   - bcftools
+  - htslib
+  - bcbio-gff
+  - biopython
+  - cyvcf2
+  - interlap
+  - pyfaidx
+  - python-igraph
+  - scikit-allel
+  - tqdm
   - bedtools
   - gemma=0.98.3
   - ipykernel
