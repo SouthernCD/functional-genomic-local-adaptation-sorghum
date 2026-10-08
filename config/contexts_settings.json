@@ -215,6 +215,16 @@
         "maf_min": 0.4,
         "maf_max": 0.5
       }
+    },
+    "flowering_time_genes": {
+      "id": "flowering_time_genes",
+      "dataset": "genome",
+      "description": "Predefined flowering-time genes"
+    },
+    "core_flowering_time_genes": {
+      "id": "core_flowering_time_genes",
+      "dataset": "genome",
+      "description": "Predefined core flowering-time genes"
     }
   },
   "cds": {
@@ -295,7 +305,17 @@
         "maf_min": 0.4,
         "maf_max": 0.5
       }
-    }
+    },
+    "flowering_time_genes": {
+      "id": "flowering_time_genes",
+      "dataset": "cds",
+      "description": "Predefined flowering-time genes"
+    },
+    "core_flowering_time_genes": {
+      "id": "core_flowering_time_genes",
+      "dataset": "cds",
+      "description": "Predefined core flowering-time genes"
+    }    
   },
   "gene": {
     "flowering_time_genes": {

@@ -5130,186 +5130,183 @@ def plot_overlap_by_quantile(
         return fig, axs
 
 
+def prune_vcf_by_ld(
+    input_vcf_file,
+    output_vcf_file,
+    *,
+    ld_window_size=15000,
+    r2_threshold=0.5,
+    random_seed=42,
+    min_maf=0.05,
+    max_het=0.1,
+    max_miss=0.5,
+    site_info_h5_file=None,
+    pool_num=1,
+    cache_max_tiles=64,
+    graph_chunk_size=256,
+    show_progress=True,
+    progress_interval=2.0,
+):
+    """Write a quality-filtered, randomly prioritized LD-pruned VCF.
+
+    Reuse ``<input_vcf_file>.var_stat.h5`` if it exists; otherwise build it
+    with vcf.build_var_stat_table. site_info_h5_file overrides that cache path.
+    The HDF must contain the per-chromosome tables produced by that function
+    and belong to this exact input VCF and sample set. Remove a stale cache
+    yourself after replacing the input. QC and random ordering are never
+    saved back into the cache, so it can be reused with different parameters.
+
+    Retain MAF >= min_maf, HETF <= max_het and missing fraction <= max_miss.
+    None disables an individual QC threshold. QC uses the cached MAF, HETF
+    and MISSF columns directly; sites without called genotypes are excluded.
+    Rebuild old caches generated before the get_var_stat MISSF correction.
+    Statistics inherit build_var_stat_table's diploid/biallelic assumptions.
+
+    Shuffle qualifying rows with numpy.default_rng(random_seed), then call
+    prune_sites_by_ld: same-chromosome distance < ld_window_size and
+    R2 > r2_threshold remove later-priority neighbors of retained sites.
+    LD genotype encoding and missing-call handling are inherited unchanged.
+    Output preserves the original header, samples, records and genomic order.
+    A repeated coordinate emits only the first VCF record matching the
+    retained row's REF and first ALT, consistent with coordinate-based pruning.
+
+    Input must be a coordinate-sorted BGZF VCF; bcftools must be on PATH.
+    A missing input index is created. Output is BGZF VCF with a TBI index;
+    '.gz' is appended when needed. Return the final output path (str).
+    pool_num controls both statistics and LD workers. pool_num=1 is serial;
+    larger values require a fork-based kernel.
+
+    从 VCF 的统计 HDF 缓存加载位点，先按 MAF、杂合率和缺失率过滤，
+    再按 random_seed 随机打乱优先级并进行贪婪 LD pruning。已有缓存
+    直接复用；缺失时自动构建，过滤和打乱不修改缓存。None 关闭对应
+    质量阈值。输出保留原始 VCF 的记录顺序和样本，压缩并建立索引，
+    返回输出路径。输入更新后需自行移除旧缓存；统计沿用二倍体、
+    二等位假设，LD 沿用原函数的基因型及缺失值处理。
+    """
+    import subprocess
+    import tempfile
+    from cyvcf2 import Writer
+    from .vcf import build_var_stat_table
+
+    input_vcf_file = os.path.abspath(os.fspath(input_vcf_file))
+    output_vcf_file = os.fspath(output_vcf_file)
+    if not output_vcf_file.endswith('.gz'):
+        output_vcf_file += '.gz'
+    output_vcf_file = os.path.abspath(output_vcf_file)
+    site_info_h5_file = os.path.abspath(os.fspath(
+        site_info_h5_file if site_info_h5_file is not None
+        else input_vcf_file + '.var_stat.h5'
+    ))
+    paths = [os.path.realpath(path) for path in
+             (input_vcf_file, output_vcf_file, site_info_h5_file)]
+    if len(set(paths)) != 3:
+        raise ValueError('Input VCF, output VCF and statistics HDF paths must differ.')
+    if not os.path.isfile(input_vcf_file):
+        raise FileNotFoundError(input_vcf_file)
+
+    random_seed = index(random_seed)
+    if random_seed < 0:
+        raise ValueError('random_seed must be a nonnegative integer.')
+    ld_window_size, pool_num, cache_max_tiles, graph_chunk_size = map(
+        index, (ld_window_size, pool_num, cache_max_tiles, graph_chunk_size)
+    )
+    if min(ld_window_size, pool_num, cache_max_tiles, graph_chunk_size) < 1:
+        raise ValueError('LD window, pool and cache/chunk sizes must be positive.')
+    r2_threshold = float(r2_threshold)
+    if not np.isfinite(r2_threshold) or not 0 <= r2_threshold <= 1:
+        raise ValueError('r2_threshold must be finite and in [0, 1].')
+    thresholds = {}
+    for name, value, maximum in (
+        ('min_maf', min_maf, 0.5), ('max_het', max_het, 1),
+        ('max_miss', max_miss, 1),
+    ):
+        if value is not None:
+            value = float(value)
+            if not np.isfinite(value) or not 0 <= value <= maximum:
+                raise ValueError(f'{name} must be None or in [0, {maximum}].')
+        thresholds[name] = value
+    if show_progress and (not np.isfinite(progress_interval) or progress_interval <= 0):
+        raise ValueError('progress_interval must be finite and positive.')
+    if pool_num > 1 and mp.get_start_method() != 'fork':
+        raise RuntimeError("Parallel LD requires 'fork'; use pool_num=1 in this kernel.")
+
+    if not any(os.path.isfile(input_vcf_file + suffix) for suffix in ('.tbi', '.csi')):
+        subprocess.run(['bcftools', 'index', '-t', input_vcf_file], check=True)
+    if not os.path.isfile(site_info_h5_file):
+        # Publish only a complete cache: a failed build must not be reused later.
+        with tempfile.TemporaryDirectory(
+            prefix='ld_stats_', dir=os.path.dirname(site_info_h5_file)
+        ) as temporary_dir:
+            temporary_h5 = os.path.join(temporary_dir, 'var_stat.h5')
+            build_var_stat_table(input_vcf_file, temporary_h5, n_jobs=pool_num)
+            os.replace(temporary_h5, site_info_h5_file)
+    elif show_progress:
+        print(f'Reusing variant statistics: {site_info_h5_file}', flush=True)
+
+    with pd.HDFStore(site_info_h5_file, mode='r') as store:
+        frames = [store[key] for key in sorted(store.keys())]
+    required = ['CHROM', 'POS', 'REF', 'ALT', 'MAF', 'HETF', 'MISSF',
+                'HOM_REF', 'HET', 'HOM_ALT']
+    site_df = (pd.concat(frames, ignore_index=True) if frames
+               else pd.DataFrame(columns=required))
+    missing = [column for column in required if column not in site_df]
+    if missing:
+        raise ValueError(f'Missing statistics HDF columns: {missing}')
+
+    called = site_df[['HOM_REF', 'HET', 'HOM_ALT']].sum(axis=1, skipna=False)
+    eligible = called.gt(0)
+    if thresholds['min_maf'] is not None:
+        eligible &= site_df['MAF'].ge(thresholds['min_maf'])
+    if thresholds['max_het'] is not None:
+        eligible &= site_df['HETF'].le(thresholds['max_het'])
+    if thresholds['max_miss'] is not None:
+        eligible &= site_df['MISSF'].le(thresholds['max_miss'])
+    qualified = site_df.loc[eligible].copy()
+    rng = np.random.default_rng(random_seed)
+    shuffled = qualified.iloc[rng.permutation(len(qualified))].reset_index(drop=True)
+    retained = prune_sites_by_ld(
+        shuffled, input_vcf_file, ld_window_size=ld_window_size,
+        r2_threshold=r2_threshold, pool_num=pool_num,
+        cache_max_tiles=cache_max_tiles, graph_chunk_size=graph_chunk_size,
+        show_progress=show_progress, progress_interval=progress_interval,
+    )
+    selected = {
+        (str(chrom), int(pos)): (ref, alt)
+        for chrom, pos, ref, alt in retained[['CHROM', 'POS', 'REF', 'ALT']].itertuples(
+            index=False, name=None
+        )
+    }
+    with tempfile.TemporaryDirectory(
+        prefix='ld_pruned_', dir=os.path.dirname(output_vcf_file)
+    ) as temporary_dir:
+        temporary_vcf = os.path.join(temporary_dir, 'pruned.vcf.gz')
+        reader = VCF(input_vcf_file)
+        try:
+            writer = Writer(temporary_vcf, reader, mode='wz')
+            try:
+                for record in reader:
+                    coordinate = (record.CHROM, record.POS)
+                    if (coordinate in selected and record.ALT
+                            and selected[coordinate] == (record.REF, record.ALT[0])):
+                        writer.write_record(record)
+                        del selected[coordinate]
+            finally:
+                writer.close()
+        finally:
+            reader.close()
+        if selected:
+            raise ValueError('Retained sites are absent from the VCF; check the statistics cache.')
+        subprocess.run(['bcftools', 'index', '-t', temporary_vcf], check=True)
+        os.replace(temporary_vcf, output_vcf_file)
+        os.replace(temporary_vcf + '.tbi', output_vcf_file + '.tbi')
+        # A previous CSI would otherwise take precedence over the new TBI.
+        if os.path.exists(output_vcf_file + '.csi'):
+            os.remove(output_vcf_file + '.csi')
+    if show_progress:
+        print(f'LD pruning: {len(site_df)} input, {len(qualified)} QC-passing, '
+              f'{len(retained)} retained sites -> {output_vcf_file}', flush=True)
+    return output_vcf_file
+
+
 if __name__ == "__main__":
     pass
-    # import os
-    # import pandas as pd
-    # import numpy as np
-
-    # site_info_df_h5 = "/lustre/home/dobby/Work/Project/functional-genomic-local-adaptation-sorghum/data/results/site_contexts.genome.maf0.05.h5"
-    # input_vcf_file = "/lustre/home/dobby/Work/Project/functional-genomic-local-adaptation-sorghum/data/results/landraces_qc_miss0.5_maf0.05_het0.05.vcf.gz"
-    # site_info_df = pd.read_hdf(site_info_df_h5, key='df')
-    # data_dir = "/lustre/home/dobby/Work/Project/functional-genomic-local-adaptation-sorghum/data"
-    # # genome site level envGWAS results
-    # env_id_list = ["bio18", "gsl", "al", "striga"]
-    # env_metadata_df = pd.read_csv(os.path.join(
-    #     data_dir, "source", "envir_metadata.csv"))
-    # for env_id in env_id_list:
-    #     env_df = pd.read_hdf(os.path.join(data_dir, "results", "gwas", env_id,
-    #                          f"{env_id}.gemma", f"{env_id}.gemma.gwas_df.h5"), key="df")
-    #     env_df = env_df[['ID', 'P_WALD']]
-    #     env_df = env_df.rename(columns={'P_WALD': env_id})
-    #     env_df[env_id] = -np.log10(env_df[env_id])
-    #     site_info_df = site_info_df.merge(env_df, on='ID', how='left')
-
-    # # calulate LD
-    # from src.ld import calculate_ld_matrix, calculate_ld_overlap_by_gea_bins_from_ld_df
-
-    # ld_window_size = 15000
-    # min_r2 = 0.5
-    # top_GEA_percent = 0.05
-    # pool_num = 40
-
-    # ld_df = calculate_ld_matrix(
-    #     site_info_df,
-    #     input_vcf_file,
-    #     ld_window_size=ld_window_size,
-    #     min_r2=min_r2,
-    #     pool_num=pool_num)
-
-    # env_id = "bio18"
-    # foreground_col = "gene_body"
-
-    # context_df = site_info_df.copy()
-    # context_df = context_df[['ID', 'CHROM',
-    #                          'POS', 'MAF', env_id, foreground_col]]
-    # context_df = context_df.rename(columns={foreground_col: "foreground"})
-
-    # ld_overlap = calculate_ld_overlap_by_gea_bins_from_ld_df(
-    #     context_df,
-    #     ld_df,
-    #     env_id,
-    #     bin_width=0.05,
-    #     min_R2=0.5,
-    #     source_col="INDEX_1",
-    #     target_col="INDEX_2",
-    #     r2_col="R2",
-    #     chunk_size=5_000_000,
-    # )
-
-    # env_random_context_df = context_df.copy()
-    # rng = np.random.default_rng(42)
-    # env_random_context_df[env_id] = rng.permutation(
-    #     env_random_context_df[env_id].to_numpy()
-    # )
-    # random_ld_overlap = calculate_ld_overlap_by_gea_bins_from_ld_df(
-    #     env_random_context_df,
-    #     ld_df,
-    #     env_id,
-    #     bin_width=0.05,
-    #     min_R2=0.5,
-    #     source_col="INDEX_1",
-    #     target_col="INDEX_2",
-    #     r2_col="R2",
-    #     chunk_size=5_000_000,
-    # )
-
-    # from src.enrich import build_enrich_data_df
-
-    # contrast_json = {
-    #     "id": "upstream_2kb_vs_genic",
-    #     "foreground": "upstream_2kb & genic_2kb",
-    #     "background": "genic_2kb",
-    #     "dataset": "genome",
-    #     "contrast_type": "enrichment",
-    #     "maf_stratify": [
-    #         "all",
-    #         "maf_0.05_0.1",
-    #         "maf_0.1_0.2",
-    #         "maf_0.2_0.3",
-    #         "maf_0.3_0.4",
-    #         "maf_0.4_0.5"
-    #     ]
-    # }
-
-    # context_df, stratify_cols = build_enrich_data_df(
-    #     site_info_df, contrast_json, [env_id])
-
-    # ld_overlap = calculate_ld_overlap_by_gea_bins_from_ld_df(
-    #     context_df,
-    #     ld_df,
-    #     env_id,
-    #     bin_width=0.05,
-    #     min_R2=0.5,
-    #     source_col="INDEX_1",
-    #     target_col="INDEX_2",
-    #     r2_col="R2",
-    #     chunk_size=5_000_000,
-    # )
-
-    # env_random_context_df = context_df.copy()
-    # rng = np.random.default_rng(42)
-    # env_random_context_df[env_id] = rng.permutation(
-    #     env_random_context_df[env_id].to_numpy()
-    # )
-    # random_ld_overlap = calculate_ld_overlap_by_gea_bins_from_ld_df(
-    #     env_random_context_df,
-    #     ld_df,
-    #     env_id,
-    #     bin_width=0.05,
-    #     min_R2=0.5,
-    #     source_col="INDEX_1",
-    #     target_col="INDEX_2",
-    #     r2_col="R2",
-    #     chunk_size=5_000_000,
-    # )
-
-    # from src.enrich import build_enrich_data_df
-
-    # contrast_json = {
-    #     "id": "upstream_2kb_vs_genic",
-    #     "foreground": "upstream_2kb & genic_2kb",
-    #     "background": "genic_2kb",
-    #     "dataset": "genome",
-    #     "contrast_type": "enrichment",
-    #     "maf_stratify": [
-    #         "all",
-    #         "maf_0.05_0.1",
-    #         "maf_0.1_0.2",
-    #         "maf_0.2_0.3",
-    #         "maf_0.3_0.4",
-    #         "maf_0.4_0.5"
-    #     ]
-    # }
-
-    # context_df, stratify_cols = build_enrich_data_df(
-    #     site_info_df, contrast_json, [env_id])
-
-    # ld_overlap = calculate_ld_overlap_by_gea_bins_from_ld_df(
-    #     context_df,
-    #     ld_df,
-    #     # env_id,
-    #     'striga',
-    #     bin_width=0.05,
-    #     min_R2=0.5,
-    #     source_col="INDEX_1",
-    #     target_col="INDEX_2",
-    #     r2_col="R2",
-    #     chunk_size=5_000_000,
-    # )
-
-    # env_random_context_df = context_df.copy()
-    # rng = np.random.default_rng(42)
-    # env_random_context_df[env_id] = rng.permutation(
-    #     env_random_context_df[env_id].to_numpy()
-    # )
-    # random_ld_overlap = calculate_ld_overlap_by_gea_bins_from_ld_df(
-    #     env_random_context_df,
-    #     ld_df,
-    #     env_id,
-    #     bin_width=0.05,
-    #     min_R2=0.5,
-    #     source_col="INDEX_1",
-    #     target_col="INDEX_2",
-    #     r2_col="R2",
-    #     chunk_size=5_000_000,
-    # )
-
-    # contrast_id, contrast, context_df, env_id_list, top_percent, ld_df, bin_width = 0.05, min_R2 = min_r2, random_seed = 42
-
-    # overlap_results = calculate_contrast_ld_overlap(
-    #     contrast_id, contrast, context_df, env_id_list, ld_df, bin_width=0.05, min_R2=0.5, random_seed=42)
-
-    # import pickle
-    # with open("/lustre/home/dobby/Work/Project/functional-genomic-local-adaptation-sorghum/data/results/enrichment/overlap_results.pkl", "wb") as f:
-    #     pickle.dump(overlap_results, f)

@@ -196,6 +196,75 @@ def extract_samples_vcf(input_vcf_file, sample_list, output_vcf_file):
     return output_vcf_file
 
 
+def merge_snp_indel_vcf(snp_vcf_file, indel_vcf_file, output_vcf_file):
+    """Combine SNP and indel VCFs, keeping one record per CHROM/POS.
+
+    Inputs must be coordinate-sorted and have identical sample names/order.
+    At each position, keep the first SNP if present, otherwise the first
+    record. REF/ALT and genotypes are retained from that record, not merged.
+    No quality filtering or variant normalization is performed. Output is
+    BGZF-compressed; '.gz' is appended if needed. Returns the output path
+    after its TBI index has been created. bcftools must be available on PATH.
+    Temporary files are cleaned up automatically; records are streamed.
+
+    合并按坐标排序、样品及顺序一致的 SNP 和 indel VCF。同一染色体位置
+    仅保留一条记录，优先第一条 SNP，否则保留第一条记录；不融合等位
+    基因或基因型，不做质控及变异标准化。输出为 BGZF 压缩 VCF，自动
+    补充 .gz 后缀并建立 .tbi 索引，返回输出路径。
+    """
+    snp_vcf_file = os.fspath(snp_vcf_file)
+    indel_vcf_file = os.fspath(indel_vcf_file)
+    output_vcf_file = os.fspath(output_vcf_file)
+    if not output_vcf_file.endswith('.gz'):
+        output_vcf_file += '.gz'
+    for input_vcf_file in (snp_vcf_file, indel_vcf_file):
+        if os.path.realpath(input_vcf_file) == os.path.realpath(output_vcf_file):
+            raise ValueError('Input and output VCF paths must be different.')
+    if get_sample_list_from_vcf(snp_vcf_file) != get_sample_list_from_vcf(indel_vcf_file):
+        raise ValueError('SNP and indel VCFs must have identical sample names/order.')
+
+    with tempfile.TemporaryDirectory(
+            prefix='vcf_merge_', dir=os.path.dirname(os.path.abspath(output_vcf_file))) as temp_dir:
+        concat_vcf_file = os.path.join(temp_dir, 'concat.vcf.gz')
+        sorted_vcf_file = os.path.join(temp_dir, 'sorted.vcf.gz')
+        merged_vcf_file = os.path.join(temp_dir, 'merged.vcf.gz')
+        subprocess.run([
+            'bcftools', 'concat', '-a', '-d', 'snps', '-Oz', '-o', concat_vcf_file,
+            snp_vcf_file, indel_vcf_file,
+        ], check=True)
+        subprocess.run([
+            'bcftools', 'sort', '-T', os.path.join(temp_dir, 'sort'),
+            '-Oz', '-o', sorted_vcf_file, concat_vcf_file,
+        ], check=True)
+
+        vcf_reader = VCF(sorted_vcf_file)
+        try:
+            vcf_writer = Writer(merged_vcf_file, vcf_reader, mode='wz')
+            try:
+                kept_record = None
+                for record in vcf_reader:
+                    if kept_record is None:
+                        kept_record = record
+                    elif (record.CHROM, record.POS) != (kept_record.CHROM, kept_record.POS):
+                        vcf_writer.write_record(kept_record)
+                        kept_record = record
+                    elif record.is_snp and not kept_record.is_snp:
+                        kept_record = record
+                if kept_record is not None:
+                    vcf_writer.write_record(kept_record)
+            finally:
+                vcf_writer.close()
+        finally:
+            vcf_reader.close()
+
+        subprocess.run(['bcftools', 'index', '-t', merged_vcf_file], check=True)
+        os.replace(merged_vcf_file, output_vcf_file)
+        os.replace(merged_vcf_file + '.tbi', output_vcf_file + '.tbi')
+        if os.path.exists(output_vcf_file + '.csi'):
+            os.remove(output_vcf_file + '.csi')
+    return output_vcf_file
+
+
 def extract_cds_vcf(input_vcf_file, ref_gff_file, output_vcf_file, min_maf=0.01, max_het=0.1, max_miss=0.5):
     gff_dict = read_gff_file(ref_gff_file)['gene']
 
@@ -246,35 +315,176 @@ def extract_cds_vcf(input_vcf_file, ref_gff_file, output_vcf_file, min_maf=0.01,
     return output_vcf_file + '.gz'
 
 
-def quality_control_vcf(input_vcf_file, output_vcf_file, min_maf=0.05, max_het=0.1, max_miss=0.5):
-    if output_vcf_file.endswith('.gz'):
-        output_vcf_file = output_vcf_file[:-3]
+def quality_control_vcf(input_vcf_file, output_vcf_file, min_maf=0.05,
+                        max_het=0.1, max_miss=0.5, *, genome_fasta_file,
+                        only_snps=False, biallelic=False, variant_types=None,
+                        n_jobs=40, window_size=10_000_000, show_progress=True):
+    """Filter a coordinate-sorted, diploid VCF using genotype-based QC.
 
-    vcf_reader = VCF(input_vcf_file)
-    vcf_writer = Writer(output_vcf_file, vcf_reader)
+    genome_fasta_file is required; chromosome names/reference must match the
+    VCF. Reuse read_fasta_by_faidx for lengths without loading the sequences.
+    min_maf, max_het and max_miss accept None to disable that filter. MAF and
+    heterozygosity exclude missing genotypes; missingness uses all samples.
+    Sites without called genotypes are excluded when MAF/heterozygosity is
+    requested. Thresholds are inclusive. Do not trust existing INFO/AC/AN.
 
-    for record in vcf_reader:
-        het_num = record.num_het
-        hom_ref_num = record.num_hom_ref
-        hom_alt_num = record.num_hom_alt
-        maf = (het_num + 2*hom_alt_num) / \
-            (2*(hom_ref_num + het_num + hom_alt_num))
-        maf = min(maf, 1-maf)
-        het_freq = het_num / (het_num + hom_ref_num + hom_alt_num)
-        het_exp_freq = 2 * maf * (1 - maf)
+    only_snps=True keeps SNP records; biallelic=True requires exactly one ALT.
+    Otherwise keep all variant types/allele counts unless variant_types is
+    supplied (comma-separated string or iterable of bcftools variant types).
+    only_snps=True cannot be combined with non-SNP variant_types. Multiallelic
+    MAF is the second most frequent allele, recomputed with +fill-tags; this
+    branch adds/replaces INFO/MAF and ignores partially missing genotypes.
 
-        if maf < min_maf or het_freq > max_het or record.call_rate < 1 - max_miss:
-            continue
+    n_jobs controls concurrent windows (default 40), window_size their length
+    (default 10 Mb). Workers run bcftools; multiallelic MAF uses a two-process
+    pipe per window. Assign by POS to avoid duplicating spanning indels, then
+    concatenate in VCF header order. Parallel input must be indexed BGZF VCF
+    or BCF; create a missing index. n_jobs=1 also supports uncompressed VCF.
+    Return the absolute BGZF VCF path with a TBI index. Append '.gz' when the
+    output path lacks it. Replace existing outputs only after QC succeeds;
+    empty results are allowed, and temporary files are cleaned up.
 
-        vcf_writer.write_record(record)
+    通用 VCF 质控：FASTA 必填，各阈值设为 None 可关闭对应过滤；可独立
+    控制 SNP、二等位限制及变异类型。默认按 10 Mb 窗口、40 个任务并行，
+    保留样品和记录顺序，返回压缩 VCF 路径并创建索引。
+    """
+    import shutil
+    from operator import index
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from .feature import read_fasta_by_faidx
 
-    vcf_writer.close()
-    vcf_reader.close()
+    input_vcf_file = os.path.abspath(os.fspath(input_vcf_file))
+    if not os.path.isfile(input_vcf_file):
+        raise FileNotFoundError(input_vcf_file)
+    genome_fasta_file = os.path.abspath(os.fspath(genome_fasta_file))
+    if not os.path.isfile(genome_fasta_file):
+        raise FileNotFoundError(genome_fasta_file)
+    n_jobs, window_size = map(index, (n_jobs, window_size))
+    if min(n_jobs, window_size) < 1:
+        raise ValueError('Worker counts and chunk/window sizes must be positive integers.')
+    fasta = read_fasta_by_faidx(genome_fasta_file)
+    chromosome_lengths = {chromosome: record.len() for chromosome, record in fasta.items()}
+    del fasta
+    reader = VCF(input_vcf_file)
+    try:
+        chromosomes = list(reader.seqnames)
+    finally:
+        reader.close()
+    if not chromosomes:
+        raise ValueError('No chromosomes found in the input VCF header.')
+    missing = [chromosome for chromosome in chromosomes if chromosome not in chromosome_lengths]
+    if missing:
+        raise ValueError(f'VCF chromosomes absent from the reference FASTA: {missing}')
+    if any(chromosome_lengths[chromosome] < 1 for chromosome in chromosomes):
+        raise ValueError('Reference chromosomes must have positive lengths.')
+    thresholds = []
+    for name, value, maximum in (('min_maf', min_maf, 0.5),
+                                 ('max_het', max_het, 1), ('max_miss', max_miss, 1)):
+        if value is not None:
+            value = float(value)
+            if not np.isfinite(value) or not 0 <= value <= maximum:
+                raise ValueError(f'{name} must be None or in [0, {maximum}].')
+        thresholds.append(value)
+    min_maf, max_het, max_miss = thresholds
+    if shutil.which('bcftools') is None:
+        raise FileNotFoundError('Executable not found: bcftools')
+    if isinstance(variant_types, str):
+        variant_types = variant_types.split(',')
+    if variant_types is not None:
+        variant_types = tuple(variant_types)
+        allowed = {'snps', 'indels', 'mnps', 'ref', 'bnd', 'other', 'overlap'}
+        if not variant_types or not set(variant_types) <= allowed:
+            raise ValueError(f'variant_types must contain bcftools types from {sorted(allowed)}.')
+    if only_snps:
+        if variant_types is not None and set(variant_types) != {'snps'}:
+            raise ValueError('only_snps=True conflicts with non-SNP variant_types.')
+        variant_types = ('snps',)
+    output_vcf_file = os.path.abspath(os.fspath(output_vcf_file))
+    if not output_vcf_file.endswith('.gz'):
+        output_vcf_file += '.gz'
+    if os.path.realpath(input_vcf_file) == os.path.realpath(output_vcf_file):
+        raise ValueError('Input VCF and output paths must differ.')
+    output_dir = os.path.dirname(output_vcf_file)
+    os.makedirs(output_dir, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix='vcf_qc_', dir=output_dir) as temp_dir:
+        filtered_vcf = os.path.join(temp_dir, 'filtered.vcf.gz')
+        command = ['bcftools', 'view', '-Oz', '--no-version']
+        if biallelic:
+            command += ['-m2', '-M2']
+        # Recompute from GT rather than trusting potentially stale INFO/AC/AN.
+        called = 'N_PASS(GT!="mis")'
+        het = 'N_PASS(GT="het" & GT!="mis")'
+        alt_frequency = f'({het}+2*N_PASS(GT="AA"))/(2*{called})'
+        conditions = [f'{called}>0'] if min_maf is not None or max_het is not None else []
+        if min_maf is not None:
+            if biallelic:
+                conditions += [f'{alt_frequency}>={min_maf}',
+                               f'{alt_frequency}<={1-min_maf}']
+            else:
+                conditions.append(f'INFO/MAF>={min_maf}')
+        if max_het is not None:
+            conditions.append(f'{het}/{called}<={max_het}')
+        if max_miss is not None:
+            conditions.append(f'(N_SAMPLES-{called})/N_SAMPLES<={max_miss}')
+        if conditions:
+            command += ['-i', ' && '.join(f'({condition})' for condition in conditions)]
+        if variant_types:
+            command += ['-v', ','.join(variant_types)]
 
-    cmd_run(f'bgzip {output_vcf_file}')
-    cmd_run(f'tabix -f -p vcf {output_vcf_file}.gz')
+        def filter_region(part_file, region=None):
+            region_options = ['-r', region, '--regions-overlap', '0'] if region else []
+            if biallelic or min_maf is None:
+                subprocess.run(command + region_options + [
+                    '-o', part_file, input_vcf_file], check=True)
+            else:
+                # Multiallelic MAF is the second most frequent allele. Recompute
+                # from GT; drop partially missing calls consistently with QC.
+                annotation = ['bcftools', '+fill-tags', '--no-version', '-Ou']
+                annotation += region_options + [input_vcf_file, '--', '-t', 'MAF', '-d']
+                with subprocess.Popen(annotation, stdout=subprocess.PIPE) as producer:
+                    try:
+                        subprocess.run(command + ['-o', part_file, '-'],
+                                       stdin=producer.stdout, check=True)
+                    finally:
+                        producer.stdout.close()
+                    if producer.wait() != 0:
+                        raise subprocess.CalledProcessError(producer.returncode, annotation)
+        if n_jobs == 1:
+            filter_region(filtered_vcf)
+        else:
+            if not any(os.path.isfile(input_vcf_file + suffix) for suffix in ('.tbi', '.csi')):
+                subprocess.run(['bcftools', 'index', input_vcf_file], check=True)
+            regions = [f'{chromosome}:{start}-{min(start + window_size - 1, chromosome_lengths[chromosome])}'
+                       for chromosome in chromosomes
+                       for start in range(1, chromosome_lengths[chromosome] + 1,
+                                          window_size)]
+            part_files = [os.path.join(temp_dir, f'part_{i:06d}.vcf.gz')
+                          for i in range(len(regions))]
 
-    return output_vcf_file + '.gz'
+            if show_progress:
+                print(f'VCF QC: filtering {len(regions)} windows with '
+                      f'{min(n_jobs, len(regions))} workers', flush=True)
+            with ThreadPoolExecutor(max_workers=min(n_jobs, len(regions))) as executor:
+                futures = {executor.submit(filter_region, path, region): region
+                           for region, path in zip(regions, part_files)}
+                for completed, future in enumerate(as_completed(futures), 1):
+                    future.result()
+                    if show_progress:
+                        print(f'VCF QC: {completed}/{len(regions)} windows '
+                              f'complete ({futures[future]})', flush=True)
+            file_list = os.path.join(temp_dir, 'parts.txt')
+            with open(file_list, 'w', encoding='utf-8') as handle:
+                handle.write('\n'.join(part_files) + '\n')
+            # Every part comes from the same header. Naive concatenation avoids
+            # decompressing/recompressing all records after parallel filtering.
+            subprocess.run(['bcftools', 'concat', '--naive', '-f', file_list,
+                            '-o', filtered_vcf], check=True)
+        subprocess.run(['bcftools', 'index', '-t', filtered_vcf], check=True)
+        os.replace(filtered_vcf, output_vcf_file)
+        os.replace(filtered_vcf + '.tbi', output_vcf_file + '.tbi')
+        if os.path.exists(output_vcf_file + '.csi'):
+            os.remove(output_vcf_file + '.csi')
+    return output_vcf_file
 
 
 def get_chr_id_list_from_vcf(vcf_file):
@@ -304,7 +514,7 @@ def get_sample_list_from_vcf(vcf_file):
 def get_var_stat(genotype_matrix):
     # Count the number of each element in the matrix
     counts = np.apply_along_axis(lambda x: np.histogram(
-        x, bins=[-1.5, -0.5, 0.5, 1.5, 2.5])[0], 1, genotype_matrix)
+        x, bins=[-np.inf, -0.5, 0.5, 1.5, 2.5])[0], 1, genotype_matrix)
 
     # Calculate the number of each type of element
     mis_num = counts[:, 0]
@@ -316,7 +526,7 @@ def get_var_stat(genotype_matrix):
     maf = np.minimum(maf, 1-maf)
 
     het = het_num/(hom_ref_num + het_num + hom_alt_num)
-    mis = mis_num/(hom_ref_num + het_num + hom_alt_num + hom_alt_num)
+    mis = mis_num/(mis_num + hom_ref_num + het_num + hom_alt_num)
 
     return mis, maf, het, hom_ref_num, het_num, hom_alt_num
 
@@ -362,7 +572,8 @@ def get_var_stat_num_parallel(genotype_matrix, chunk_size=1000, n_jobs=8):
     return np.array(mis), np.array(maf), np.array(het), np.array(hom_ref_num), np.array(het_num), np.array(hom_alt_num)
 
 
-def build_var_stat_table(input_vcf_file, output_h5_file):
+def build_var_stat_table(input_vcf_file, output_h5_file, *, n_jobs=8):
+    """Write per-chromosome variant statistics; n_jobs controls chunk workers."""
     if not have_file(input_vcf_file + ".tbi"):
         cmd_run(f'tabix -p vcf {input_vcf_file}')
 
@@ -390,16 +601,27 @@ def build_var_stat_table(input_vcf_file, output_h5_file):
                 'ALT': record.ALT[0],
             })
 
+            # cyvcf2 represents missing alleles as negative integers. Treat
+            # partially missing diploid calls as missing, too.
             variant_genotypes = [
-                gt[0] + gt[1] if gt[0] is not None and gt[1] is not None else -1 for gt in record.genotypes]
+                gt[0] + gt[1]
+                if gt[0] is not None and gt[1] is not None
+                and gt[0] >= 0 and gt[1] >= 0 else -1
+                for gt in record.genotypes
+            ]
             genotype_matrix.append(variant_genotypes)
 
+        # Filtered VCF headers may list chromosomes with no remaining records.
+        # Empty tables would coerce POS to float when LD concatenates them.
+        if not records:
+            vcf.close()
+            continue
         chr_var_df = pd.DataFrame(records)
 
         genotype_matrix = np.array(genotype_matrix)
 
         mis, maf, het, hom_ref_num, het_num, hom_alt_num = get_var_stat_num_parallel(
-            genotype_matrix, chunk_size=1000, n_jobs=8)
+            genotype_matrix, chunk_size=1000, n_jobs=n_jobs)
 
         chr_var_df['MISSF'] = mis
         chr_var_df['MAF'] = maf
@@ -468,32 +690,33 @@ def read_hdf_with_retry(file_path, key, max_retries=5):
 
 
 def get_genotype_matrix_from_vcf(vcf_file, chr_id=None, start=None, end=None):
-    """
-    Get genotype matrix from a VCF file.
+    """Read diploid allele-index sums; any missing allele gives dosage -1.
+
+    读取二倍体基因型剂量；任一等位基因缺失时记为 -1，并关闭 VCF 句柄。
     """
 
     vcf = VCF(vcf_file)
     genotype_matrix = []
 
-    if chr_id is not None and start is not None and end is not None:
-        for record in vcf(f'{chr_id}:{start}-{end}'):
-            variant_genotypes = [
-                gt[0] + gt[1] if gt[0] is not None and gt[1] is not None else -1 for gt in record.genotypes]
-            genotype_matrix.append(variant_genotypes)
-    elif chr_id is not None and start is None and end is None:
-        for record in vcf(f'{chr_id}'):
-            variant_genotypes = [
-                gt[0] + gt[1] if gt[0] is not None and gt[1] is not None else -1 for gt in record.genotypes]
-            genotype_matrix.append(variant_genotypes)
-    else:
-        for record in vcf:
-            variant_genotypes = [
-                gt[0] + gt[1] if gt[0] is not None and gt[1] is not None else -1 for gt in record.genotypes]
-            genotype_matrix.append(variant_genotypes)
-
-    genotype_matrix = np.array(genotype_matrix)
-
-    return genotype_matrix
+    try:
+        if chr_id is not None and start is not None and end is not None:
+            records = vcf(f'{chr_id}:{start}-{end}')
+        elif chr_id is not None and start is None and end is None:
+            records = vcf(f'{chr_id}')
+        else:
+            records = vcf
+        for record in records:
+            genotypes = record.genotypes
+            if any(len(gt) != 3 for gt in genotypes):
+                raise ValueError(f'Diploid genotypes required at {record.CHROM}:{record.POS}.')
+            genotype_matrix.append([
+                gt[0] + gt[1] if gt[0] is not None and gt[1] is not None
+                and gt[0] >= 0 and gt[1] >= 0 else -1 for gt in genotypes
+            ])
+        return (np.array(genotype_matrix) if genotype_matrix
+                else np.empty((0, len(vcf.samples)), dtype=int))
+    finally:
+        vcf.close()
 
 
 def get_genotype_matrix_from_vcf_by_pos_list(vcf_file, chr_id, pos_list, *, vcf_reader=None):

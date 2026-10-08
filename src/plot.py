@@ -8,11 +8,11 @@ def set_plot_style():
     plt.rcParams['pdf.fonttype'] = 42
     plt.rcParams['ps.fonttype'] = 42
     plt.rcParams['font.family'] = 'Arial'
-    plt.rcParams['font.size'] = 14
-    plt.rcParams['axes.titlesize'] = 16
-    plt.rcParams['axes.labelsize'] = 16
-    plt.rcParams['xtick.labelsize'] = 14
-    plt.rcParams['ytick.labelsize'] = 14
+    plt.rcParams['font.size'] = 12
+    plt.rcParams['axes.titlesize'] = 10
+    plt.rcParams['axes.labelsize'] = 10
+    plt.rcParams['xtick.labelsize'] = 9
+    plt.rcParams['ytick.labelsize'] = 9
     plt.rcParams['mathtext.it'] = 'Arial:italic'
     plt.rcParams['mathtext.rm'] = 'Arial'
     plt.rcParams['mathtext.tt'] = 'Arial'
