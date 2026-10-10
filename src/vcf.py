@@ -7,7 +7,7 @@ import time
 import random
 import subprocess
 import tempfile
-from .utils import cmd_run, log_print, have_file, multiprocess_running
+from .utils import cmd_run, log_print, multiprocess_running
 from .feature import read_gff_file
 from interlap import InterLap
 
@@ -21,6 +21,8 @@ def _window_maf_chunk(args):
     counts = np.zeros(n_bins, dtype=np.int64)
     snp_counts = np.zeros(n_bins, dtype=np.int64)
     rare_snp_counts = np.zeros(n_bins, dtype=np.int64)
+    variant_counts = np.zeros(n_bins, dtype=np.int64)
+    rare_variant_counts = np.zeros(n_bins, dtype=np.int64)
     skipped_multiallelic = skipped_missing = 0
     vcf = VCF(vcf_file)
     try:
@@ -30,6 +32,7 @@ def _window_maf_chunk(args):
             if not start <= variant.POS <= end:
                 continue
             bin_index = (variant.POS - 1) // window_size - first_bin
+            variant_counts[bin_index] += 1
             is_snp = variant.is_snp
             if is_snp:
                 snp_counts[bin_index] += 1
@@ -48,6 +51,7 @@ def _window_maf_chunk(args):
             alt_frequency = np.count_nonzero(alleles == 1) / called_count
             site_maf = min(alt_frequency, 1 - alt_frequency)
             if site_maf < min_maf:
+                rare_variant_counts[bin_index] += 1
                 if is_snp:
                     rare_snp_counts[bin_index] += 1
                 continue
@@ -56,12 +60,12 @@ def _window_maf_chunk(args):
     finally:
         vcf.close()
     return (chrom, first_bin, sums, counts, snp_counts, rare_snp_counts,
-            skipped_multiallelic, skipped_missing)
+            variant_counts, rare_variant_counts, skipped_multiallelic, skipped_missing)
 
 
 def calculate_window_maf(vcf_file, chromosome_lengths, window_size=250_000,
                          n_jobs=8, chunk_size=5_000_000, min_maf=0.05):
-    """Compute common-site mean MAF and total/rare SNP counts in parallel.
+    """Compute common-site mean MAF and total/rare variant counts in parallel.
 
     All samples and biallelic variant types are included. Missing copies and
     mixed-ploidy padding are excluded; fully missing/non-biallelic sites are
@@ -69,19 +73,22 @@ def calculate_window_maf(vcf_file, chromosome_lengths, window_size=250_000,
     (default 0.05). Windows without qualifying sites retain MAF=NaN.
     SNP_COUNT counts all SNP records, including multiallelic and missing sites.
     RARE_SNP_COUNT counts biallelic SNPs with called alleles and MAF < min_maf.
-    Non-SNP variants contribute to mean MAF but neither SNP count.
+    VARIANT_COUNT counts all records, including SNPs and indels.
+    RARE_VARIANT_COUNT counts callable biallelic records with MAF < min_maf.
+    Non-SNP variants contribute to mean MAF and variant counts, not SNP counts.
     chromosome_lengths maps chromosome IDs to their plotted lengths in bp.
     Chunks align to window boundaries and return only sums/counts, never full
     genotype matrices. n_jobs=1 runs serially. A VCF index is required.
     Returns CHROM, BIN (zero-based), MAF, MAF_SITE_COUNT (qualifying sites),
-    SNP_COUNT and RARE_SNP_COUNT; exclusion counts
+    SNP_COUNT, RARE_SNP_COUNT, VARIANT_COUNT and RARE_VARIANT_COUNT; exclusion counts
     are stored in DataFrame.attrs. tqdm reports completed genomic chunks.
 
     按基因组区间并行读取有索引的 VCF，计算各窗口二等位位点的平均 MAF。
     MAF 使用全部样品，忽略缺失拷贝，跳过全缺失及非二等位位点；仅纳入
     MAF >= min_maf（默认 0.05）的位点，无符合条件的位点时均值为 NaN。
     SNP_COUNT 为全部 SNP 记录数；RARE_SNP_COUNT 为可计算 MAF 且
-    MAF < min_maf 的二等位 SNP 数。非 SNP 位点只参与 MAF，不计入 SNP 数。
+    MAF < min_maf 的二等位 SNP 数。VARIANT_COUNT 包括 SNP 和 indel；
+    RARE_VARIANT_COUNT 为可计算 MAF 且 MAF < min_maf 的二等位变异数。
     n_jobs 控制进程数，chunk_size 控制区间大小（自动对齐绘图窗口）。
     n_jobs=1 时串行执行；tqdm 显示已完成的区间数。
     """
@@ -119,17 +126,21 @@ def calculate_window_maf(vcf_file, chromosome_lengths, window_size=250_000,
     counts = {chrom: np.zeros(len(values), dtype=np.int64) for chrom, values in sums.items()}
     snp_counts = {chrom: np.zeros(len(values), dtype=np.int64) for chrom, values in sums.items()}
     rare_snp_counts = {chrom: np.zeros(len(values), dtype=np.int64) for chrom, values in sums.items()}
+    variant_counts = {chrom: np.zeros(len(values), dtype=np.int64) for chrom, values in sums.items()}
+    rare_variant_counts = {chrom: np.zeros(len(values), dtype=np.int64) for chrom, values in sums.items()}
     skipped_multiallelic = skipped_missing = 0
 
     def collect(result):
         nonlocal skipped_multiallelic, skipped_missing
         (chrom, first_bin, chunk_sums, chunk_counts, chunk_snps, chunk_rare_snps,
-         multiallelic, missing) = result
+         chunk_variants, chunk_rare_variants, multiallelic, missing) = result
         destination = slice(first_bin, first_bin + len(chunk_sums))
         sums[chrom][destination] = chunk_sums
         counts[chrom][destination] = chunk_counts
         snp_counts[chrom][destination] = chunk_snps
         rare_snp_counts[chrom][destination] = chunk_rare_snps
+        variant_counts[chrom][destination] = chunk_variants
+        rare_variant_counts[chrom][destination] = chunk_rare_variants
         skipped_multiallelic += multiallelic
         skipped_missing += missing
 
@@ -152,7 +163,9 @@ def calculate_window_maf(vcf_file, chromosome_lengths, window_size=250_000,
         frames.append(pd.DataFrame({'CHROM': chrom, 'BIN': np.arange(len(means)),
                                     'MAF': means, 'MAF_SITE_COUNT': counts[chrom],
                                     'SNP_COUNT': snp_counts[chrom],
-                                    'RARE_SNP_COUNT': rare_snp_counts[chrom]}))
+                                    'RARE_SNP_COUNT': rare_snp_counts[chrom],
+                                    'VARIANT_COUNT': variant_counts[chrom],
+                                    'RARE_VARIANT_COUNT': rare_variant_counts[chrom]}))
     result = pd.concat(frames, ignore_index=True)
     result.attrs['skipped_multiallelic'] = skipped_multiallelic
     result.attrs['skipped_missing'] = skipped_missing
@@ -649,7 +662,7 @@ def build_var_stat_table(input_vcf_file, output_h5_file, *, n_jobs=8):
         must inspect completeness and retain baseline results before reuse.
         Displays stage progress and never submits scheduler jobs.
     """
-    if not have_file(input_vcf_file + ".tbi"):
+    if not os.path.exists(input_vcf_file + ".tbi"):
         cmd_run(f'tabix -p vcf {input_vcf_file}')
 
     chr_id_list = get_chr_id_list_from_vcf(input_vcf_file)

@@ -593,26 +593,36 @@ def get_genome_windows_contexts(ref_genome_fa, ref_gff_file, ref_repeat_gff_file
                                 bed_files=None, window_contexts=None,
                                 recombination_file=None, window_size=500,
                                 bed_zero_based=False):
-    """
-    Return whole-reference bins and interval-union coverage fractions.
+    """Build continuous annotation coverage on every reference-genome window.
 
-    Windows and GFF coordinates are 1-based inclusive. Reference lengths come
-    from the existing FASTA .fai; no index is built. The last bin uses its actual
-    length. BED defaults to the existing get_bed_contexts convention (inclusive);
-    set bed_zero_based=True for standard 0-based, half-open BED files.
-    window_contexts maps context names to CHROM/START/END DataFrames, e.g. pi
-    classes. Overlapping intervals count once; unannotated bases contribute zero.
-    REPEAT_FRACTION includes all repeat GFF similarity annotations, without
-    filtering repeat classes, as in get_genome_allele_statistics.
-    No variant-ID, coding-consequence, phyloP or MAF contexts are inferred.
+    Parameters
+    ----------
+    ref_genome_fa : str
+        Reference FASTA with an existing .fai; retain every reference sequence.
+    ref_gff_file : str
+        Gene GFF used for gene-body, flanking and gene-structure intervals.
+    ref_repeat_gff_file : str
+        Repeat GFF similarity features. TE uses DNA/LINE/LTR/SINE classes;
+        REPEAT_FRACTION uses all repeat similarity annotations.
+    bed_files : dict or None
+        Annotation names mapped to BED paths, such as ACR and UMR.
+    window_contexts : dict or None
+        Optional annotation names mapped to CHROM/START/END interval tables.
+    recombination_file : str or None
+        Optional map for recombination-class interval coverage.
+    window_size : int
+        Window size in bp. Coordinates are 1-based inclusive; the final
+        window uses its actual length, including bases without variants.
+    bed_zero_based : bool
+        False retains the project's inclusive BED convention. True converts
+        standard 0-based half-open BED intervals to 1-based inclusive intervals.
 
-    输出覆盖整条参考序列的 1-based 闭区间窗口及各注释的并集覆盖比例。
-    使用已有 FASTA .fai，末尾窗口按实际长度计算，重叠碱基只计一次。
-    BED 默认沿用 get_bed_contexts 的闭区间约定；标准 BED 请设置
-    bed_zero_based=True。window_contexts 接收按类别划分的区间表（如 π）。
-    REPEAT_FRACTION 纳入 repeat GFF 全部 similarity 注释，不筛选 repeat
-    类别，与 get_genome_allele_statistics 一致。
-    不推断位点 ID、编码后果、phyloP 或 MAF 类别，不执行 VCF 分析。
+    Returns
+    -------
+    pandas.DataFrame
+        CHROM, START, END and continuous interval-union coverage fractions.
+        Overlapping bases count once per annotation; absent coverage is zero.
+        Does not read genotypes, convert fractions to booleans or save files.
     """
     if not isinstance(window_size, int) or window_size <= 0:
         raise ValueError('window_size must be a positive integer in bp.')
@@ -1023,94 +1033,255 @@ def get_genome_allele_statistics(
     return results_df
 
 
+def _genome_window_statistics_chunk(task):
+    """Count all records and summarize diversity in aligned reference windows."""
+    chr_id, start, end, vcf_file, window_size, min_variant_count = task
+    starts = np.arange(start, end + 1, window_size, dtype=np.int64)
+    windows = np.column_stack([starts, np.minimum(starts + window_size - 1, end)])
+    positions, genotypes, snp_positions = [], [], []
+    reader = VCF(vcf_file)
+    try:
+        for variant in reader(f'{chr_id}:{start}-{end}'):
+            # Assign records by POS even when an indel overlaps a chunk boundary.
+            if not start <= variant.POS <= end:
+                continue
+            positions.append(variant.POS)
+            genotypes.append(variant.genotypes)
+            if variant.is_snp:
+                snp_positions.append(variant.POS)
+    finally:
+        reader.close()
+
+    variant_counts = np.zeros(len(windows), dtype=np.int64)
+    snp_counts = np.zeros(len(windows), dtype=np.int64)
+    pi = np.full(len(windows), np.nan)
+    tajima_d = np.full(len(windows), np.nan)
+    if positions:
+        positions = np.asarray(positions, dtype=np.int64)
+        alleles = allel.GenotypeArray(np.asarray(genotypes)[:, :, :2]).count_alleles()
+        pi, _, _, variant_counts = allel.windowed_diversity(
+            positions, alleles, windows=windows,
+        )
+        tajima_d, _, _ = allel.windowed_tajima_d(
+            positions, alleles, windows=windows, min_sites=3,
+        )
+        insufficient = variant_counts < min_variant_count
+        pi[insufficient] = np.nan
+        tajima_d[insufficient] = np.nan
+        snp_counts = np.bincount(
+            (np.asarray(snp_positions, dtype=np.int64) - start) // window_size,
+            minlength=len(windows),
+        )
+    return pd.DataFrame({
+        'CHROM': chr_id, 'START': windows[:, 0], 'END': windows[:, 1],
+        'VARIANT_COUNT': variant_counts, 'SNP_COUNT': snp_counts,
+        'PI': pi, 'TajimaD': tajima_d,
+    })
+
+
+def get_genome_window_statistics(ref_genome_fa, vcf_file, recombination_file,
+                                 window_size=500, min_variant_count=3,
+                                 chunk_size=1_000_000, n_jobs=1):
+    """Calculate diversity on every aligned reference-genome window.
+
+    Workflow
+    --------
+    1. Build all 1-based inclusive windows from the reference FASTA index.
+    2. Count SNP/all-variant records and calculate PI and TajimaD in VCF chunks.
+    3. Assign recombination rates to window midpoints using the source map.
+
+    Parameters
+    ----------
+    ref_genome_fa : str
+        Reference FASTA with an existing .fai; all reference sequences are kept.
+    vcf_file : str
+        Indexed, coordinate-sorted diploid VCF. Include SNPs and indels without
+        additional MAF, heterozygosity or allele-count filtering.
+    recombination_file : str
+        CSV with chr, bp and meanCmPerBp. Match midpoints backward within
+        999 bp and convert rates to cM/Mb.
+    window_size : int
+        Window length in bp; the terminal window uses its actual length.
+    min_variant_count : int
+        Minimum variant-record count for PI/TajimaD; default 3. TajimaD also
+        requires at least three segregating sites. Undefined values remain NaN.
+    chunk_size : int
+        VCF task size in bp, rounded down to a positive window-size multiple.
+    n_jobs : int
+        Worker count; 1 is serial, otherwise use spawn with independent readers.
+
+    Returns
+    -------
+    pandas.DataFrame
+        CHROM, START, END, VARIANT_COUNT (all records), SNP_COUNT (SNP records),
+        PI (per bp), TajimaD and meanCmPerMb. Empty windows have zero counts
+        and NaN diversity. Reference sequences absent from VCF are retained.
+        No LD, ThetaW or DAF is calculated; no files are saved.
+    """
+    from multiprocessing import get_context
+    from operator import index
+
+    window_size, min_variant_count, chunk_size, n_jobs = map(
+        index, (window_size, min_variant_count, chunk_size, n_jobs),
+    )
+    if min(window_size, min_variant_count, chunk_size, n_jobs) < 1:
+        raise ValueError('Window, count, chunk and worker settings must be positive.')
+    chunk_size = max(window_size, chunk_size // window_size * window_size)
+    reference = pd.read_csv(
+        f'{ref_genome_fa}.fai', sep='\t', header=None, usecols=[0, 1],
+        names=['CHROM', 'LENGTH'], dtype={'CHROM': str},
+    )
+    if reference['CHROM'].duplicated().any() or (reference['LENGTH'] <= 0).any():
+        raise ValueError('Reference sequences must have unique names and positive lengths.')
+    vcf_chromosomes = set(get_chr_id_list_from_vcf(vcf_file))
+    frames, tasks = [], []
+    for chr_id, length in reference.itertuples(index=False, name=None):
+        starts = np.arange(1, length + 1, window_size, dtype=np.int64)
+        frames.append(pd.DataFrame({
+            'CHROM': chr_id, 'START': starts,
+            'END': np.minimum(starts + window_size - 1, length),
+        }))
+        if chr_id in vcf_chromosomes:
+            tasks.extend(
+                (chr_id, start, min(start + chunk_size - 1, length),
+                 vcf_file, window_size, min_variant_count)
+                for start in range(1, length + 1, chunk_size)
+            )
+    windows = pd.concat(frames, ignore_index=True)
+    if n_jobs == 1:
+        statistics = [
+            _genome_window_statistics_chunk(task)
+            for task in tqdm(tasks, desc='Genome window statistics', unit='chunk')
+        ]
+    elif tasks:
+        with get_context('spawn').Pool(processes=min(n_jobs, len(tasks))) as pool:
+            statistics = list(tqdm(
+                pool.imap(_genome_window_statistics_chunk, tasks), total=len(tasks),
+                desc='Genome window statistics', unit='chunk',
+            ))
+    else:
+        statistics = []
+    if statistics:
+        windows = windows.merge(
+            pd.concat(statistics, ignore_index=True), on=['CHROM', 'START', 'END'],
+            how='left', validate='one_to_one',
+        )
+    else:
+        for column in ['VARIANT_COUNT', 'SNP_COUNT', 'PI', 'TajimaD']:
+            windows[column] = np.nan
+    for column in ['VARIANT_COUNT', 'SNP_COUNT']:
+        windows[column] = windows[column].fillna(0).astype(np.int64)
+
+    rates = pd.read_csv(recombination_file).dropna()
+    rates['meanCmPerMb'] = rates['meanCmPerBp'] * 1e6
+    windows['mid'] = ((windows['START'] + windows['END']) // 2).astype(np.int64)
+    windows = pd.merge_asof(
+        windows.sort_values(['mid', 'CHROM']), rates.sort_values(['bp', 'chr']),
+        left_on='mid', right_on='bp', left_by='CHROM', right_by='chr',
+        direction='backward', tolerance=999,
+    )
+    return windows.sort_values(['CHROM', 'START']).reset_index(drop=True)[
+        ['CHROM', 'START', 'END', 'VARIANT_COUNT', 'SNP_COUNT', 'PI', 'TajimaD', 'meanCmPerMb']
+    ]
+
+
 def build_genome_tracks(allele_stat_df, ld_blocks, vcf_file, gff_file,
                         ref_genome_fa, window_size=1_000_000, n_jobs=8,
                         chunk_size=5_000_000, rare_maf_threshold=0.05,
-                        daf_df=None, min_daf=0.05, ref_repeat_gff_file=None):
-    """Aggregate genome-landscape sources into a reusable window DataFrame.
+                        ref_repeat_gff_file=None, gene_flank_size=2000,
+                        bed_files=None, bed_zero_based=False):
+    """Build raw genome-landscape statistics on reference-length plotting windows.
 
-    Parameters / 数据源
-    ------------------
-    allele_stat_df : DataFrame
-        CHROM, START, END, PI, TajimaD, meanCmPerMb; generated by
-        get_genome_allele_statistics. Input windows are assigned by midpoint,
-        then each metric is averaged over valid values (no weighting).
-        π、Tajima's D 和重组率来自此表，按输入窗口中点分组后取均值。
-        The input REPEAT_FRACTION column is not used for plotting density;
-        plotting-bin repeat coverage is calculated directly from repeat GFF.
-        基础统计表的重复比例不用于绘图汇总，绘图窗口直接从重复注释计算覆盖率。
-    ld_blocks : DataFrame
-        PLINK blocks.det columns CHR, BP1, BP2, KB. Each block is assigned
-        once by midpoint; mean full block length is converted to bp.
-        LD 来自此表的完整 block 长度，按中点分组取均值，并换算为 bp。
-    vcf_file : path
-        Indexed VCF read by calculate_window_maf, using all samples.
-        SNP_COUNT includes all SNP records; RARE_SNP_COUNT counts callable
-        biallelic SNPs with MAF < rare_maf_threshold. Mean MAF includes only
-        callable biallelic sites (including non-SNPs) with MAF >= threshold.
-        SNP 总数、稀有 SNP 数及平均 MAF 来自此 VCF；缺失拷贝不计分母。
-    gff_file : path
-        read_gff_file gene bodies, inclusive START to END. Overlapping gene
-        bodies are merged; GENE_DENSITY is covered bp / actual window bp.
-        基因密度来自 GFF 中 gene body 的覆盖碱基比例，重叠碱基不重复计数。
-    ref_genome_fa : path
-        Reference genome FASTA (including .fa.gz). Chromosome lengths are
-        read automatically from <ref_genome_fa>.fai. The genome and index
-        must exist; missing files raise FileNotFoundError. No index is built.
-        输入参考基因组文件；自动查找同路径后缀 .fai，缺失时直接报错。
-    ref_repeat_gff_file : path or None
-        Repeat GFF similarity intervals. If supplied, REPEAT_FRACTION is
-        calculated directly as repeat-union covered bp / actual plotting-bin
-        bp, including bases without SNPs. Overlaps count once; no coverage is 0.
-        提供重复 GFF 时直接计算绘图大窗口的重复覆盖比例，包含没有 SNP 的碱基。
-    daf_df : DataFrame or None
-        Optional cached calculate_DAF output with CHROM, POS, REF, ALT, DAF.
-        Mean DAF uses callable biallelic SNPs with DAF >= min_daf, grouped
-        by POS. The caller handles cache loading/computation, not this function.
-        DAF 来自调用者读取的缓存表；仅二等位 SNP 且 DAF >= min_daf 纳入窗口均值。
-    min_daf : float in [0, 1]
-        DAF inclusion cutoff, default 0.05. Empty DAF bins remain NaN.
-    window_size, chunk_size : positive int
-        Plotting bin size and parallel VCF task size, respectively, in bp.
-    n_jobs : positive int
-        VCF worker count; 1 is serial. No remote tasks are started on import.
-    rare_maf_threshold : float in [0, 0.5]
-        Shared cutoff for rare SNP counts and mean-MAF inclusion (default .05).
+    Workflow
+    --------
+    1. Assign 500 bp statistics and full PLINK blocks to bins by midpoint.
+    2. Calculate annotation-union coverage directly in the plotting bins.
+    3. Count variants and calculate MAF in one VCF pass; return the table.
 
-    Returns / 输出
-    --------------
-    DataFrame
-        One row per 1-based inclusive window, naturally sorted by chromosome.
-        CHROM/START/END identify windows; BIN is zero-based within chromosome.
-        Tracks: GENE_DENSITY, SNP_COUNT, RARE_SNP_COUNT, MAF, PI, TajimaD,
-        LD_BLOCK_BP and meanCmPerMb, plus DAF when daf_df is supplied and
-        REPEAT_FRACTION when ref_repeat_gff_file is supplied.
-        GENE_BODY_BP, MAF_SITE_COUNT and optional DAF_SITE_COUNT retain
-        coverage and qualifying-site counts for inspection. Empty counts are
-        zero; undefined means are NaN. Only chromosomes in allele_stat_df
-        are plotted. Sources/settings/exclusions are recorded in df.attrs.
-        不写文件、不绘图；返回窗口表供 plot_genome_tracks 或其他分析复用。
+    Parameters
+    ----------
+    allele_stat_df : pandas.DataFrame
+        CHROM, START, END, PI, TajimaD, meanCmPerMb. Average valid input
+        window values by midpoint without weighting or standardization.
+    ld_blocks : pandas.DataFrame
+        PLINK CHR, BP1, BP2, KB; average full block lengths by midpoint,
+        converting KB to bp. Bins without blocks have NaN lengths.
+    vcf_file : str
+        Indexed VCF. Count all variant records, including SNPs and indels.
+        Rare counts include callable biallelic sites below rare_maf_threshold;
+        mean MAF includes callable biallelic sites at or above that threshold.
+    gff_file : str
+        Gene GFF with 1-based inclusive gene intervals.
+    ref_genome_fa : str
+        Reference FASTA with an existing .fai. Retain every plotting bin on
+        chromosomes in allele_stat_df; clip terminal bins to reference length.
+    window_size, chunk_size : int
+        Plotting window width (default 1 Mb) and parallel VCF task width in bp.
+    n_jobs : int
+        VCF worker count; 1 is serial.
+    rare_maf_threshold : float
+        Shared rare-variant and mean-MAF cutoff; default 0.05.
+    ref_repeat_gff_file : str or None
+        Repeat similarity GFF. REPEAT_FRACTION includes all similarity
+        intervals; TE_FRACTION includes DNA, LINE, LTR and SINE classes.
+    gene_flank_size : int
+        Extend gene bodies on both sides, default 2000 bp. Clip intervals
+        to chromosome bounds before calculating GENIC_FRACTION.
+    bed_files : dict or None
+        Annotation names mapped to BED paths, such as ACR and UMR. No flanks
+        are added. Each annotation produces a <name>_FRACTION column.
+    bed_zero_based : bool
+        False retains the project's 1-based inclusive BED convention. True
+        converts standard 0-based half-open intervals to 1-based inclusive.
+
+    Returns
+    -------
+    pandas.DataFrame
+        CHROM/START/END/BIN and raw tracks in plotting order. Annotation
+        fractions are union-covered bp / actual bin bp; overlaps count once
+        and absent coverage is zero. GENIC_BP and MAF_SITE_COUNT provide
+        supporting counts. Undefined means are NaN. No files are written;
+        sources and settings are recorded in attrs. No z-score is applied.
     """
-    from pathlib import Path
     import re
     from .vcf import calculate_window_maf
 
-    if not np.isfinite(min_daf) or not 0 <= min_daf <= 1:
-        raise ValueError('min_daf must be between 0 and 1.')
     track_window_size = window_size
     maf_n_jobs, maf_chunk_size = n_jobs, chunk_size
     ld_unfiltered_vcf_file, ref_gff_file = vcf_file, gff_file
-    genome_path = Path(ref_genome_fa)
-    fai_path = Path(str(genome_path) + '.fai')
-    if not genome_path.is_file():
+    genome_path = os.fspath(ref_genome_fa)
+    fai_path = os.fspath(str(genome_path) + '.fai')
+    if not os.path.isfile(genome_path):
         raise FileNotFoundError(f'Reference genome not found: {genome_path}')
-    if not fai_path.is_file():
+    if not os.path.isfile(fai_path):
         raise FileNotFoundError(
             f'Reference genome index not found: {fai_path}')
     if not isinstance(track_window_size, int) or track_window_size <= 0:
         raise ValueError('track_window_size must be a positive integer in bp.')
-    repeat_intervals_by_chr = (_read_repeat_intervals(ref_repeat_gff_file)
-                               if ref_repeat_gff_file is not None else {})
+    if not isinstance(gene_flank_size, int) or gene_flank_size < 0:
+        raise ValueError('gene_flank_size must be a nonnegative integer in bp.')
+    annotation_intervals = {}
+    if ref_repeat_gff_file is not None:
+        annotation_intervals = {'TE_FRACTION': {}, 'REPEAT_FRACTION': {}}
+        for repeat in read_gff_file(ref_repeat_gff_file)['similarity'].values():
+            interval = (repeat.start, repeat.end)
+            annotation_intervals['REPEAT_FRACTION'].setdefault(
+                repeat.chr_id, []).append(interval)
+            if repeat.qualifiers['class'][0].split('/')[0] in ['DNA', 'LINE', 'LTR', 'SINE']:
+                annotation_intervals['TE_FRACTION'].setdefault(
+                    repeat.chr_id, []).append(interval)
+    for name, bed_file in (bed_files or {}).items():
+        bed_df = pd.read_csv(bed_file, sep='\t', header=None, comment='#',
+                             usecols=[0, 1, 2], names=['CHROM', 'START', 'END'],
+                             dtype={'CHROM': str})
+        if bed_zero_based:
+            bed_df = bed_df[bed_df['END'] > bed_df['START']].copy()
+            bed_df['START'] += 1
+        if (bed_df['END'] < bed_df['START']).any():
+            raise ValueError(f'Invalid interval in {name}.')
+        annotation_intervals[f'{name}_FRACTION'] = {
+            chrom: list(frame[['START', 'END']].itertuples(index=False, name=None))
+            for chrom, frame in bed_df.groupby('CHROM', sort=False)}
     metric_columns = ['PI', 'TajimaD', 'meanCmPerMb']
     required_columns = ['CHROM', 'START', 'END'] + metric_columns
     missing_columns = sorted(set(required_columns) -
@@ -1231,40 +1402,25 @@ def build_genome_tracks(allele_stat_df, ld_blocks, vcf_file, gff_file,
             (np.arange(n_bins) + 1) * track_window_size, chrom_length)
         chrom_track['BIN'] = np.arange(n_bins)
         track_frames.append(chrom_track.reset_index(drop=True))
-    # Gene density = fraction of window bases covered by the union of gene bodies.
-    # START/END are inclusive: merge overlapping intervals before counting coverage.
+    # Count each annotated base once; divide by actual terminal-window length.
     for chrom, chrom_track in zip(chromosome_order, track_frames):
-        gene_intervals = track_gene_df.loc[
-            track_gene_df['CHROM'] == chrom, ['START', 'END']
-        ].sort_values(['START', 'END']).to_numpy(dtype=np.int64)
-        merged_gene_bodies = []
-        for start, end in gene_intervals:
-            if merged_gene_bodies and start <= merged_gene_bodies[-1][1] + 1:
-                merged_gene_bodies[-1][1] = max(
-                    merged_gene_bodies[-1][1], int(end))
-            else:
-                merged_gene_bodies.append([int(start), int(end)])
-        covered_bp = np.zeros(len(chrom_track), dtype=np.int64)
-        bin_starts = chrom_track['START'].to_numpy(dtype=np.int64)
-        bin_ends = chrom_track['END'].to_numpy(dtype=np.int64)
-        for start, end in merged_gene_bodies:
-            first_bin = (start - 1) // track_window_size
-            last_bin = (end - 1) // track_window_size
-            bin_slice = slice(first_bin, last_bin + 1)
-            covered_bp[bin_slice] += np.maximum(
-                0, np.minimum(end, bin_ends[bin_slice])
-                - np.maximum(start, bin_starts[bin_slice]) + 1,
-            )
-        window_bp = bin_ends - bin_starts + 1
-        chrom_track['GENE_BODY_BP'] = covered_bp
-        chrom_track['GENE_DENSITY'] = covered_bp / window_bp
-        if ref_repeat_gff_file is not None:
-            chrom_track['REPEAT_FRACTION'] = _window_repeat_fraction(
-                chrom_track[['START', 'END']].to_numpy(),
-                repeat_intervals_by_chr.get(chrom, []),
-            )
+        windows = chrom_track[['START', 'END']].to_numpy(dtype=np.int64)
+        chrom_length = chromosome_lengths[chrom]
+        genic_intervals = [
+            (max(1, int(start) - gene_flank_size),
+             min(chrom_length, int(end) + gene_flank_size))
+            for start, end in track_gene_df.loc[
+                track_gene_df['CHROM'] == chrom, ['START', 'END']
+            ].itertuples(index=False, name=None)]
+        chrom_track['GENIC_FRACTION'] = _window_repeat_fraction(windows, genic_intervals)
+        chrom_track['GENIC_BP'] = np.rint(
+            chrom_track['GENIC_FRACTION'] * (windows[:, 1] - windows[:, 0] + 1)
+        ).astype(np.int64)
+        for column, intervals_by_chr in annotation_intervals.items():
+            chrom_track[column] = _window_repeat_fraction(
+                windows, intervals_by_chr.get(chrom, []))
 
-    # Compute SNP counts and common-site mean MAF together in one parallel VCF pass.
+    # Compute Variant counts and common-site mean MAF together in one parallel VCF pass.
     track_maf_df = calculate_window_maf(
         ld_unfiltered_vcf_file, chromosome_lengths, window_size=track_window_size,
         n_jobs=maf_n_jobs, chunk_size=maf_chunk_size, min_maf=rare_maf_threshold,
@@ -1273,69 +1429,20 @@ def build_genome_tracks(allele_stat_df, ld_blocks, vcf_file, gff_file,
     for chrom, chrom_track in zip(chromosome_order, track_frames):
         chrom_maf = track_maf_lookup.xs(
             chrom, level='CHROM').reindex(range(len(chrom_track)))
-        for column in ['MAF_SITE_COUNT', 'MAF', 'SNP_COUNT', 'RARE_SNP_COUNT']:
+        for column in ['MAF_SITE_COUNT', 'MAF', 'VARIANT_COUNT', 'RARE_VARIANT_COUNT']:
             chrom_track[column] = chrom_maf[column].to_numpy()
     print(f"MAF excluded {track_maf_df.attrs['skipped_multiallelic']:,} non-biallelic and "
           f"{track_maf_df.attrs['skipped_missing']:,} fully missing sites on plotted chromosomes.")
-    if daf_df is not None:
-        daf_columns = ['CHROM', 'POS', 'REF', 'ALT', 'DAF']
-        missing_daf_columns = sorted(set(daf_columns) - set(daf_df.columns))
-        if missing_daf_columns:
-            raise ValueError(f'Missing daf_df columns: {missing_daf_columns}')
-        window_daf = daf_df[daf_columns].copy()
-        window_daf['CHROM'] = window_daf['CHROM'].astype(str)
-        window_daf[['POS', 'DAF']] = window_daf[['POS', 'DAF']].apply(
-            pd.to_numeric, errors='raise')
-        if (not np.isfinite(window_daf['POS']).all()
-                or (window_daf['POS'] < 1).any()
-                or (window_daf['POS'] % 1 != 0).any()):
-            raise ValueError(
-                'DAF positions must be positive integer coordinates.')
-        valid_daf = window_daf['DAF'].dropna()
-        if (not np.isfinite(valid_daf).all()
-                or (valid_daf < 0).any() or (valid_daf > 1).any()):
-            raise ValueError('DAF values must be NaN or between 0 and 1.')
-        # One row per biallelic SNP; exclude indels and multiallelic ALT strings.
-        is_snp = (window_daf['REF'].astype(str).str.fullmatch('[ACGTacgt]')
-                  & window_daf['ALT'].astype(str).str.fullmatch('[ACGTacgt]'))
-        window_daf = window_daf.loc[
-            is_snp & (window_daf['DAF'] >= min_daf)
-            & window_daf['CHROM'].isin(chromosome_order)
-        ].copy()
-        for chrom, positions in window_daf.groupby('CHROM')['POS']:
-            if (positions > chromosome_lengths[chrom]).any():
-                raise ValueError(
-                    f'DAF SNP coordinates exceed reference length for {chrom}.')
-        window_daf['BIN'] = ((window_daf['POS'] - 1) //
-                             track_window_size).astype(int)
-        daf_windows = window_daf.groupby(['CHROM', 'BIN'])[
-            'DAF'].agg(['mean', 'count'])
-        for chrom, chrom_track in zip(chromosome_order, track_frames):
-            if chrom in daf_windows.index.get_level_values('CHROM'):
-                chrom_daf = daf_windows.xs(chrom, level='CHROM').reindex(
-                    range(len(chrom_track)))
-                chrom_track['DAF'] = chrom_daf['mean'].to_numpy()
-                chrom_track['DAF_SITE_COUNT'] = chrom_daf['count'].fillna(
-                    0).to_numpy(dtype=np.int64)
-            else:
-                chrom_track['DAF'] = np.nan
-                chrom_track['DAF_SITE_COUNT'] = 0
-
     track_df = pd.concat(track_frames, ignore_index=True)
-    output_columns = ['CHROM', 'START', 'END', 'BIN', 'GENE_DENSITY',
-                      'SNP_COUNT', 'RARE_SNP_COUNT', 'MAF']
-    if ref_repeat_gff_file is not None:
-        output_columns.insert(output_columns.index(
-            'GENE_DENSITY') + 1, 'REPEAT_FRACTION')
-    if daf_df is not None:
-        output_columns.append('DAF')
-    output_columns += ['PI', 'TajimaD', 'LD_BLOCK_BP', 'meanCmPerMb',
-                       'GENE_BODY_BP', 'MAF_SITE_COUNT']
-    if daf_df is not None:
-        output_columns.append('DAF_SITE_COUNT')
+    output_columns = ['CHROM', 'START', 'END', 'BIN', 'GENIC_FRACTION']
+    output_columns += list(annotation_intervals)
+    output_columns += ['VARIANT_COUNT', 'RARE_VARIANT_COUNT', 'MAF', 'PI',
+                       'TajimaD', 'meanCmPerMb', 'LD_BLOCK_BP',
+                       'GENIC_BP', 'MAF_SITE_COUNT']
     track_df = track_df[output_columns]
     track_df.attrs.update(
-        window_size=track_window_size, rare_maf_threshold=rare_maf_threshold, min_daf=min_daf,
+        window_size=track_window_size, rare_maf_threshold=rare_maf_threshold,
+        gene_flank_size=gene_flank_size, bed_zero_based=bed_zero_based,
         chromosome_lengths=chromosome_lengths,
         sources={'allele_statistics': 'allele_stat_df', 'ld_blocks': 'ld_blocks',
                  'vcf': str(vcf_file), 'gff': str(gff_file),
@@ -1344,8 +1451,7 @@ def build_genome_tracks(allele_stat_df, ld_blocks, vcf_file, gff_file,
     )
     if ref_repeat_gff_file is not None:
         track_df.attrs['sources']['repeat_gff'] = str(ref_repeat_gff_file)
-    if daf_df is not None:
-        track_df.attrs['sources']['daf'] = 'daf_df (cached calculate_DAF output)'
+    track_df.attrs['sources']['beds'] = dict(bed_files or {})
     return track_df
 
 
@@ -1354,50 +1460,43 @@ def plot_genome_tracks(track_df, output_prefix=None, title=None,
                        ld_ylim=(1e2, 1e6), figsize=None,
                        colors=('#879DD0', '#A0CFDF'), hspace=0.18, h_pad=0.14,
                        label_fontsize=10, tick_fontsize=9, title_fontsize=12):
-    """Plot prepared window tracks and optionally export PDF/PNG/CSV.gz.
+    """Plot raw prepared genome tracks and optionally export PDF/PNG/CSV.gz.
 
-    Input / 输入
-    ------------
-    track_df : DataFrame
-        build_genome_tracks output, or its exported CSV reloaded with pandas.
-        Required: CHROM/START/END and all eight data columns listed below.
-        If DAF is present, add a mean-DAF track immediately below MAF.
-        Optional REPEAT_FRACTION adds Repeat density below Gene density.
-        This function does not read VCF/GFF or recompute window statistics.
-        接收已有窗口表，不再读取 VCF/GFF，因此调整样式无需重新计算。
+    Parameters
+    ----------
+    track_df : pandas.DataFrame
+        build_genome_tracks output or its CSV reloaded with pandas. Requires
+        CHROM, START, END, GENIC_FRACTION, VARIANT_COUNT, RARE_VARIANT_COUNT,
+        MAF, PI, TajimaD, meanCmPerMb and LD_BLOCK_BP. Optional TE_FRACTION,
+        REPEAT_FRACTION, ACR_FRACTION and UMR_FRACTION follow Genic in that order.
+        Values remain in their original units; no statistics are recomputed.
+    output_prefix : str or None
+        If supplied, export PDF, 300 dpi PNG and the actual plotted CSV.gz.
     title : str or None
-        Optional figure title; None (default) leaves the figure untitled.
-    output_prefix : path or None
-        Filename prefix without an extension. If supplied, write .pdf, .png
-        (300 dpi) and .csv.gz. CSV rows are windows; columns follow track order,
-        including RARE_SNP_COUNT for the pale subset of total SNPs.
+        Optional title; None leaves the figure untitled.
     rare_maf_threshold : float or None
-        Legend cutoff; defaults to track_df.attrs, then 0.05 for reloaded CSV.
-        Must describe the cutoff used to prepare the data; no refiltering here.
-    maf_ymin, ld_ylim : float or None, pair of floats
-        MAF lower limit (default .05; None enables autoscaling); DAF starts
-        at .05. LD uses log10 with default range 100–1,000,000 bp. Other
-        nonnegative tracks start at zero; upper bounds remain automatic.
-        TajimaD retains automatic limits. Fixed lower bounds appear as ticks.
-    figsize, colors, hspace, h_pad
-        Figure size, alternating chromosome colors, fractional vertical gap
-        and vertical padding in inches. Default height is 1.55 inches per track.
-        Seven tracks plus optional DAF and repeat density; no ThetaW track.
+        Legend cutoff, defaulting to table attrs or 0.05 for reloaded CSV.
+    maf_ymin : float or None
+        MAF lower limit, default 0.05; None enables autoscaling.
+    ld_ylim : tuple
+        Positive lower/upper bounds in bp. Only LD-block length uses a log axis;
+        its exported values remain bp. Default bounds are 100 and 1,000,000.
+    figsize : tuple or None
+        Figure size; default height is 1.55 inches per track.
+    colors : tuple
+        Two alternating chromosome colors; rare counts use pale variants.
+    hspace, h_pad : float
+        Fractional vertical gap and vertical padding in inches.
     label_fontsize, tick_fontsize, title_fontsize : float
-        Independent font sizes; short horizontal y labels are aligned at the left.
-        独立控制标签、刻度和标题字号；短标签横向排列，避免轨道之间重叠。
+        Independent font sizes for labels, ticks and title.
 
-    Returns / 输出
-    --------------
+    Returns
+    -------
     dict
-        figure: Matplotlib Figure; axes: one Axes per track; plot_data: exported table
-        with CHROM/START/END and GENE_DENSITY, SNP_COUNT, RARE_SNP_COUNT, MAF,
-        optional REPEAT_FRACTION/DAF, PI, TajimaD, LD_BLOCK_BP, meanCmPerMb;
-        files: paths keyed by pdf/png/csv,
-        or an empty dict when output_prefix is None. Call plt.show() yourself.
-        返回图对象、坐标轴、绘图数据及输出路径；函数不自动 show。
+        figure, axes, plot_data (columns in track order) and exported files.
+        Density tracks are covered-base fractions; the pale rare-variant
+        area is a subset of the total. No VCF/GFF reads or automatic show.
     """
-    from pathlib import Path
     import matplotlib.pyplot as plt
     from matplotlib.colors import to_rgb
     from matplotlib.patches import Patch
@@ -1419,28 +1518,28 @@ def plot_genome_tracks(track_df, output_prefix=None, title=None,
     if len(colors) != 2:
         raise ValueError(
             'colors must contain two alternating chromosome colors.')
-    track_specs = [
-        ('GENE_DENSITY', 'Gene density'),
-        ('SNP_COUNT', 'SNP count'),
+    track_specs = [('GENIC_FRACTION', 'Genic density')]
+    for column, label in [
+        ('TE_FRACTION', 'TE density'),
+        ('REPEAT_FRACTION', 'Repeat density'),
+        ('ACR_FRACTION', 'ACR density'),
+        ('UMR_FRACTION', 'UMR density'),
+    ]:
+        if column in track_df.columns:
+            track_specs.append((column, label))
+    track_specs += [
+        ('VARIANT_COUNT', 'Variant count'),
         ('MAF', f'Mean MAF\n(≥ {rare_maf_threshold:g})'),
         ('PI', r'Mean $\pi$'),
         ('TajimaD', "Tajima's D"),
-        ('LD_BLOCK_BP', 'LD block\nlength (bp)'),
         ('meanCmPerMb', 'Recombination\n(cM/Mb)'),
+        ('LD_BLOCK_BP', 'LD block\nlength (bp)'),
     ]
-    if 'REPEAT_FRACTION' in track_df.columns:
-        track_specs.insert(1, ('REPEAT_FRACTION', 'Repeat density'))
-    if 'DAF' in track_df.columns:
-        min_daf = track_df.attrs.get('min_daf', 0.05)
-        maf_index = next(i for i, (metric, _) in enumerate(
-            track_specs) if metric == 'MAF')
-        track_specs.insert(
-            maf_index + 1, ('DAF', f'Mean DAF\n(≥ {min_daf:g})'))
     plot_data_columns = ['CHROM', 'START', 'END']
     for metric, _ in track_specs:
         plot_data_columns.append(metric)
-        if metric == 'SNP_COUNT':
-            plot_data_columns.append('RARE_SNP_COUNT')
+        if metric == 'VARIANT_COUNT':
+            plot_data_columns.append('RARE_VARIANT_COUNT')
     missing_columns = sorted(set(plot_data_columns) - set(track_df.columns))
     if missing_columns:
         raise ValueError(f'Missing track_df columns: {missing_columns}')
@@ -1456,11 +1555,11 @@ def plot_genome_tracks(track_df, output_prefix=None, title=None,
             or (track_plot_df['END'] < track_plot_df['START']).any()):
         raise ValueError(
             'Window coordinates must be finite, 1-based and ordered.')
-    rare = track_plot_df['RARE_SNP_COUNT']
-    total = track_plot_df['SNP_COUNT']
+    rare = track_plot_df['RARE_VARIANT_COUNT']
+    total = track_plot_df['VARIANT_COUNT']
     if (rare < 0).any() or (total < 0).any() or (rare > total).any():
         raise ValueError(
-            'Rare SNP counts must lie between zero and total SNP counts.')
+            'Rare Variant counts must lie between zero and total Variant counts.')
     track_plot_df.replace([np.inf, -np.inf], np.nan, inplace=True)
 
     chromosome_order = track_plot_df['CHROM'].drop_duplicates().tolist()
@@ -1506,8 +1605,6 @@ def plot_genome_tracks(track_df, output_prefix=None, title=None,
         for ax, (metric, ylabel) in zip(track_axes, track_specs):
             if metric == 'LD_BLOCK_BP':
                 fill_baseline = ld_ymin
-            elif metric == 'DAF':
-                fill_baseline = 0.05
             elif metric == 'MAF' and maf_ymin is not None:
                 fill_baseline = maf_ymin
             else:
@@ -1524,8 +1621,8 @@ def plot_genome_tracks(track_df, output_prefix=None, title=None,
                                 alpha=1.0, linewidth=0)
                 ax.step(x, y, where='post',
                         color=track_colors[chrom_index % 2], linewidth=0.8)
-                if metric == 'SNP_COUNT':
-                    rare_values = chrom_track['RARE_SNP_COUNT'].to_numpy(
+                if metric == 'VARIANT_COUNT':
+                    rare_values = chrom_track['RARE_VARIANT_COUNT'].to_numpy(
                         dtype=float)
                     rare_y = np.r_[rare_values, rare_values[-1]]
                     rare_color = rare_track_colors[chrom_index % 2]
@@ -1544,12 +1641,12 @@ def plot_genome_tracks(track_df, output_prefix=None, title=None,
                 ax.yaxis.set_major_locator(LogLocator(base=10, numticks=5))
             else:
                 ax.yaxis.set_major_locator(MaxNLocator(nbins=3, min_n_ticks=2))
-            if metric == 'SNP_COUNT':
+            if metric == 'VARIANT_COUNT':
                 ax.legend(handles=[
                     Patch(facecolor=track_colors[0],
-                          alpha=1.0, label='Total SNPs'),
+                          alpha=1.0, label='Total variants'),
                     Patch(facecolor=rare_track_colors[0],
-                          label=f'Rare SNPs\nMAF < {rare_maf_threshold:g}'),
+                          label=f'Rare variants\nMAF < {rare_maf_threshold:g}'),
                 ], loc='lower right', bbox_to_anchor=(1, 1.05), ncol=2,
                     frameon=False, fontsize=tick_fontsize - 0.5,
                     handlelength=1.5, columnspacing=1.4, borderaxespad=0)
@@ -1573,9 +1670,12 @@ def plot_genome_tracks(track_df, output_prefix=None, title=None,
                                   & (ticks <= upper_bound)]
                     ax.yaxis.set_major_locator(
                         FixedLocator(np.r_[lower_bound, ticks]))
-                    if metric in ('MAF', 'DAF'):
+                    if metric == 'MAF':
                         ax.yaxis.set_major_formatter(FuncFormatter(
                             lambda value, position: f'{value:g}'))
+            if metric == 'VARIANT_COUNT':
+                ax.yaxis.set_major_formatter(FuncFormatter(
+                    lambda value, position: f'{value / 1000:g}k' if abs(value) >= 1000 else f'{value:g}'))
             if metric == 'PI':
                 ax.ticklabel_format(axis='y', style='sci',
                                     scilimits=(-3, 3), useMathText=True)
@@ -1589,9 +1689,9 @@ def plot_genome_tracks(track_df, output_prefix=None, title=None,
             track_fig.suptitle(f'{title} | {window_size / 1e6:g} Mb windows',
                                fontsize=title_fontsize, fontweight='normal')
         if output_prefix is not None:
-            prefix = Path(output_prefix)
-            prefix.parent.mkdir(parents=True, exist_ok=True)
-            files = {kind: Path(str(prefix) + suffix) for kind, suffix in
+            prefix = os.fspath(output_prefix)
+            os.makedirs(os.path.dirname(prefix) or '.', exist_ok=True)
+            files = {kind: f'{prefix}{suffix}' for kind, suffix in
                      [('pdf', '.pdf'), ('png', '.png'), ('csv', '.csv.gz')]}
             track_plot_df.to_csv(files['csv'], index=False, compression='gzip')
             track_fig.savefig(files['pdf'], bbox_inches='tight')
@@ -1999,143 +2099,6 @@ def get_site_recombination_contexts(site_contexts_df, recombination_file, min_Cm
     site_contexts_df.drop(columns=['recombination_rate'], inplace=True)
 
     return site_contexts_df
-
-
-def calculate_DAF(vcf_file, target_samples, outgroup_samples, min_ancestral_allele_frequency=0.9, keep_nan=True):
-    """
-    Calculate derived allele frequencies for the target population based on the VCF file and outgroup information.
-
-    Input:
-    vcf_file: path to the indexed VCF file containing variant data
-    target_samples: list of sample IDs for the target population
-    outgroup_samples: list of sample IDs for the outgroup population
-    min_ancestral_allele_frequency: minimum frequency of the ancestral allele in the outgroup to be considered an ancestral allele
-    keep_nan: retain sites with NaN AAF or DAF when True (default); omit them when False
-
-    Output:
-    DataFrame containing derived allele frequencies for the target population at each variant site
-    columns:
-        ID: identifier of the variant site
-        CHROM: chromosome of the variant site
-        POS: position of the variant site
-        REF: reference allele from the VCF
-        ALT: alternate alleles from the VCF, comma-separated at multiallelic sites
-        AA: ancestral allele in the outgroup population
-        AAF: frequency of the ancestral allele in the outgroup population
-        AA_N: number of ancestral alleles observed in the outgroup population
-        DA: derived allele in the target population
-        DAF: derived allele frequency in the target population
-        DA_N: number of derived alleles observed in the target population
-
-    Missing allele copies are excluded from frequency denominators; called
-    copies in partially missing genotypes are counted. Ancestry is assigned
-    only when the most frequent outgroup allele is unique and its frequency
-    meets the threshold (inclusive). Unresolved sites retain ID/CHROM/POS/REF/ALT
-    with NaN in the remaining columns. Multiallelic sites produce one row per
-    non-ancestral allele, including alleles absent from the target population.
-    If all target alleles are missing, DA_N is zero and DAF is NaN.
-    keep_nan=False removes rows with NaN AAF or DAF, regardless of missing IDs.
-
-    频率按非缺失等位基因拷贝数计算，部分缺失基因型中的已知拷贝仍计入。
-    外群中频率最高的等位基因唯一且达到阈值（含等号）时才判定祖先。
-    无法判定的位点保留 ID/CHROM/POS/REF/ALT，其余列为 NaN。多等位位点按每个
-    非祖先等位基因分别输出一行，包括目标群体中未出现的等位基因。
-    目标群体全部缺失时，DA_N 为 0，DAF 为 NaN。
-    keep_nan=False 时过滤 AAF 或 DAF 为 NaN 的行；缺失 ID 不影响过滤。
-    REF 和 ALT 记录 VCF 中的等位基因，多个 ALT 用逗号连接。
-
-    A VCF index is required. tqdm uses its record count as the total;
-    an unavailable index raises an error before variant processing.
-    VCF 必须有索引；tqdm 从索引获取总位点数，索引不可用时在处理位点前报错。
-    """
-    if not 0 <= min_ancestral_allele_frequency <= 1:
-        raise ValueError(
-            'min_ancestral_allele_frequency must be between 0 and 1.')
-    for name, samples in [('target_samples', target_samples),
-                          ('outgroup_samples', outgroup_samples)]:
-        if isinstance(samples, str) or len(samples) == 0:
-            raise ValueError(f'{name} must be a non-empty list of sample IDs.')
-        if any(not isinstance(sample, str) or not sample for sample in samples):
-            raise ValueError(f'{name} must contain non-empty sample IDs.')
-        if len(set(samples)) != len(samples):
-            raise ValueError(f'{name} contains duplicate sample IDs.')
-
-    columns = ['ID', 'CHROM', 'POS', 'REF', 'ALT',
-               'AA', 'AAF', 'AA_N', 'DA', 'DAF', 'DA_N']
-    rows = []
-    vcf = VCF(vcf_file)
-    try:
-        total_sites = vcf.num_records
-        requested_samples = list(dict.fromkeys(
-            list(target_samples) + list(outgroup_samples)))
-        missing_samples = sorted(set(requested_samples) - set(vcf.samples))
-        if missing_samples:
-            raise ValueError(f'Sample IDs not found in VCF: {missing_samples}')
-        # Decode only the populations needed for this calculation.
-        vcf.set_samples(requested_samples)
-        sample_indices = {sample: index for index,
-                          sample in enumerate(vcf.samples)}
-        target_indices = [sample_indices[sample] for sample in target_samples]
-        outgroup_indices = [sample_indices[sample]
-                            for sample in outgroup_samples]
-
-        def count_alleles(genotypes, indices, allele_count):
-            counts = np.zeros(allele_count, dtype=np.int64)
-            for index in indices:
-                # cyvcf2 stores the phase flag after the allele indices.
-                for allele in genotypes[index][:-1]:
-                    if allele is not None and 0 <= allele < allele_count:
-                        counts[allele] += 1
-            return counts
-
-        for variant in tqdm(vcf, total=total_sites, desc='Calculating DAF', unit='site'):
-            site = [variant.ID, variant.CHROM, variant.POS, variant.REF,
-                    ','.join(variant.ALT) if variant.ALT else '.']
-            alleles = [variant.REF] + list(variant.ALT)
-            genotypes = variant.genotypes
-            outgroup_counts = count_alleles(
-                genotypes, outgroup_indices, len(alleles))
-            outgroup_total = int(outgroup_counts.sum())
-            if outgroup_total == 0:
-                rows.append(site + [np.nan] * 6)
-                continue
-
-            ancestral_index = int(outgroup_counts.argmax())
-            ancestral_count = int(outgroup_counts[ancestral_index])
-            ancestral_frequency = ancestral_count / outgroup_total
-            if (np.count_nonzero(outgroup_counts == ancestral_count) != 1 or
-                    ancestral_frequency < min_ancestral_allele_frequency):
-                rows.append(site + [np.nan] * 6)
-                continue
-
-            target_counts = count_alleles(
-                genotypes, target_indices, len(alleles))
-            target_total = int(target_counts.sum())
-            ancestral_info = [alleles[ancestral_index],
-                              ancestral_frequency, ancestral_count]
-            derived_indices = [index for index in range(len(alleles))
-                               if index != ancestral_index]
-            if not derived_indices:
-                rows.append(site + ancestral_info + [np.nan, np.nan, 0])
-            for derived_index in derived_indices:
-                derived_count = int(target_counts[derived_index])
-                derived_frequency = derived_count / target_total if target_total else np.nan
-                rows.append(site + ancestral_info +
-                            [alleles[derived_index], derived_frequency, derived_count])
-    finally:
-        vcf.close()
-
-    result = pd.DataFrame(rows, columns=columns)
-    if not keep_nan:
-        result = result[result['DAF'] > 0]
-        result = result.dropna(subset=['AAF', 'DAF']).reset_index(drop=True)
-
-    result['DAF'] = result['DAF'].astype(float)
-    result['AAF'] = result['AAF'].astype(float)
-    result['AA_N'] = result['AA_N'].astype(int)
-    result['DA_N'] = result['DA_N'].astype(int)
-
-    return result
 
 
 if __name__ == "__main__":

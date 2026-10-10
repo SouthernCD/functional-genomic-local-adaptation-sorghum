@@ -88,34 +88,12 @@ def printer_list(list_input, sep="\t", head="", wrap_num=None):
     return printer
 
 
-def mkdir(dir_name, keep=True):
-    if keep is False:
-        if os.path.exists(dir_name):
-            shutil.rmtree(dir_name)
-        os.makedirs(dir_name)
-    else:
-        if not os.path.exists(dir_name):
-            os.makedirs(dir_name)
-
-    return dir_name
-
-
 def rmdir(dir_name):
     if os.path.exists(dir_name):
         if os.path.isdir(dir_name):
             shutil.rmtree(dir_name)
         else:
             os.remove(dir_name)
-
-
-def have_file(file_name, null_is_ok=False):
-    if os.path.exists(file_name):
-        if null_is_ok:
-            return True
-        elif os.path.getsize(file_name):
-            return True
-    else:
-        return False
 
 
 def is_path(path):
@@ -155,7 +133,7 @@ def copy_file(source_path, target_path, keep=False):
         if os.path.isdir(target_path):
             target_path = os.path.join(target_path, get_file_name(source_path))
 
-        if keep and have_file(target_path):
+        if keep and os.path.exists(target_path):
             new_path = target_path
         else:
             new_path = shutil.copy(source_path, target_path)

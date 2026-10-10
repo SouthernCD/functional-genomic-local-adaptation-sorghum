@@ -19,7 +19,6 @@ from shapely.geometry import box, MultiPolygon
 from scipy.stats import pearsonr
 from .tree import UnrootedTreePlotter
 from .plot import set_plot_style
-from .utils import mkdir
 import networkx as nx    
 import matplotlib as mpl
 import matplotlib.ticker as ticker
@@ -70,130 +69,126 @@ PLOTBOTANICALTYPE_TO_GROUPID = {
 }
 
 
-def nj_tree_plotter(nj_tree_file, landraces_reseq_df, save_fig_path):
+def nj_tree_plotter(nj_tree_file, landraces_reseq_df, save_fig_path, figsize=(10, 10)):
+    """Display an IBS-based NJ tree colored by botanical group.
+
+    Parameters
+    ----------
+    nj_tree_file : str
+        Newick tree with sample identifiers as tip names.
+    landraces_reseq_df : pandas.DataFrame
+        Metadata with unique LIB identifiers and PlotBotanicalType groups.
+        Tree tips are matched to LIB; unmapped groups or tips use gray.
+    save_fig_path : str
+        Output PDF path; an existing figure is overwritten.
+    figsize : tuple of float
+        Figure width and height in inches.
+
+    Returns
+    -------
+    None
+        Applies the shared style, saves and displays the tree. Adds the
+        PlotBotanicalType_Color column to the supplied metadata. The Newick
+        tree and metadata provide the source data for the figure.
+    """
     set_plot_style()
+    if landraces_reseq_df['LIB'].duplicated().any():
+        raise ValueError('LIB identifiers must be unique for tree-tip color matching.')
+    color_lookup = {
+        group: GROUP_COLOR_LOOKUP[group_id]
+        for group, group_id in PLOTBOTANICALTYPE_TO_GROUPID.items()
+    }
+    landraces_reseq_df['PlotBotanicalType_Color'] = (
+        landraces_reseq_df['PlotBotanicalType'].map(color_lookup).fillna('gray')
+    )
+    color_dict = landraces_reseq_df.set_index('LIB')['PlotBotanicalType_Color'].to_dict()
 
-    plotbotanicaltype_color_lookup = {
-        i: GROUP_COLOR_LOOKUP[j] for i, j in PLOTBOTANICALTYPE_TO_GROUPID.items()}
-
-    landraces_reseq_df['PlotBotanicalType_Color'] = landraces_reseq_df.apply(
-        lambda x: plotbotanicaltype_color_lookup.get(x['PlotBotanicalType'], 'gray'), axis=1)
-
-    fig, ax = plt.subplots(figsize=(10, 10))
+    fig, ax = plt.subplots(figsize=figsize)
     ax.set_aspect('equal')
     ax.axis('off')
-
     nj_plotter = UnrootedTreePlotter(Phylo.read(nj_tree_file, 'newick'))
-    color_dict = landraces_reseq_df[['LIB', 'PlotBotanicalType_Color']].set_index(
-        'LIB').to_dict()['PlotBotanicalType_Color']
-    # color_dict中没有的设置为灰色
     for tip in nj_plotter.tree.get_terminals():
-        if tip.name not in color_dict:
-            color_dict[tip.name] = 'gray'
-
+        color_dict.setdefault(tip.name, 'gray')
     nj_plotter.plot(clade_colors=color_dict, ax=ax, bg_lw=1)
-
     fig.savefig(save_fig_path, format='pdf', facecolor='none',
                 edgecolor='none', bbox_inches='tight')
-
     plt.show()
 
-    return
 
+def landraces_botanical_map_plotter(
+    landraces_reseq_df, save_fig_path, NATURAL_EARTH_SHP_FILE,
+    longitude_limit=(-20, 52), latitude_limit=(-37, 38), figsize=(8, 8),
+):
+    """Plot landrace collection locations colored by botanical group.
 
-def landraces_botanical_map_plotter(landraces_reseq_df, save_fig_path, NATURAL_EARTH_SHP_FILE):
+    Parameters
+    ----------
+    landraces_reseq_df : pandas.DataFrame
+        Sample metadata with LIB, Latitude, Longitude and PlotBotanicalType.
+        Coordinates are longitude/latitude in degrees. Rows missing either
+        coordinate or botanical group are excluded from the scatter plot.
+    save_fig_path : str
+        Output PDF path; an existing file is overwritten.
+    NATURAL_EARTH_SHP_FILE : str
+        Natural Earth country-boundary shapefile in geographic coordinates.
+    longitude_limit, latitude_limit : tuple of float
+        Display bounds in degrees. These clip the view, not the sample table
+        or the group counts in the legend.
+    figsize : tuple of float
+        Figure width and height in inches.
+
+    Returns
+    -------
+    pandas.DataFrame
+        Scatter input rows in metadata order, containing LIB, Latitude,
+        Longitude, PlotBotanicalType and PlotBotanicalType_Color. Applies the
+        shared plotting style, displays and saves the figure, and adds the
+        color column to the supplied metadata. Unmapped groups use gray.
+    """
     set_plot_style()
+    color_lookup = {
+        group: GROUP_COLOR_LOOKUP[group_id]
+        for group, group_id in PLOTBOTANICALTYPE_TO_GROUPID.items()
+    }
+    landraces_reseq_df['PlotBotanicalType_Color'] = (
+        landraces_reseq_df['PlotBotanicalType'].map(color_lookup).fillna('gray')
+    )
+    data = landraces_reseq_df[
+        ['LIB', 'Latitude', 'Longitude', 'PlotBotanicalType', 'PlotBotanicalType_Color']
+    ].dropna(subset=['Latitude', 'Longitude', 'PlotBotanicalType']).copy()
 
-    plotbotanicaltype_color_lookup = {
-        i: GROUP_COLOR_LOOKUP[j] for i, j in PLOTBOTANICALTYPE_TO_GROUPID.items()}
-
-    value_label = 'BotanicalType'
-    title = 'Landrace Resequencing Samples in Africa'
-
-    latitude_limit = (-37, 38)
-    longitude_limit = (-20, 52)
-
-    data = pd.DataFrame({
-        'latitude': landraces_reseq_df['Latitude'],
-        'longitude': landraces_reseq_df['Longitude'],
-        'value': landraces_reseq_df['PlotBotanicalType'],
-    })
-
-    # # 把小于10的类别合并为一个类别
-    # data = data[data['value'].notnull()]
-    # data['value'] = data['value'].apply(lambda x: x if data['value'].value_counts()[x] > 4 else 'Others')
-
-    fig, ax = plt.subplots(figsize=(8, 8))
-
-    data = data[data['latitude'].notnull()]
-    data = data[data['longitude'].notnull()]
-    data = data[data['value'].notnull()]
-
-    # 读取内置的世界地图数据
+    fig, ax = plt.subplots(figsize=figsize)
     world = gpd.read_file(NATURAL_EARTH_SHP_FILE)
-    # 在 axes 对象上绘制地图
     world.boundary.plot(color='black', linewidth=0.5, ax=ax)
+    ax.set_xlim(longitude_limit)
+    ax.set_ylim(latitude_limit)
 
-    # 设置地图边界
-    ax.set_xlim(longitude_limit)  # 替换为你的左右边界的经度
-    ax.set_ylim(latitude_limit)  # 替换为你的上下边界的纬度
-
-    # scatter
-    value_plot_order = sorted(data['value'].unique(), key=lambda x: len(
-        data[data['value'] == x]), reverse=True)
-
-    for value in value_plot_order:
-        subdata = data[data['value'] == value]
-        data_count = len(subdata)
+    group_order = sorted(
+        data['PlotBotanicalType'].unique(),
+        key=lambda group: (data['PlotBotanicalType'] == group).sum(), reverse=True,
+    )
+    for group in group_order:
+        group_data = data[data['PlotBotanicalType'] == group]
         sns.scatterplot(
-            x=subdata['longitude'],
-            y=subdata['latitude'],
-            color=plotbotanicaltype_color_lookup.get(
-                value, 'gray') if plotbotanicaltype_color_lookup else None,
-            label='%s (%d)' % (value, data_count),
-            s=40,
-            ax=ax,
+            x=group_data['Longitude'], y=group_data['Latitude'],
+            color=color_lookup.get(group, 'gray'), label=f'{group} ({len(group_data)})',
+            s=40, ax=ax,
         )
-        # ax.scatter(
-        #     subdata['longitude'], subdata['latitude'], c=[
-        #         cmap(value_color)], label='%s (%d)' %
-        #     (value, data_count), s=s)
-
-    ax.set_title(title)
-
-    # 显示图例，位置在右下角
-    ax.legend(loc='lower right')
-
-    # 为 landraces_reseq_df 添加一个新列，用于存储每个样本的绘图颜色
-    landraces_reseq_df['PlotBotanicalType_Color'] = landraces_reseq_df.apply(
-        lambda x: plotbotanicaltype_color_lookup.get(x['PlotBotanicalType'], 'gray'), axis=1)
 
     ax.set_title(None)
-    ax.spines['top'].set_visible(False)
-    ax.spines['right'].set_visible(False)
-    ax.spines['left'].set_visible(False)
-    ax.spines['bottom'].set_visible(False)
+    for spine in ax.spines.values():
+        spine.set_visible(False)
     ax.set_xticks([])
     ax.set_yticks([])
     ax.set_xlabel(None)
     ax.set_ylabel(None)
-    # 获取当前legend的handles和labels
     handles, labels = ax.get_legend_handles_labels()
-
-    # 反转顺序
-    handles = handles[::-1]
-    labels = labels[::-1]
-
-    # 设置 legend，调整字体和行间距
-    ax.legend(handles, labels, loc='lower left',
+    ax.legend(handles[::-1], labels[::-1], loc='lower left',
               fontsize=11, labelspacing=0.3, frameon=False)
     plt.show()
-
-    # save the figure
     fig.savefig(save_fig_path, format='pdf', facecolor='none',
                 edgecolor='none', bbox_inches='tight')
-
-    return
+    return data
 
 
 def env_vars_map_plotter(main_env,
@@ -206,26 +201,53 @@ def env_vars_map_plotter(main_env,
                          longitude_limit=(-20, 52),
                          latitude_limit=(-37, 22)):
 
+    """Map environmental values and color the existing landrace tree.
+
+    Parameters
+    ----------
+    main_env : str
+        Variable ID for the main map and tree inset.
+    small_envs : sequence of str
+        Three variable IDs for the small maps.
+    landraces_reseq_df : pandas.DataFrame
+        Original metadata with LIB, Longitude, Latitude and environmental
+        columns. Values are divided by the scale in env_info_df for display.
+    nj_tree_file : str
+        Newick tree with sample IDs matching metadata LIB values.
+    env_info_df : pandas.DataFrame
+        env_id, short description, units and scale for displayed variables.
+    save_fig_path : str
+        Destination PDF path. No separate figure-data table is written.
+    NATURAL_EARTH_SHP_FILE : str
+        Natural Earth country polygons with CONTINENT and NAME fields.
+    longitude_limit, latitude_limit : tuple
+        Geographic display bounds. Non-Striga colors span the 2nd to 98th
+        percentiles; Striga uses 0–1. Missing environmental values are gray.
+
+    Returns
+    -------
+    tuple
+        Figure and main map Axes. Save the PDF without calling plt.show().
+        Raw metadata, variable definitions and the tree are the figure inputs.
+    """
+
     set_plot_style()
 
     # =========================
-    # 1. 基本参数
+
     # =========================
     world = gpd.read_file(NATURAL_EARTH_SHP_FILE)
 
-    # 只保留非洲，并裁剪到视窗范围
     africa = world[world["CONTINENT"] == "Africa"].copy()
     africa_bbox = box(longitude_limit[0], latitude_limit[0], 53, 38)
     africa = africa.clip(africa_bbox)
 
-    # 去掉明显岛屿国家
     drop_names = {
         "Madagascar", "Mauritius", "Comoros", "Seychelles", "Cape Verde",
         "Sao Tome and Principe", "Reunion", "Mayotte"
     }
     africa = africa[~africa["NAME"].isin(drop_names)].copy()
 
-    # 对每个国家保留最大 polygon，去掉零散小岛
     def keep_largest_part(geom):
         if geom is None or geom.is_empty:
             return geom
@@ -242,7 +264,7 @@ def env_vars_map_plotter(main_env,
     env_scale_dict = dict(env_info_df[['env_id', 'scale']].values)
 
     # =========================
-    # 2. 环境变量缩放 + 颜色映射
+
     # =========================
     def get_env_scale(env_name):
         scale = env_scale_dict.get(env_name, 1)
@@ -289,7 +311,7 @@ def env_vars_map_plotter(main_env,
         return color_list, cmap, norm
 
     # =========================
-    # 3. 只画地图（不画色带）
+
     # =========================
 
     def plot_env_map_only(
@@ -346,7 +368,7 @@ def env_vars_map_plotter(main_env,
         return cmap, norm
 
     # =========================
-    # 4. 单独画色带 + 左侧垂直标签 + 顶部单位
+
     # =========================
 
     def add_colorbar_to_axes(
@@ -497,7 +519,7 @@ def env_vars_map_plotter(main_env,
         return ax_cbar
 
     # =========================
-    # 5. 树
+
     # =========================
 
     def add_tree_inset(
@@ -541,7 +563,7 @@ def env_vars_map_plotter(main_env,
         return ax_tree
 
     # =========================
-    # 6. 主图
+
     # =========================
     fig = plt.figure(figsize=(9, 10), facecolor='white')
     ax_main = fig.add_subplot(111)
@@ -567,7 +589,7 @@ def env_vars_map_plotter(main_env,
         norm=main_norm,
         label_text=env_desc_dict.get(main_env, main_env),
         unit_text=env_unit_dict.get(main_env, ''),
-        cbar_anchor=(0.25, 0.46, 0.03, 0.16),
+        cbar_anchor=(0.25, 0.48, 0.03, 0.16),
         cbar_ticksize=9,
         label_size=14,
         unit_size=11,
@@ -584,14 +606,14 @@ def env_vars_map_plotter(main_env,
         env_name=main_env,
         df=landraces_reseq_df,
         nj_tree_file=nj_tree_file,
-        bbox_to_anchor=(-0.12, -0.02, 1, 1),
+        bbox_to_anchor=(-0.12, -0.03, 1, 1),
         width="62%",
         height="62%",
         rotate_deg=-60.0
     )
 
     # =========================
-    # 7. 小图
+
     # =========================
     y0 = 0.95
     h = 0.270
@@ -676,7 +698,7 @@ def env_vars_map_plotter(main_env,
 
         ax_in.set_title(
             env_desc_dict.get(env_name, env_name),
-            loc='left',     # 关键
+            loc='left',
             fontsize=12,
             pad=4
         )
@@ -688,64 +710,86 @@ def env_vars_map_plotter(main_env,
     fig.savefig(save_fig_path, format='pdf',
                 facecolor='white', edgecolor='none')
     # print(f"Figure saved to {save_fig_path}")
-    plt.show()
-
-    return
-
+    return fig, ax_main
 
 def rda_analysis(vcf, landraces_env_df, kinship_file, output_dir):
-    mkdir(output_dir)
+    """Fit RDA of genotypic variation on standardized environmental variables.
 
-    # 0) 环境矩阵：去缺失并固定样本顺序
+    Workflow
+    --------
+    1. Retain complete environmental profiles and align VCF sample order.
+    2. Remove monomorphic variants, center genotypes and scale environments.
+    3. Regress genotypes on environments and apply PCA to fitted genotypes.
+    4. Save sample scores, environmental correlations and explained variance.
+
+    Parameters
+    ----------
+    vcf : str
+        LD-pruned VCF; genotypes are represented as alternative-allele counts.
+    landraces_env_df : pandas.DataFrame
+        Samples indexed by LIB, with environmental variables as columns.
+    kinship_file : str
+        IBS matrix in the original sample order. Loaded and aligned for a
+        finite-value check; it is not a predictor or covariate in this model.
+    output_dir : str
+        Save rda_samples.csv, rda_env_contrib.csv and rda_explained.csv.
+        Environmental vectors are correlations with the first two RDA axes.
+        The explained table includes the adjusted R-squared. Overwrite outputs;
+        the calling notebook owns result reuse.
+
+    Returns
+    -------
+    None
+        Write the three result tables without plotting.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Retain complete environmental profiles and their sample order.
     env = landraces_env_df.copy()
     env_clean = env.dropna()
     keep_ids = env_clean.index.tolist()
-    print("env_clean:", env_clean.shape)
+    print(f'RDA samples: {env_clean.shape[0]:,}; environmental variables: {env_clean.shape[1]:,}')
 
-    # 1) 读 VCF，并对齐样本顺序
-    callset = allel.read_vcf(vcf, samples=keep_ids)   # 直接只读保留样本（最稳）
+    # Align genotype rows to the environmental sample order.
+    callset = allel.read_vcf(vcf, samples=keep_ids)
     samples_vcf = callset['samples'].tolist()
-    assert samples_vcf == keep_ids, "VCF样本顺序与env不一致"
+    if samples_vcf != keep_ids:
+        raise ValueError('VCF and environmental sample order do not match.')
 
     gt = allel.GenotypeArray(callset['calldata/GT'])
-    gn = gt.to_n_alt().T.astype("float32")   # (n_samples, n_variants), 0/1/2, 缺失为 -1
-    print("gn raw:", gn.shape)
+    gn = gt.to_n_alt().T.astype("float32")
+    print(f'Input variants: {gn.shape[1]:,}')
 
-    # 2) 处理缺失：先把 -1 变为 NaN，再按位点做“均值插补”
+    # Handle missing genotype counts before removing monomorphic variants.
     gn[gn < 0] = np.nan
     imp = SimpleImputer(strategy="mean")
-    gn_imp = imp.fit_transform(gn)           # 每一列用非缺失均值填充
-    # 若某列全缺失，SimpleImputer 会报错；为防万一，先移除全缺失列：
+    gn_imp = imp.fit_transform(gn)
+
     all_nan_cols = np.isnan(gn).all(axis=0)
     if all_nan_cols.any():
         gn = gn[:, ~all_nan_cols]
         gn_imp = imp.fit_transform(gn)
 
-    # 3) 去掉在当前样本集合上仍然单态的位点（方差=0）
+    # Retain variation present in the selected samples.
     var = np.nanvar(gn_imp, axis=0)
     gn_imp = gn_imp[:, var > 0]
-    print("gn cleaned:", gn_imp.shape)
+    print(f'Variable sites retained: {gn_imp.shape[1]:,}')
 
-    # 4) 基因型中心化
+    # Center genotype counts and standardize environmental variables.
     X = gn_imp - np.mean(gn_imp, axis=0)
 
-    # 5) 环境矩阵标准化（用去缺失后的 env_clean）
     E = StandardScaler().fit_transform(env_clean.values)
 
-    # 6) kinship 对齐样本顺序
+    # Align the supplied IBS matrix; the RDA fit below does not use it.
     K = pd.read_csv(kinship_file, sep=',', names=landraces_env_df.index)
     K.index = landraces_env_df.index
     K = K.loc[keep_ids, keep_ids].values
-    print("K:", K.shape)
 
-    # 7) 最后做一次健壮性检查
-    assert np.isfinite(X).all(), "X 仍有 NaN/Inf"
-    assert np.isfinite(E).all(), "E 仍有 NaN/Inf"
-    assert np.isfinite(K).all(), "K 仍有 NaN/Inf"
+    assert np.isfinite(X).all(), 'Genotype matrix contains non-finite values.'
+    assert np.isfinite(E).all(), 'Environmental matrix contains non-finite values.'
+    assert np.isfinite(K).all(), 'IBS matrix contains non-finite values.'
 
-    # 8) RDA 分析
-
-    # 拟合基因型对环境
+    # Fit genotype variation to environments.
     lm = LinearRegression().fit(E, X)
     X_hat = lm.predict(E)
 
@@ -753,16 +797,15 @@ def rda_analysis(vcf, landraces_env_df, kinship_file, output_dir):
     pca = PCA()
     rda_scores = pca.fit_transform(X_hat)
 
-    # RDA 结果
     explained = pca.explained_variance_ratio_
     print("Explained variance:", explained[:5])
 
-    # 计算 R2_adj
+    # Adjust the explained fraction for sample size and predictor count.
     SS_total = np.sum((X - X.mean(axis=0))**2)
     SS_explained = np.sum((X_hat - X.mean(axis=0))**2)
     R2 = SS_explained / SS_total
     n = X.shape[0]
-    p = E.shape[1]                  # 环境变量个数（37）
+    p = E.shape[1]
     R2_adj = 1 - (1 - R2) * (n - 1) / (n - p - 1)
     print("Adjusted R2:", R2_adj)
 
@@ -789,7 +832,33 @@ def rda_analysis(vcf, landraces_env_df, kinship_file, output_dir):
 
     return
 
-def plot_rda_biplot(rda_samples_df, rda_env_contrib_df, rda_explained_df, env_info_df, save_fig_path):
+def plot_rda_biplot(rda_samples_df, rda_env_contrib_df, rda_explained_df,
+                    env_info_df, save_fig_path, highlight_env_ids=None):
+    """Plot sample RDA scores and environmental vectors.
+
+    Parameters
+    ----------
+    rda_samples_df : pandas.DataFrame
+        Sample scores with RDA1 and RDA2 columns.
+    rda_env_contrib_df : pandas.DataFrame
+        Environmental vectors with env_id, RDA1_contrib and RDA2_contrib.
+    rda_explained_df : pandas.DataFrame
+        RDA and explained_variance columns containing RDA1, RDA2 and R2_adj.
+    env_info_df : pandas.DataFrame
+        env_id, env_abbr and category for label text and colors.
+    save_fig_path : str
+        Destination PDF path.
+    highlight_env_ids : sequence of str or None
+        Variable IDs whose labels receive red rectangular outlines. Matching
+        uses env_id, independently of the displayed abbreviation.
+
+    Returns
+    -------
+    tuple
+        Figure and Axes. Save the PDF without calling plt.show().
+        Add category_color to env_info_df.
+    """
+    highlight_env_ids = set(highlight_env_ids or [])
 
     cmap = plt.get_cmap('Dark2')
 
@@ -797,38 +866,33 @@ def plot_rda_biplot(rda_samples_df, rda_env_contrib_df, rda_explained_df, env_in
     category_color_dict = {cat: cmap(i) for i, cat in enumerate(category_list)}
 
     env_info_df['category_color'] = env_info_df['category'].map(category_color_dict)
-    env_info_df
 
     rda1_contrib = rda_env_contrib_df['RDA1_contrib'].values
     rda2_contrib = rda_env_contrib_df['RDA2_contrib'].values
     rda1_sample_scores = rda_samples_df['RDA1'].values
     rda2_sample_scores = rda_samples_df['RDA2'].values
 
-    # ====== Step 5: 绘制双标图（biplot）======
     fig, ax = plt.subplots(1, 1, figsize=(5.1, 5))
 
-    # 绘制样品点
     sns.scatterplot(x=rda1_sample_scores, y=rda2_sample_scores, s=80, color='black', ax=ax, alpha=0.7)
 
     label_dict = env_info_df[['env_id', 'env_abbr']].set_index('env_id')['env_abbr'].to_dict()
     label_color_dict = env_info_df.set_index('env_id')['category_color'].to_dict()
 
-    # 变量箭头（以原点为起点）
     for i, feature in enumerate(rda_env_contrib_df['env_id'].values):
-        x_arrow = rda1_contrib[i] * 300 # 放大长度，便于可视化
+        x_arrow = rda1_contrib[i] * 300
         y_arrow = rda2_contrib[i] * 300
         ax.arrow(0, 0, x_arrow, y_arrow, color='gray', alpha=0.6, head_width=10, width=0.05)
 
-        # ===== 关键：沿箭头方向平移 =====
         vec = np.array([x_arrow, y_arrow])
         norm = np.linalg.norm(vec)
 
         if norm == 0:
             continue
 
-        direction = vec / norm   # 单位向量
+        direction = vec / norm
 
-        offset = 40  # 控制 label 离箭头的距离（自己调）
+        offset = 40
         x_text = x_arrow + direction[0] * offset
         y_text = y_arrow + direction[1] * offset
 
@@ -837,11 +901,12 @@ def plot_rda_biplot(rda_samples_df, rda_env_contrib_df, rda_explained_df, env_in
                 color=label_color_dict.get(feature, 'black'),
                 fontsize=10,
                 fontweight='bold',
-                ha='center', va='center', bbox=dict(facecolor='white', edgecolor='none', alpha=0.7, pad=1))
+                ha='center', va='center', bbox=dict(facecolor='white',
+                           edgecolor='red' if feature in highlight_env_ids else 'none',
+                           linewidth=1.2, alpha=0.7, pad=1))
 
         # ax.text(x_arrow + 30, y_arrow + 30, label_dict[feature], color=label_color_dict.get(feature, 'black'), fontsize=10, fontweight='bold', ha='center', va='center')
 
-    # 图形美化
     rda1_explained = rda_explained_df.loc[rda_explained_df['RDA'] == 'RDA1', 'explained_variance'].values[0]
     rda2_explained = rda_explained_df.loc[rda_explained_df['RDA'] == 'RDA2', 'explained_variance'].values[0]
     r2_adj = rda_explained_df.loc[rda_explained_df['RDA'] == 'R2_adj', 'explained_variance'].values[0]
@@ -852,13 +917,13 @@ def plot_rda_biplot(rda_samples_df, rda_env_contrib_df, rda_explained_df, env_in
     ax.axhline(0, linestyle='dotted', color='gray')
     ax.axvline(0, linestyle='dotted', color='gray')
 
-    # 关闭坐标轴
     ax.set_xticks([]); ax.set_yticks([])
     ax.spines['top'].set_visible(False)
     ax.spines['right'].set_visible(False)
     ax.spines['left'].set_visible(False)
     ax.spines['bottom'].set_visible(False)
 
+    ax.invert_yaxis()
 
     ax.set_xlim(ax.get_xlim()[0]*1.2, ax.get_xlim()[1])
     fig.patch.set_facecolor('none')
@@ -868,14 +933,45 @@ def plot_rda_biplot(rda_samples_df, rda_env_contrib_df, rda_explained_df, env_in
 
     fig.savefig(save_fig_path, format='pdf', facecolor='none',
                     edgecolor='none')
-    plt.show()    
+    return fig, ax
 
+def plot_env_corr_network(env_info_df, landraces_env_df, r_threshold=0.7,
+                          corr_file=None, save_fig_path=None, highlight_env_ids=None,
+                          correlation_df=None):
+    """Draw the environmental Pearson-correlation network.
 
+    Parameters
+    ----------
+    env_info_df : pandas.DataFrame
+        env_id, env_abbr and category_color define labels and text colors.
+    landraces_env_df : pandas.DataFrame
+        Samples by environmental variables, with env_id column names.
+        Samples with missing environmental values are excluded.
+    r_threshold : float
+        Minimum absolute Pearson r for displaying a connection.
+    corr_file : str or None
+        Optional destination for the correlation matrix CSV.
+    save_fig_path : str
+        Destination PDF path.
+    highlight_env_ids : sequence of str or None
+        Variable IDs whose circles receive red, 2 pt outlines. Applies to
+        the main component, two-node components and isolated nodes.
 
-def plot_env_corr_network(env_info_df, landraces_env_df, r_threshold=0.7, corr_file=None, save_fig_path=None):
+    correlation_df : pandas.DataFrame or None
+        Saved environmental Pearson-correlation matrix indexed and columned
+        by env_id. When supplied, draw this matrix without recomputing it.
+        Otherwise calculate correlations from complete environmental profiles.
+
+    Returns
+    -------
+    tuple
+        Figure and Axes. Export the matrix when requested and save the PDF,
+        without calling plt.show().
+    """
+    highlight_env_ids = set(highlight_env_ids or [])
 
     # =========================
-    # 工具函数
+
     # =========================
     def orient_flat(pos_dict, flatten=0.65, align='x'):
         nodes = list(pos_dict.keys())
@@ -899,7 +995,6 @@ def plot_env_corr_network(env_info_df, landraces_env_df, r_threshold=0.7, corr_f
 
         return {n: XY[i] for i, n in enumerate(nodes)}
 
-
     def scale_pos(pos, sx=1.0, sy=1.0, center=True):
         xs = np.array([p[0] for p in pos.values()])
         ys = np.array([p[1] for p in pos.values()])
@@ -909,7 +1004,6 @@ def plot_env_corr_network(env_info_df, landraces_env_df, r_threshold=0.7, corr_f
         for n, (x, y) in pos.items():
             new[n] = np.array([cx + (x - cx) * sx, cy + (y - cy) * sy])
         return new
-
 
     def normalize_to_box(pos, box_w=1.0, box_h=1.0, keep_aspect=True):
         nodes = list(pos.keys())
@@ -936,13 +1030,11 @@ def plot_env_corr_network(env_info_df, landraces_env_df, r_threshold=0.7, corr_f
 
         return {n: XY[i] for i, n in enumerate(nodes)}
 
-
     def translate_pos(pos, dx=0.0, dy=0.0):
         return {n: np.array([xy[0] + dx, xy[1] + dy]) for n, xy in pos.items()}
 
-
     def build_corr_graph(df, method='pearson', r_threshold=0.7, corr_file=None):
-        C = df.corr(method=method)
+        C = correlation_df.copy() if correlation_df is not None else df.corr(method=method)
 
         if corr_file is not None:
             C.to_csv(corr_file)
@@ -962,13 +1054,11 @@ def plot_env_corr_network(env_info_df, landraces_env_df, r_threshold=0.7, corr_f
             G.add_edge(row['u'], row['v'], r=row['r'], strength=abs(row['r']))
         return G
 
-
     def get_connected_components_and_isolates(G):
         comps = [G.subgraph(c).copy() for c in nx.connected_components(G) if len(c) > 1]
         isolates = sorted([n for n, d in G.degree() if d == 0])
         comps.sort(key=lambda H: (H.number_of_nodes(), H.number_of_edges()), reverse=True)
         return comps, isolates
-
 
     def get_component_layout(H, layout='spring', seed=42, k=None, iterations=500):
         nV = H.number_of_nodes()
@@ -999,7 +1089,6 @@ def plot_env_corr_network(env_info_df, landraces_env_df, r_threshold=0.7, corr_f
         pos = scale_pos(pos, sx=1.0, sy=1.10, center=True)
         return pos
 
-
     def get_node_size_map(G, degree_mode='count', node_size_min=400, node_size_max=2000):
         if degree_mode == 'strength' and G.number_of_edges() > 0:
             val_by_node = {n: 0.0 for n in G.nodes()}
@@ -1021,7 +1110,6 @@ def plot_env_corr_network(env_info_df, landraces_env_df, r_threshold=0.7, corr_f
         )
         return {n: s for n, s in zip(G.nodes(), interp_sizes)}
 
-
     def abbr_to_env_id(abbr_or_id, env_info_df):
         if abbr_or_id in set(env_info_df["env_id"]):
             return abbr_or_id
@@ -1032,9 +1120,8 @@ def plot_env_corr_network(env_info_df, landraces_env_df, r_threshold=0.7, corr_f
 
         return None
 
-
     # =========================
-    # 专用绘图函数：2节点连通图
+
     # =========================
     def draw_two_node_component(
         ax,
@@ -1074,13 +1161,13 @@ def plot_env_corr_network(env_info_df, landraces_env_df, r_threshold=0.7, corr_f
 
         circ_top = Circle(
             (x_top, y_top), radius=r_top,
-            facecolor=node_facecolor, edgecolor=node_edgecolor,
-            linewidth=node_linewidth, zorder=2
+            facecolor=node_facecolor, edgecolor='red' if node_top in highlight_env_ids else node_edgecolor,
+            linewidth=2.0 if node_top in highlight_env_ids else node_linewidth, zorder=2
         )
         circ_bottom = Circle(
             (x_bottom, y_bottom), radius=r_bottom,
-            facecolor=node_facecolor, edgecolor=node_edgecolor,
-            linewidth=node_linewidth, zorder=2
+            facecolor=node_facecolor, edgecolor='red' if node_bottom in highlight_env_ids else node_edgecolor,
+            linewidth=2.0 if node_bottom in highlight_env_ids else node_linewidth, zorder=2
         )
         ax.add_patch(circ_top)
         ax.add_patch(circ_bottom)
@@ -1101,9 +1188,8 @@ def plot_env_corr_network(env_info_df, landraces_env_df, r_threshold=0.7, corr_f
             fontweight=font_weight, color=bottom_text_color, zorder=3
         )
 
-
     # =========================
-    # 专用绘图函数：独立节点
+
     # =========================
     def draw_isolated_nodes(
         ax,
@@ -1126,8 +1212,8 @@ def plot_env_corr_network(env_info_df, landraces_env_df, r_threshold=0.7, corr_f
 
             circ = Circle(
                 (x, y), radius=radius,
-                facecolor=node_facecolor, edgecolor=node_edgecolor,
-                linewidth=node_linewidth, zorder=2
+                facecolor=node_facecolor, edgecolor='red' if node in highlight_env_ids else node_edgecolor,
+                linewidth=2.0 if node in highlight_env_ids else node_linewidth, zorder=2
             )
             ax.add_patch(circ)
 
@@ -1140,9 +1226,8 @@ def plot_env_corr_network(env_info_df, landraces_env_df, r_threshold=0.7, corr_f
                 fontweight=font_weight, color=text_color, zorder=3
             )
 
-
     # =========================
-    # 调用逻辑：这张图的具体布局
+
     # =========================
     edgecolors = '#525A61'
     label_font_size = 12
@@ -1152,8 +1237,9 @@ def plot_env_corr_network(env_info_df, landraces_env_df, r_threshold=0.7, corr_f
         for env in landraces_env_df.columns
     }
 
-    # 文字颜色：按 env_info_df['category_color']
-    text_color_dict = env_info_df.set_index('env_id')['category_color'].to_dict()
+    category_colors = {category: plt.get_cmap('Dark2')(i)
+                       for i, category in enumerate(env_info_df['category'].unique())}
+    text_color_dict = env_info_df.set_index('env_id')['category'].map(category_colors).to_dict()
 
     env = landraces_env_df.copy()
     env_clean = env.dropna()
@@ -1171,14 +1257,12 @@ def plot_env_corr_network(env_info_df, landraces_env_df, r_threshold=0.7, corr_f
     small_two_node_comps = comps[1:]
     global_pos = {}
 
-    # 1. 最大连通图：更松弛 + 盒子更大一些
     pos0 = get_component_layout(H0, layout='spring', seed=42, iterations=700, k=1.15)
     pos0 = normalize_to_box(pos0, box_w=7.0, box_h=6.6, keep_aspect=True)
     pos0 = scale_pos(pos0, sx=0.8, sy=1.4, center=True)
     pos0 = translate_pos(pos0, dx=0.0, dy=1.52)
     global_pos.update(pos0)
 
-    # 2. 节点大小
     node_size_map = get_node_size_map(
         G,
         degree_mode='count',
@@ -1186,7 +1270,6 @@ def plot_env_corr_network(env_info_df, landraces_env_df, r_threshold=0.7, corr_f
         node_size_max=2000
     )
 
-    # 3. 给小图统一一个固定节点大小
     small_nodes = []
     for H in small_two_node_comps:
         if H.number_of_nodes() == 2 and H.number_of_edges() == 1:
@@ -1197,10 +1280,8 @@ def plot_env_corr_network(env_info_df, landraces_env_df, r_threshold=0.7, corr_f
     else:
         fixed_small_node_size = 700.0
 
-    # 手动调这个，小图圈圈大小
     SMALL_NODE_RADIUS_SCALE = 150
 
-    # 4. 颜色映射
     cmap_name = 'coolwarm'
     cmap = plt.get_cmap(cmap_name)
     edge_norm = mpl.colors.Normalize(vmin=-1, vmax=1)
@@ -1215,14 +1296,12 @@ def plot_env_corr_network(env_info_df, landraces_env_df, r_threshold=0.7, corr_f
     shift_y = 0.5
     x_gap = 0.4
 
-    # 5. 小连通图位置
     two_node_specs = [
         {"top_center": (-0.95 + shift_x, -0.02 + shift_y), "vertical_gap": 0.72},
         {"top_center": (-0.95 + x_gap + shift_x, -0.02 + shift_y), "vertical_gap": 0.72},
         {"top_center": (-0.95 + 2 * x_gap + shift_x, -0.02 + shift_y), "vertical_gap": 0.72},
     ]
 
-    # 6. 独立节点位置
     isolated_node_positions_input = {
         "WTD": (-0.95 + 3 * x_gap + shift_x, -0.02 + shift_y),
         "PHS": (-0.95 + 3 * x_gap + shift_x, -0.74 + shift_y),
@@ -1242,23 +1321,18 @@ def plot_env_corr_network(env_info_df, landraces_env_df, r_threshold=0.7, corr_f
             isolated_node_positions[env_id] = xy
 
     if unresolved_keys:
-        print("这些 isolated key 无法匹配到 env_id 或 env_abbr：", unresolved_keys)
+        print('Unmatched isolated-node labels:', unresolved_keys)
 
     isolated_node_positions = {
         n: xy for n, xy in isolated_node_positions.items() if n in isolates
     }
 
-    print("isolates =", isolates)
-    print("isolated_node_positions after mapping/filter =", isolated_node_positions)
-
-    # 7. 画图
     fig, ax = plt.subplots(figsize=(12, 7))
     fig.patch.set_facecolor('none')
     ax.set_facecolor('none')
     ax.patch.set_alpha(0)
     ax.axis('off')
 
-    # 7.1 大连通图边
     if H0.number_of_edges() > 0:
         edgelist0 = list(H0.edges())
         r_vals0 = np.array([H0[u][v]['r'] for u, v in edgelist0])
@@ -1274,17 +1348,15 @@ def plot_env_corr_network(env_info_df, landraces_env_df, r_threshold=0.7, corr_f
             alpha=0.9
         )
 
-    # 7.2 大连通图节点
     nx.draw_networkx_nodes(
         H0, global_pos, ax=ax,
         nodelist=list(H0.nodes()),
         node_size=[node_size_map[n] for n in H0.nodes()],
         node_color="#F7F7F7",
-        linewidths=0.8,
-        edgecolors=edgecolors
+        linewidths=[2.0 if n in highlight_env_ids else 0.8 for n in H0.nodes()],
+        edgecolors=['red' if n in highlight_env_ids else edgecolors for n in H0.nodes()]
     )
 
-    # 7.3 大连通图标签
     for n, (x, y) in global_pos.items():
         ax.text(
             x, y,
@@ -1297,7 +1369,6 @@ def plot_env_corr_network(env_info_df, landraces_env_df, r_threshold=0.7, corr_f
             zorder=3
         )
 
-    # 7.4 二节点连通图
     for i, H in enumerate(small_two_node_comps):
         if H.number_of_nodes() != 2 or H.number_of_edges() != 1:
             continue
@@ -1330,7 +1401,6 @@ def plot_env_corr_network(env_info_df, landraces_env_df, r_threshold=0.7, corr_f
             font_weight='bold',
         )
 
-    # 7.5 独立节点
     draw_isolated_nodes(
         ax=ax,
         node_positions=isolated_node_positions,
@@ -1347,7 +1417,6 @@ def plot_env_corr_network(env_info_df, landraces_env_df, r_threshold=0.7, corr_f
         font_weight='bold',
     )
 
-    # 7.6 色带
     cax = fig.add_axes([0.45, 0.435, 0.14, 0.03])
     cbar = fig.colorbar(sm, cax=cax, orientation='horizontal')
     cbar.ax.xaxis.set_major_locator(ticker.MultipleLocator(0.5))
@@ -1364,4 +1433,4 @@ def plot_env_corr_network(env_info_df, landraces_env_df, r_threshold=0.7, corr_f
         edgecolor='none',
     )
 
-    plt.show()    
+    return fig, ax

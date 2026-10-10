@@ -11,7 +11,6 @@ from scipy.stats import zscore
 import re
 from scipy.optimize import linear_sum_assignment
 import matplotlib.colors as mcolors
-from .utils import have_file
 from .plot import set_plot_style
 
 
@@ -385,7 +384,7 @@ def site_contrast_runner(contrast_id, contrast_json, context_df, env_id_list, ou
 
     results_json_file = os.path.join(
         output_dir, f"{contrast_id}.enrichment.json.gz")
-    reuse_result = have_file(results_json_file)
+    reuse_result = os.path.exists(results_json_file)
     if reuse_result:
         try:
             with gzip.open(results_json_file, 'rt', encoding='utf-8') as f:
@@ -455,7 +454,7 @@ def gene_contrast_runner(contrast_id, contrast_json, context_df, env_id_list, ou
         output_dir, f"{contrast_id}.enrichment.json.gz")
 
     # Old global-roll results must not be reused under the new null model.
-    if have_file(results_json_file):
+    if os.path.exists(results_json_file):
         try:
             with gzip.open(results_json_file, 'rt', encoding='utf-8') as f:
                 existing = json.load(f)['all']
@@ -534,7 +533,7 @@ def win_contrast_runner(contrast_id, contrast_json, context_df, trait_id_list, o
     results_json_file = os.path.join(
         output_dir, f"{contrast_id}.enrichment.json.gz")
 
-    if have_file(results_json_file):
+    if os.path.exists(results_json_file):
         try:
             with gzip.open(results_json_file, 'rt', encoding='utf-8') as f:
                 existing = json.load(f)['all']
@@ -608,7 +607,7 @@ def site_jaccard_contrast_runner(contrast_id, contrast_json, context_df, trait_i
     results_json_file = os.path.join(
         output_dir, f"{contrast_id}.enrichment.json.gz")
 
-    if have_file(results_json_file):
+    if os.path.exists(results_json_file):
         try:
             with gzip.open(results_json_file, 'rt', encoding='utf-8') as f:
                 existing = json.load(f)['all']

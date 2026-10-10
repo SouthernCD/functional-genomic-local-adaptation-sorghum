@@ -15,7 +15,6 @@ from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
 import os
 import pickle
-from .utils import have_file
 from .plot import set_plot_style
 from .vcf import VCF, get_genotype_matrix_from_vcf_by_pos_list
 from .enrich import build_enrich_data_df
@@ -2021,17 +2020,37 @@ def summarize_ld_decay_pairs(ld_pairs, site_info_df, *, max_decay_size=35000,
 
 def calculate_ld_decay(site_info_df, input_vcf_file, *, max_decay_size=35000,
                        curve_bin_size=100, pool_num=1, show_progress=True):
-    """Calculate all windowed LD pairs once per chromosome, then bin them.
+    """Calculate chromosome-level LD decay statistics from genotype dosages.
 
-    Calls calculate_ld_matrix(..., output_format='pairs', min_r2=0) once
-    for each chromosome, reusing the backend's VCF readers and genotype
-    caches across its tasks. Every distinct coordinate pair with
-    0 < distance <= max_decay_size is counted once. Duplicate input
-    coordinates are collapsed. All finite pairs for one chromosome are
-    held in memory until aggregation; only bin summaries persist afterwards.
-    Missing-call handling is inherited from calculate_ld_matrix unchanged.
-    Undefined R2 is excluded; pair_count records the finite observations.
-    This function performs computation only when explicitly called.
+    Workflow
+    --------
+    1. Collapse duplicate coordinates and process each chromosome separately.
+    2. Calculate each distinct coordinate pair within the distance limit once.
+    3. Summarize finite squared correlations in distance bins.
+
+    Parameters
+    ----------
+    site_info_df : pandas.DataFrame
+        Retained sites with CHROM and positive integer POS (1-based bp),
+        matching the input VCF. Chromosomes retain their encounter order.
+    input_vcf_file : str
+        VCF containing the selected sites and analysis samples.
+    max_decay_size : int
+        Largest included pair distance in bp; zero-distance pairs are excluded.
+    curve_bin_size : int
+        Bin width in bp, with intervals (0, B], (B, 2B], and so on.
+    pool_num : int
+        LD worker count. All finite pairs for one chromosome are held in
+        memory before aggregation; choose resources accordingly.
+    show_progress : bool
+        Display chromosome and backend computation progress.
+
+    Returns
+    -------
+    pandas.DataFrame
+        CHROM, bin_right (bp), ld_sum, pair_count and ld_mean. Undefined
+        correlations are excluded. Empty bins have zero count and NaN mean.
+        Missing-call handling follows calculate_ld_matrix. No files are saved.
     """
     max_decay_size, curve_bin_size = index(max_decay_size), index(curve_bin_size)
     pool_num = index(pool_num)
@@ -2077,15 +2096,33 @@ def calculate_ld_decay(site_info_df, input_vcf_file, *, max_decay_size=35000,
 
 def plot_ld_decay(ld_decay_df, *, half_ld_value=0.5, figsize=(12, 9),
                   xlim=(-1000, 35000), save_fig_path=None, ax=None):
-    """Plot binned decay with the Landraces notebook's style.
+    """Plot saved LD decay statistics and interpolate threshold distances.
 
-    Input is calculate_ld_decay/summarize_ld_decay_pairs output. Returns
-    (fig, ax, half_ld_df). The first downward threshold crossing is linearly
-    interpolated along distance, without sorting by R2 or extrapolating.
-    The (0, 1) origin is a display convention, not an observed pair/bin.
-    Crossings use observed bins only. A first bin already below threshold
-    yields NaN with status 'below_in_first_bin'; a missing-bin gap is not
-    interpolated. No crossing yields NaN with status 'not_reached'.
+    Parameters
+    ----------
+    ld_decay_df : pandas.DataFrame
+        Binned statistics with CHROM, bin_right (bp), ld_mean and pair_count,
+        as returned by calculate_ld_decay. Each chromosome/bin occurs once.
+    half_ld_value : float
+        Absolute mean r² threshold in (0, 1), rather than half the first bin.
+    figsize : tuple of float
+        Figure width and height in inches when creating a new axes.
+    xlim : tuple of float
+        Display bounds for distance in bp.
+    save_fig_path : str or None
+        Optional figure path; an existing file is overwritten.
+    ax : matplotlib.axes.Axes or None
+        Existing axes, or None to create a figure.
+
+    Returns
+    -------
+    tuple
+        Figure, axes and threshold table with CHROM, half_ld_value,
+        half_ld_dist (bp) and status. The first downward crossing is linearly
+        interpolated between adjacent observed bins; gaps are not bridged.
+        Missing crossings have NaN distance and a diagnostic status.
+        The plotted (0, 1) origin is a display convention, not an observed
+        bin, and is excluded from threshold estimation. No LD is recomputed.
     """
     half_ld_value = float(half_ld_value)
     if not np.isfinite(half_ld_value) or not 0 < half_ld_value < 1:
@@ -2342,45 +2379,64 @@ def calculate_multiscale_ld_decay(
     show_progress=True, silence=False, progress_interval=2.0,
     matrix_block_size=128, scratch_dir=None, cache_file=None, force_recompute=False,
 ):
-    """Exhaustive short-range and sampled long-range chromosome-wide LD.
+    """Exhaustively evaluate short-range LD and sample long-range LD.
 
-    Normalize each chromosome once into a temporary float64 disk array,
-    shared read-only by workers. Exhaustive bins <= full_distance (200 kb)
-    use bounded block matrix multiplication; only unordered pairs contribute.
-    More distant bins use uniform sampling without replacement with at most
-    50,000 pairs/bin by default. No R2 filtering; no dense chromosome LD
-    matrix or exhaustive pair list is stored. Same bin definitions, seeded
-    pair selection and genotype/missing-call semantics as the previous version.
+    Workflow
+    --------
+    1. Reuse saved statistics, or select sites and plan chromosome-wise pairs.
+    2. Normalize genotypes into temporary disk arrays shared by workers.
+    3. Evaluate pairs, aggregate finite r² by distance bin, and save statistics.
 
-    site_info_df accepts a DataFrame or notebook 02's var_stat HDF path.
-    PAIR_COUNT counts finite LD; EVALUATED_PAIR_COUNT includes undefined
-    pairs; POPULATION_PAIR_COUNT counts all eligible coordinate pairs.
-    PAIR_DISTANCE_MIN/MAX record min/max physical distance (bp) for the
-    last two bins across evaluated pairs, including undefined LD. Other bins
-    and bins without evaluated pairs have NaN distance extrema.
-    The >50 Mb bin explicitly requires distance >50,000,000; it is not a
-    catch-all for unassigned pairs. Multiple VCF records per coordinate raise.
-    Empty bins have LD_MEAN=NaN.
-    silence=True suppresses messages regardless of show_progress. Otherwise
-    report loading/normalization and pair-count progress with elapsed time,
-    throughput and ETA every progress_interval seconds. pool_num>1 uses fork,
-    one BLAS thread/worker, with workers opening the shared temporary array.
-    scratch_dir selects temporary storage (approximately 8*n_sites*n_samples
-    bytes/chromosome); arrays are removed after workers finish. cache_max_tiles
-    bounds the VCF tile cache used only during the one-time normalization.
+    Parameters
+    ----------
+    site_info_df : pandas.DataFrame or str
+        Sites with CHROM and positive integer POS in bp, or a chromosome-keyed
+        variant-statistics HDF file. MAF/HETF are required when filtering.
+    input_vcf_file : str
+        VCF matching the selected coordinates; multiple records per selected
+        coordinate are rejected.
+    min_maf, max_het : float or None
+        Inclusive MAF lower bound and heterozygosity upper bound.
+    full_distance : int
+        Exhaustive distance limit in bp; must be a finite predefined bin edge.
+    max_pairs_per_bin : int
+        Maximum uniformly sampled pairs without replacement per distant bin.
+    random_seed : int
+        Reproducible long-range pair sampling seed.
+    pool_num : int
+        Worker count; parallel execution requires fork and one BLAS thread
+        per worker. No dense chromosome LD matrix is retained.
+    pair_batch_size, matrix_block_size, cache_max_tiles : int
+        Pair batch size, exhaustive matrix-block size and VCF tile-cache limit.
+    show_progress, silence : bool
+        Enable progress; silence overrides show_progress.
+    progress_interval : float
+        Seconds between pair-count, throughput and ETA messages.
+    scratch_dir : str or None
+        Temporary-array directory, or the system default. Storage is about
+        8*n_sites*n_samples bytes per chromosome and removed after processing.
+    cache_file : str or None
+        Optional statistics CSV path. Existing CSV is loaded without checking
+        current inputs or parameters; completed output is written atomically.
+    force_recompute : bool
+        Recompute and replace the CSV after input or parameter changes.
 
-    An existing cache_file is read immediately, without loading inputs or
-    checking a JSON fingerprint. Set force_recompute=True after changing
-    inputs/parameters. CSV output is written atomically when all chromosomes
-    finish. Background jobs can compute/save this CSV without creating plots.
+    Returns
+    -------
+    pandas.DataFrame
+        Chromosome/bin statistics with bounds in bp, BIN_LABEL, LD_MEAN,
+        PAIR_COUNT (finite r²), EVALUATED_PAIR_COUNT (attempted pairs) and
+        POPULATION_PAIR_COUNT (eligible pairs). Undefined r² is excluded;
+        empty means are NaN. PAIR_DISTANCE_MIN/MAX record attempted distance
+        extrema for the final two bins, including undefined r² pairs.
+        The >50 Mb bin requires distance >50,000,000 bp.
     """
     import hashlib
     import math
     import tempfile
-    from pathlib import Path
 
     verbose = bool(show_progress) and not silence
-    if cache_file is not None and not force_recompute and Path(cache_file).is_file():
+    if cache_file is not None and not force_recompute and os.path.isfile(cache_file):
         if verbose:
             print(f'Reading existing multiscale LD CSV: {cache_file}', flush=True)
         return _load_multiscale_ld_result(cache_file)
@@ -2542,30 +2598,41 @@ def calculate_multiscale_ld_decay(
                   f'total elapsed {perf_counter() - start_time:.1f}s', flush=True)
     result = pd.DataFrame(rows)
     if cache_file is not None:
-        output = Path(cache_file)
-        output.parent.mkdir(parents=True, exist_ok=True)
+        output = os.fspath(cache_file)
+        os.makedirs(os.path.dirname(output) or '.', exist_ok=True)
         # Do not expose a partial CSV to a separate plotting process.
-        with tempfile.NamedTemporaryFile(dir=output.parent, prefix=output.name + '.',
+        with tempfile.NamedTemporaryFile(dir=os.path.dirname(output) or '.', prefix=os.path.basename(output) + '.',
                                          suffix='.tmp', delete=False) as handle:
-            temporary_output = Path(handle.name)
+            temporary_output = handle.name
         try:
             result.to_csv(temporary_output, index=False,
                           compression='gzip' if str(output).endswith('.gz') else None)
             os.replace(temporary_output, output)
         finally:
-            temporary_output.unlink(missing_ok=True)
+            try:
+                os.remove(temporary_output)
+            except FileNotFoundError:
+                pass
         if verbose:
             print(f'Saved {output}; total elapsed {perf_counter() - start_time:.1f}s', flush=True)
     return result
 
 
 def summarize_multiscale_ld_overflow(ld_decay_df):
-    """QC 30–50 Mb and >50 Mb bins from a DataFrame or standalone CSV.
+    """Inspect attempted distances in the two longest-range bins.
 
-    POPULATION_PAIR_COUNT is candidate count; EVALUATED_PAIR_COUNT is actual
-    attempted count; PAIR_COUNT is finite R2 count used for LD_MEAN.
-    Distance extrema refer to attempted pairs. Legacy CSVs lacking these
-    columns are marked not_recorded; no distances are inferred or fabricated.
+    Parameters
+    ----------
+    ld_decay_df : pandas.DataFrame or str
+        Multiscale LD statistics or their saved CSV path.
+
+    Returns
+    -------
+    pandas.DataFrame
+        Rows for 30–50 Mb and >50 Mb with candidate, attempted and finite
+        pair counts, mean r², attempted distance extrema in bp and DISTANCE_QC.
+        Missing distance records yield not_recorded; no pairs yield no_pairs;
+        recorded distances yield pass or out_of_bin. No LD is recomputed.
     """
     data = _load_multiscale_ld_result(ld_decay_df)
     result = data.loc[data['BIN_LABEL'].isin(['30–50 Mb', '>50 Mb'])].copy()
@@ -2587,7 +2654,22 @@ def summarize_multiscale_ld_overflow(ld_decay_df):
 
 
 def summarize_ld_decay_thresholds(ld_decay_df, thresholds=(0.2, 0.1)):
-    """Read a DataFrame/CSV and return the first bin below each threshold; no interpolation."""
+    """Find the first observed distance bin below each mean r² threshold.
+
+    Parameters
+    ----------
+    ld_decay_df : pandas.DataFrame or str
+        Multiscale LD statistics or their saved CSV path.
+    thresholds : tuple of float
+        Absolute mean r² thresholds in (0, 1).
+
+    Returns
+    -------
+    pandas.DataFrame
+        CHROM, THRESHOLD, BIN_LEFT/RIGHT in bp, BIN_LABEL and STATUS.
+        Uses only finite means with positive pair counts; no interpolation.
+        Missing crossings retain NaN bounds and a diagnostic status.
+    """
     ld_decay_df = _load_multiscale_ld_result(ld_decay_df)
     rows = []
     for chr_id, curve in ld_decay_df.groupby('CHROM', sort=False, observed=True):
@@ -2612,11 +2694,26 @@ def summarize_ld_decay_thresholds(ld_decay_df, thresholds=(0.2, 0.1)):
 
 def plot_multiscale_ld_decay(ld_decay_df, *, figsize=(12, 9), save_fig_path=None,
                              ax=None):
-    """Plot bin means at equal spacing, labeled by distance-bin right edges.
+    """Plot chromosome-wise multiscale LD means at equal bin spacing.
 
-    Prepend (0, 1) for display only, as in plot_ld_decay; it is not an
-    observed pair and does not alter the data or threshold summaries.
-    The open-ended overflow bin retains the label '>50 MB'.
+    Parameters
+    ----------
+    ld_decay_df : pandas.DataFrame or str
+        Multiscale LD statistics or their saved CSV path.
+    figsize : tuple of float
+        Figure width and height in inches when creating a new axes.
+    save_fig_path : str or None
+        Optional figure path; an existing figure is overwritten.
+    ax : matplotlib.axes.Axes or None
+        Existing axes, or None to create a figure.
+
+    Returns
+    -------
+    tuple
+        Figure and axes. Horizontal spacing is not proportional to physical
+        distance; labels show bin right edges, with >50 MB for the final bin.
+        The (0, 1) origin is display-only and does not change input statistics
+        or threshold summaries. Applies shared style; no LD is recomputed.
     """
     ld_decay_df = _load_multiscale_ld_result(ld_decay_df)
     if ld_decay_df.empty or ld_decay_df.duplicated(['CHROM', 'BIN_LABEL']).any():
@@ -4674,7 +4771,7 @@ def calculate_contrast_ld_overlap(contrast_id, contrast_json, context_df, env_id
     results_pkl_file = os.path.join(
         output_dir, f"{contrast_id}_overlap_results.pkl")
 
-    if not have_file(results_pkl_file):
+    if not os.path.exists(results_pkl_file):
         enrich_data_df = build_enrich_data_df(
             context_df, contrast_json, env_id_list)
 

@@ -1,9 +1,10 @@
+import os
 import gzip
 from collections import OrderedDict
 from BCBio import GFF
 from pyfaidx import Fasta
 import re
-from .utils import cmd_run, have_file
+from .utils import cmd_run
 import pandas as pd
 
 
@@ -501,7 +502,7 @@ def read_gff_file(gff_file):
 
 def get_gene_range_df(gff_file):
     gene_range_csv = f'{gff_file}.GeneRange.csv'
-    if have_file(gene_range_csv):
+    if os.path.exists(gene_range_csv):
         gene_range_df = pd.read_csv(gene_range_csv)
     else:
         gene_dict = read_gff_file(gff_file)['gene']

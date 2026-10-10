@@ -13,10 +13,10 @@ Output matrices use:
     columns = relative window positions in transcription direction
 """
 
+import os
 import gzip
 import json
 from math import ceil
-from pathlib import Path
 
 import allel
 import numpy as np
@@ -519,8 +519,8 @@ def build_gene_info(
     from gene START/END according to transcription strand.
     """
     if output_file is not None:
-        output_file = Path(output_file)
-        if output_file.exists() and not overwrite:
+        output_file = os.fspath(output_file)
+        if os.path.exists(output_file) and not overwrite:
             return pd.read_hdf(output_file, key="gene_info")
 
     gene_range_df = get_gene_range_df(gff_file).copy()
@@ -579,7 +579,7 @@ def build_gene_info(
     ]
 
     if output_file is not None:
-        output_file.parent.mkdir(parents=True, exist_ok=True)
+        os.makedirs(os.path.dirname(output_file) or '.', exist_ok=True)
         gene_info.to_hdf(
             output_file,
             key="gene_info",
@@ -624,8 +624,8 @@ def _save_profile(
     extra_metadata=None,
 ):
     """Save one profile matrix and its basic calculation parameters."""
-    output_file = Path(output_file)
-    output_file.parent.mkdir(parents=True, exist_ok=True)
+    output_file = os.fspath(output_file)
+    os.makedirs(os.path.dirname(output_file) or '.', exist_ok=True)
 
     profile_df = profile_df.copy()
     profile_df.index.name = "gene_id"
@@ -720,16 +720,16 @@ def build_qre_profiles(
     overwrite=False,
 ):
     """Build TSS and TTS QRE databases for one GEA environment."""
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir = os.fspath(output_dir)
+    os.makedirs(output_dir, exist_ok=True)
 
     output_files = {}
 
     for anchor in ("TSS", "TTS"):
-        output_file = output_dir / f"{anchor}.QRE.{label}.h5"
+        output_file = os.path.join(output_dir, f'{anchor}.QRE.{label}.h5')
         output_files[anchor] = output_file
 
-        if output_file.exists() and not overwrite:
+        if os.path.exists(output_file) and not overwrite:
             continue
 
         anchor_df = make_anchor_table(gene_info, anchor)
@@ -771,16 +771,16 @@ def build_pi_profiles(
     overwrite=False,
 ):
     """Build TSS and TTS nucleotide-diversity databases."""
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir = os.fspath(output_dir)
+    os.makedirs(output_dir, exist_ok=True)
 
     output_files = {}
 
     for anchor in ("TSS", "TTS"):
-        output_file = output_dir / f"{anchor}.pi.h5"
+        output_file = os.path.join(output_dir, f'{anchor}.pi.h5')
         output_files[anchor] = output_file
 
-        if output_file.exists() and not overwrite:
+        if os.path.exists(output_file) and not overwrite:
             continue
 
         anchor_df = make_anchor_table(gene_info, anchor)
@@ -1042,16 +1042,16 @@ def build_ld_profiles(
     overwrite=False,
 ):
     """Build TSS and TTS anchor-window LD databases."""
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir = os.fspath(output_dir)
+    os.makedirs(output_dir, exist_ok=True)
 
     output_files = {}
 
     for anchor in ("TSS", "TTS"):
-        output_file = output_dir / f"{anchor}.LD.h5"
+        output_file = os.path.join(output_dir, f'{anchor}.LD.h5')
         output_files[anchor] = output_file
 
-        if output_file.exists() and not overwrite:
+        if os.path.exists(output_file) and not overwrite:
             continue
 
         anchor_df = make_anchor_table(gene_info, anchor)
@@ -1101,8 +1101,8 @@ def build_ld_profiles(
 def _load_intervals(bed_file):
     """Load a BED or gzipped BED file into chromosome-specific InterLap objects."""
     intervals = {}
-    bed_file = Path(bed_file)
-    opener = gzip.open if bed_file.suffix == ".gz" else open
+    bed_file = os.fspath(bed_file)
+    opener = gzip.open if os.path.splitext(bed_file)[1] == ".gz" else open
 
     with opener(bed_file, "rt") as handle:
         for line in handle:
@@ -1165,8 +1165,8 @@ def build_feature_profiles(
         1: the 500-bp window overlaps at least one feature
         0: no overlap
     """
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir = os.fspath(output_dir)
+    os.makedirs(output_dir, exist_ok=True)
 
     relative_positions = _relative_window_positions(
         flank,
@@ -1178,10 +1178,10 @@ def build_feature_profiles(
     output_files = {}
 
     for anchor in ("TSS", "TTS"):
-        output_file = output_dir / f"{anchor}.{track_name}.h5"
+        output_file = os.path.join(output_dir, f'{anchor}.{track_name}.h5')
         output_files[anchor] = output_file
 
-        if output_file.exists() and not overwrite:
+        if os.path.exists(output_file) and not overwrite:
             continue
 
         values = np.zeros(
@@ -1317,8 +1317,8 @@ def build_gene_profile_database(
     LD is supported as track="ld" but is intentionally not included in the
     default track tuple because it is substantially more expensive to build.
     """
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir = os.fspath(output_dir)
+    os.makedirs(output_dir, exist_ok=True)
 
     cfg = {
         track: values.copy()
@@ -1340,7 +1340,7 @@ def build_gene_profile_database(
             f"Unknown tracks: {sorted(unknown_tracks)}"
         )
 
-    gene_info_file = output_dir / "gene_info.h5"
+    gene_info_file = os.path.join(output_dir, 'gene_info.h5')
 
     gene_info = build_gene_info(
         gff_file,
@@ -1489,7 +1489,7 @@ def _get_plot_profile_path(profile_db, env_name, track, anchor):
 
     if track == "QRE":
         try:
-            return Path(profile_db["qre"][env_name][anchor])
+            return os.fspath(profile_db['qre'][env_name][anchor])
         except KeyError as exc:
             raise KeyError(
                 f"QRE profile for environment '{env_name}' and {anchor} is "
@@ -1498,7 +1498,7 @@ def _get_plot_profile_path(profile_db, env_name, track, anchor):
 
     output_key = {"pi": "pi", "ACR": "acr", "UMR": "umr", "LD": "ld"}[track]
     try:
-        return Path(profile_db[output_key][anchor])
+        return os.fspath(profile_db[output_key][anchor])
     except KeyError as exc:
         raise KeyError(
             f"{track} profile for {anchor} is not present in profile_db"
@@ -2129,7 +2129,7 @@ DEFAULT_PLOT_CONFIG = {
     # 只有 track_order 中加入 "high_effect_index" 才会使用
     #
     # "high_effect_index_csv":
-    #     project_dir / "high_effect_index.csv",
+    #     f"{project_dir}/high_effect_index.csv",
 
     "high_effect_color": "#5580B0",
 
@@ -2157,7 +2157,7 @@ DEFAULT_PLOT_CONFIG = {
     # ------------------------------------------------------------
     # Output
     # ------------------------------------------------------------
-    # "plot_output_dir": project_dir / "figures",
+    # "plot_output_dir": f"{project_dir}/figures",
 
     "save_fig": False,
     "show_fig": True,
@@ -2286,9 +2286,9 @@ def plot_env_tracks(
     )
 
     if save_path is None and plot_config.get("save_fig", True):
-        output_dir = Path(plot_config.get("plot_output_dir", "."))
-        output_dir.mkdir(parents=True, exist_ok=True)
-        save_path = output_dir / f"{env_name}.gene_profiles.pdf"
+        output_dir = os.fspath(plot_config.get('plot_output_dir', '.'))
+        os.makedirs(output_dir, exist_ok=True)
+        save_path = os.path.join(output_dir, f'{env_name}.gene_profiles.pdf')
 
     if plot_config.get("save_fig", True):
         save_kwargs = plot_config.get(
@@ -2305,16 +2305,16 @@ def plot_env_tracks(
 
 if __name__ == "__main__":
     # Example 1: build all gene-centered profile databases.
-    project_dir = Path("/path/to/project")
-    gff_file = project_dir / "genome.gff3"
-    vcf_file = project_dir / "genotype.vcf.gz"
-    acr_bed_file = project_dir / "ACR.bed.gz"
-    umr_bed_file = project_dir / "UMR.bed.gz"
-    output_dir = project_dir / "gene_profiles"
+    project_dir = '/path/to/project'
+    gff_file = os.path.join(project_dir, 'genome.gff3')
+    vcf_file = os.path.join(project_dir, 'genotype.vcf.gz')
+    acr_bed_file = os.path.join(project_dir, 'ACR.bed.gz')
+    umr_bed_file = os.path.join(project_dir, 'UMR.bed.gz')
+    output_dir = os.path.join(project_dir, 'gene_profiles')
 
     qre_sources = {
-        "bio18": project_dir / "bio18.gemma.gwas_df.h5",
-        "gsl": project_dir / "gsl.gemma.gwas_df.h5",
+        "bio18": os.path.join(project_dir, 'bio18.gemma.gwas_df.h5'),
+        "gsl": os.path.join(project_dir, 'gsl.gemma.gwas_df.h5'),
     }
 
     outputs = build_gene_profile_database(
@@ -2337,7 +2337,7 @@ if __name__ == "__main__":
         "profile_db": outputs,
         "track_order": ["pi", "ACR", "UMR", "LD"],
         "plot_xlim": (-5500, 5500),
-        "plot_output_dir": project_dir / "figures",
+        "plot_output_dir": os.path.join(project_dir, 'figures'),
         "fig_size": (11, 6.5),
         "qre_height_ratio": 3,
         "track_height_ratio": 1,
@@ -2380,7 +2380,7 @@ if __name__ == "__main__":
     fig, axes = plot_env_tracks(
         env_name="bio18",
         env_desc="Precipitation of Warmest Quarter",
-        magma_gwas_df_h5=project_dir / "bio18.magma.gwas_df.h5",
+        magma_gwas_df_h5=os.path.join(project_dir, 'bio18.magma.gwas_df.h5'),
         config=plot_config,
         top_gene_quantile=0.05,
         random_num=1000,

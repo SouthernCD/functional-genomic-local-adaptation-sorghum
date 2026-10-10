@@ -1,3 +1,4 @@
+import os
 """LD weighted coverage of a binary feature by top GEA sites.
 
 The genome-wide LD pairs are calculated in one call. Their high-LD
@@ -11,7 +12,6 @@ import gzip
 import json
 import multiprocessing as mp
 from datetime import datetime, timezone
-from pathlib import Path
 from time import perf_counter
 
 import numpy as np
@@ -115,7 +115,7 @@ class FEATURE_COVERAGE_JOB:
                  permutations=1000, pool_num=20, permutation_pool_num=None,
                  silence=True):
         self.input_vcf_file = str(input_vcf_file)
-        self.output_dir = Path(output_dir)
+        self.output_dir = os.fspath(output_dir)
         self.foreground_col = foreground_col
         self.env_id_list = list(env_id_list)
         self.stratify_ids = ['all'] + [x for x in (maf_stratify or []) if x != 'all']
@@ -200,8 +200,8 @@ class FEATURE_COVERAGE_JOB:
         }
 
     def _existing_result(self):
-        result_file = self.output_dir / 'feature_coverage.json.gz'
-        if not result_file.is_file():
+        result_file = os.path.join(self.output_dir, 'feature_coverage.json.gz')
+        if not os.path.isfile(result_file):
             return None
         try:
             with gzip.open(result_file, 'rt') as stream:
@@ -212,12 +212,13 @@ class FEATURE_COVERAGE_JOB:
         if not isinstance(result, dict):
             self._log('Existing result JSON has an invalid structure; rerunning')
             return None
-        settings_file = self.output_dir / 'feature_coverage.settings.json'
-        if not settings_file.is_file():
+        settings_file = os.path.join(self.output_dir, 'feature_coverage.settings.json')
+        if not os.path.isfile(settings_file):
             self._log('Existing result has no settings file; rerunning')
             return None
         try:
-            settings_record = json.loads(settings_file.read_text())
+            with open(settings_file) as stream:
+                settings_record = json.load(stream)
         except (OSError, UnicodeError, json.JSONDecodeError):
             self._log('Existing settings file is incomplete; rerunning')
             return None
@@ -234,16 +235,16 @@ class FEATURE_COVERAGE_JOB:
                 f'Existing feature coverage results in {self.output_dir} have '
                 f'different settings: {", ".join(mismatches)}. '
                 'Choose another output_dir to run this configuration.')
-        expected_files = [self.output_dir / 'report.md']
+        expected_files = [os.path.join(self.output_dir, 'report.md')]
         for stratify_id in self.stratify_ids:
-            context_dir = self.output_dir / stratify_id
+            context_dir = os.path.join(self.output_dir, stratify_id)
             expected_files.extend([
-                context_dir / 'feature.LD_blocks.tsv.gz',
-                context_dir / 'feature_block_score.summary.tsv',
-                *(context_dir / f'{env}.feature_block_scores.tsv.gz'
+                os.path.join(context_dir, 'feature.LD_blocks.tsv.gz'),
+                os.path.join(context_dir, 'feature_block_score.summary.tsv'),
+                *(os.path.join(context_dir, f'{env}.feature_block_scores.tsv.gz')
                   for env in self.env_id_list),
             ])
-        complete = (all(path.is_file() and path.stat().st_size > 0
+        complete = (all(os.path.isfile(path) and os.stat(path).st_size > 0
                         for path in expected_files)
                     and set(result) == set(self.stratify_ids))
         for stratify_id in self.stratify_ids:
@@ -349,8 +350,8 @@ class FEATURE_COVERAGE_JOB:
         graph = context['graph']
         site_max = context['site_max']
         top_masks = context['top_masks']
-        context_dir = self.output_dir / stratify_id
-        context_dir.mkdir(parents=True, exist_ok=True)
+        context_dir = os.path.join(self.output_dir, stratify_id)
+        os.makedirs(context_dir, exist_ok=True)
         representatives = _blocks(foreground, graph)
         block_ids, inverse, counts, scores_by_env = _scores(representatives, site_max)
         if not len(block_ids):
@@ -362,7 +363,7 @@ class FEATURE_COVERAGE_JOB:
             'POS': frame.POS.iloc[selected_rows].to_numpy(),
             'feature_block_id': inverse,
             'representative_ID': frame.ID.iloc[block_ids[inverse]].to_numpy(),
-        }).to_csv(context_dir / 'feature.LD_blocks.tsv.gz', sep='\t',
+        }).to_csv(os.path.join(context_dir, 'feature.LD_blocks.tsv.gz'), sep='\t',
                   index=False, compression='gzip')
         observed, summaries = {}, []
         for env_idx, env in enumerate(self.env_id_list):
@@ -377,7 +378,7 @@ class FEATURE_COVERAGE_JOB:
             })
             for threshold in self.coverage_r2_thresholds:
                 block_df[f'hit_r2_{threshold:g}'] = scores >= threshold
-            block_df.to_csv(context_dir / f'{env}.feature_block_scores.tsv.gz',
+            block_df.to_csv(os.path.join(context_dir, f'{env}.feature_block_scores.tsv.gz'),
                             sep='\t', index=False, compression='gzip')
             record = {
                 'STRATIFY_ID': stratify_id, 'ENV': env,
@@ -446,9 +447,9 @@ class FEATURE_COVERAGE_JOB:
         if existing is not None:
             print(f'Feature coverage results already exist in {self.output_dir}; '
                   'skipping run.', flush=True)
-            result_file = self.output_dir / 'feature_coverage.json.gz'
+            result_file = os.path.join(self.output_dir, 'feature_coverage.json.gz')
             return result_file
-        self.output_dir.mkdir(parents=True, exist_ok=True)
+        os.makedirs(self.output_dir, exist_ok=True)
         self._log(f'Starting {self.foreground_col}: '
                   f'{len(self.site_info_df):,} sites, '
                   f'{int(self.foreground.sum()):,} foreground sites')
@@ -474,7 +475,7 @@ class FEATURE_COVERAGE_JOB:
                 self._log(f'{stratify_id}/{env}: empirical P = '
                           f'{stat[env]["pval"]:.6g}')
             pd.DataFrame(summaries).to_csv(
-                self.output_dir / stratify_id / 'feature_block_score.summary.tsv',
+                os.path.join(os.path.join(self.output_dir, stratify_id), 'feature_block_score.summary.tsv'),
                 sep='\t', index=False)
             all_summaries.extend(summaries)
             # Match the result schema returned by enrichment_permutation_analysis.
@@ -486,7 +487,7 @@ class FEATURE_COVERAGE_JOB:
             }
             del context['graph'], context['site_max']
         summary = pd.DataFrame(all_summaries)
-        summary.to_csv(self.output_dir / 'feature_block_score.summary.tsv',
+        summary.to_csv(os.path.join(self.output_dir, 'feature_block_score.summary.tsv'),
                        sep='\t', index=False)
         report = [
             f'# Feature coverage: {self.foreground_col}', '',
@@ -508,15 +509,16 @@ class FEATURE_COVERAGE_JOB:
             '## Results', '', summary.to_string(index=False), '',
             'Empirical two-sided P values use inclusive tails and a +1 correction.',
         ]
-        (self.output_dir / 'report.md').write_text('\n'.join(report) + '\n')
+        with open(f'{self.output_dir}/report.md', 'w') as stream:
+            stream.write('\n'.join(report) + '\n')
         settings = {**self._result_settings(), 'input_vcf_file': self.input_vcf_file}
-        (self.output_dir / 'feature_coverage.settings.json').write_text(
-            json.dumps(settings, indent=2) + '\n')
-        result_file = self.output_dir / 'feature_coverage.json.gz'
-        temporary_result_file = self.output_dir / 'feature_coverage.json.gz.tmp'
+        with open(f'{self.output_dir}/feature_coverage.settings.json', 'w') as stream:
+            stream.write(json.dumps(settings, indent=2) + '\n')
+        result_file = os.path.join(self.output_dir, 'feature_coverage.json.gz')
+        temporary_result_file = os.path.join(self.output_dir, 'feature_coverage.json.gz.tmp')
         with gzip.open(temporary_result_file, 'wt') as stream:
             json.dump(results, stream, indent=2)
-        temporary_result_file.replace(result_file)
+        os.replace(temporary_result_file, result_file)
         self._log(f'Finished in {perf_counter() - run_start:.1f}s; '
                   f'outputs: {self.output_dir}')
         return result_file
