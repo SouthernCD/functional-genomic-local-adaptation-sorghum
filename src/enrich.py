@@ -380,18 +380,23 @@ def build_enrich_data_df(context_df, contrast_json, env_id_list, other_columns=[
     return enrich_data_df
 
 
-def site_contrast_runner(contrast_id, contrast_json, context_df, env_id_list, output_dir, permutations=1000, top_percent=0.05, pool_num=40):
+def site_contrast_runner(contrast_id, contrast_json, context_df, env_id_list, output_dir, permutations=1000, top_percent=0.05, pool_num=40, force_recompute=False):
 
     results_json_file = os.path.join(
         output_dir, f"{contrast_id}.enrichment.json.gz")
-    reuse_result = os.path.exists(results_json_file)
+    reuse_result = not force_recompute and os.path.exists(results_json_file)
     if reuse_result:
         try:
             with gzip.open(results_json_file, 'rt', encoding='utf-8') as f:
                 existing_results = json.load(f)
             reuse_result = (isinstance(existing_results, dict) and
+                            set(existing_results) == set(['all'] + [
+                                s for s in contrast_json.get('maf_stratify', []) if s != 'all']) and
                             all(isinstance(result, dict) and
-                                result.get('permutation_scheme') == CHROMOSOME_PERMUTATION_SCHEME
+                                result.get('permutation_scheme') == CHROMOSOME_PERMUTATION_SCHEME and
+                                result.get('permutations') == permutations and
+                                result.get('top_percent') == top_percent and
+                                result.get('env_id_list') == list(env_id_list)
                                 for result in existing_results.values()))
         except (OSError, EOFError, UnicodeError, json.JSONDecodeError):
             reuse_result = False
@@ -419,8 +424,10 @@ def site_contrast_runner(contrast_id, contrast_json, context_df, env_id_list, ou
 
         json_file = os.path.join(
             output_dir, f"{contrast_id}.enrichment.json.gz")
-        with gzip.open(json_file, 'wt', encoding='utf-8') as f:
+        temporary_file = f'{json_file}.tmp'
+        with gzip.open(temporary_file, 'wt', encoding='utf-8') as f:
             json.dump(enrich_results_json, f, indent=4)
+        os.replace(temporary_file, json_file)
     else:
         print(
             f"Enrichment results already exist for contrast {contrast_id}, skipping.")
@@ -438,7 +445,7 @@ def get_jaccard(set1_mask, set2_mask):
     return intersection / union
 
 
-def gene_contrast_runner(contrast_id, contrast_json, context_df, env_id_list, output_dir, permutations=1000, top_percent=0.05):
+def gene_contrast_runner(contrast_id, contrast_json, context_df, env_id_list, output_dir, permutations=1000, top_percent=0.05, seed=42):
     """Test gene-set overlap using chromosome-local shifts on per-environment backgrounds.
 
     Each background excludes missing scores, target labels, and coordinates, and
@@ -448,6 +455,8 @@ def gene_contrast_runner(contrast_id, contrast_json, context_df, env_id_list, ou
         raise ValueError("top_percent must be in (0, 1]")
     if permutations < 1:
         raise ValueError("permutations must be positive")
+    if not isinstance(seed, int):
+        raise ValueError("seed must be an integer")
     env_id_list = list(env_id_list)
     target = contrast_json["target"]
     results_json_file = os.path.join(
@@ -493,7 +502,7 @@ def gene_contrast_runner(contrast_id, contrast_json, context_df, env_id_list, ou
         obs_value = get_jaccard(target_mask, env_top_mask)
         perm_values = [
             get_jaccard(permute_array_within_chromosomes(
-                target_mask, chrom_slices, seed=perm_id), env_top_mask)
+                target_mask, chrom_slices, seed=seed + perm_id * 10000), env_top_mask)
             for perm_id in range(permutations)
         ]
         results_json['obs_values'][env_id] = obs_value
@@ -1817,6 +1826,7 @@ def plot_enrichment_and_overlap(
     # ============================================================
     show=True,
     return_fig_ax=True,
+    apply_style=True,
 ):
     """
     Combined figure:
@@ -1831,6 +1841,8 @@ def plot_enrichment_and_overlap(
     The default appearance is optimized for a manuscript-style
     4-panel figure, but most style parameters remain configurable.
 
+    Set apply_style=False to retain the notebook initialization style.
+
     Returns
     -------
     fig, axes
@@ -1843,7 +1855,8 @@ def plot_enrichment_and_overlap(
     # ============================================================
     # Global style
     # ============================================================
-    set_plot_style()
+    if apply_style:
+        set_plot_style()
 
     n_env = len(env_id_list)
 
@@ -2510,3 +2523,112 @@ def plot_enrichment_and_overlap(
 
     if return_fig_ax:
         return fig, axes
+
+
+def plot_gene_enrichment_histogram(results_json_file, env_id_list, env_metadata_df,
+                                    output_prefix=None, bins=30, figsize=None,
+                                    title_width=20, title_fontsize=13,
+                                    label_fontsize=11, annotation_fontsize=10,
+                                    wspace=0.15):
+    """Display a single gene-set enrichment as per-environment null histograms.
+
+    Parameters
+    ----------
+    results_json_file : str
+        Existing gene_contrast_runner JSON.gz. Read raw observed/permutation
+        Jaccard overlaps and the saved two-sided empirical P values under 'all'.
+        This function does not run permutations or recalculate significance.
+    env_id_list : sequence of str
+        Environmental IDs in display order.
+    env_metadata_df : pandas.DataFrame
+        Unique env_id values and description labels for the panel titles.
+    output_prefix : str or None
+        When provided, save PDF, 300 dpi PNG, actual observed/permutation values
+        in .csv.gz and displayed histogram edges/densities in .histogram.csv.gz.
+    bins : int, sequence or str
+        NumPy/Matplotlib histogram bins; default 30 bins per environment.
+        Each panel retains its own range; density normalization is unchanged.
+    figsize : tuple or None
+        Inches; default (2.5 * number of environments, 2.8).
+    title_width : int
+        Wrap descriptive panel titles at this width.
+    title_fontsize, label_fontsize, annotation_fontsize : float
+        Panel title, axis label and P-value font sizes.
+    wspace : float
+        Fractional horizontal gap between panels sharing the density axis.
+
+    Returns
+    -------
+    dict
+        figure, axes, plot_data, histogram_data and exported files. Raw Jaccard
+        values define the x axis; null densities are light blue with black edges,
+        and red dashed vertical lines indicate observed overlaps. Shared y limits
+        leave 20% headroom above the tallest histogram. Titles italicize
+        Striga. Shared plotting defaults are retained; does not call show.
+    """
+    import textwrap
+
+    with gzip.open(results_json_file, 'rt', encoding='utf-8') as handle:
+        result = json.load(handle)['all']
+    env_id_list = list(env_id_list)
+    metadata = env_metadata_df.set_index('env_id')
+    if not metadata.index.is_unique:
+        raise ValueError('Environmental IDs must be unique for histogram labels.')
+    if figsize is None:
+        figsize = (2.5 * len(env_id_list), 2.8)
+    fig, axes = plt.subplots(1, len(env_id_list), figsize=figsize, sharey=True, squeeze=False)
+    axes = axes[0]
+    plot_frames, histogram_frames = [], []
+    for ax, env_id in zip(axes, env_id_list):
+        observed = float(result['obs_values'][env_id])
+        permutations = np.asarray(result['perm_values'][env_id], dtype=float)
+        p_value = float(result['stat'][env_id]['pval'])
+        densities, edges = np.histogram(permutations, bins=bins, density=True)
+        ax.hist(permutations, bins=edges, density=True, color='lightblue',
+                edgecolor='black', linewidth=0.7)
+        ax.axvline(observed, color='red', linestyle='dashed', linewidth=1.8)
+        significant = p_value < 0.05
+        p_label = (fr'$\mathbfit{{P}}\mathbf{{ = {p_value:.3f}}}$ *' if significant
+                   else fr'$P = {p_value:.3f}$')
+        ax.text(0.05, 0.92, p_label, transform=ax.transAxes,
+                fontsize=annotation_fontsize, color='black', ha='left', va='top',
+                fontweight='bold' if significant else 'normal')
+        title = '\n'.join(textwrap.wrap(str(metadata.loc[env_id, 'description']), width=title_width))
+        if env_id in ['striga', 'striga_crop']:
+            title = title.replace('Striga', r'$Striga$')
+        ax.set_title(title, fontsize=title_fontsize, pad=12)
+        ax.set_xlabel('Jaccard index', fontsize=label_fontsize)
+        ax.tick_params(axis='both', labelsize=label_fontsize - 1)
+        plot_frames.append(pd.DataFrame({
+            'env_id': env_id, 'description': metadata.loc[env_id, 'description'],
+            'point_type': ['observed'] + ['permutation'] * len(permutations),
+            'permutation_id': [-1] + list(range(len(permutations))),
+            'JACCARD': np.concatenate(([observed], permutations)),
+            'P_VALUE': p_value, 'P_VALUE_METHOD': 'two_sided_empirical',
+        }))
+        histogram_frames.append(pd.DataFrame({
+            'env_id': env_id, 'BIN_LEFT': edges[:-1], 'BIN_RIGHT': edges[1:],
+            'DENSITY': densities, 'COUNT': np.histogram(permutations, bins=edges)[0],
+        }))
+    # Set the shared limits only after all panels have contributed their peaks.
+    peak_density = max(frame['DENSITY'].max() for frame in histogram_frames)
+    axes[0].set_ylim(0, peak_density * 1.2 if peak_density > 0 else 1)
+    axes[0].set_ylabel('Density', fontsize=label_fontsize)
+    fig.tight_layout()
+    fig.subplots_adjust(wspace=wspace)
+    plot_data = pd.concat(plot_frames, ignore_index=True)
+    histogram_data = pd.concat(histogram_frames, ignore_index=True)
+    files = {}
+    if output_prefix is not None:
+        os.makedirs(os.path.dirname(os.path.abspath(output_prefix)), exist_ok=True)
+        files = {kind: f'{output_prefix}.{extension}' for kind, extension in
+                 [('pdf', 'pdf'), ('png', 'png'), ('csv', 'csv.gz'),
+                  ('histogram_csv', 'histogram.csv.gz')]}
+        fig.savefig(files['pdf'], facecolor='none', edgecolor='none', bbox_inches='tight')
+        fig.savefig(files['png'], dpi=300, bbox_inches='tight')
+        plot_data.to_csv(files['csv'], index=False, compression='gzip')
+        histogram_data.to_csv(files['histogram_csv'], index=False, compression='gzip')
+        print(f'Figure and data: {output_prefix}.{{pdf,png,csv.gz,histogram.csv.gz}}')
+    return {'figure': fig, 'axes': axes, 'plot_data': plot_data,
+            'histogram_data': histogram_data, 'files': files}
+

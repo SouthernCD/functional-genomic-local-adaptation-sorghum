@@ -2153,3 +2153,536 @@ def save_context_table(table_df, output_file):
     os.replace(temporary_file, output_file)
     print(f'[{datetime.now():%H:%M:%S}] Saved: {output_file}; shape={table_df.shape}', flush=True)
     return output_file
+
+
+# Genomic feature and environmental association landscapes.
+
+def _landscape_windows(track_df, window_size):
+    """Select and validate complete, ordered reference-length chromosome bins."""
+    chromosomes = [f'Chr{i:02d}' for i in range(1, 11)]
+    windows = track_df.loc[track_df['CHROM'].isin(chromosomes), ['CHROM', 'START', 'END']].copy()
+    windows = windows.sort_values(['CHROM', 'START']).reset_index(drop=True)
+    if windows.duplicated(['CHROM', 'START', 'END']).any():
+        raise ValueError('Duplicate landscape windows would make alignment ambiguous.')
+    if set(windows['CHROM']) != set(chromosomes):
+        raise ValueError('Landscape inputs must contain Chr01 through Chr10.')
+    for chrom, frame in windows.groupby('CHROM', sort=False):
+        starts, ends = frame['START'].to_numpy(), frame['END'].to_numpy()
+        if not np.array_equal(starts, 1 + np.arange(len(frame)) * window_size):
+            raise ValueError(f'Windows on {chrom} must be consecutive {window_size} bp bins.')
+        if (ends < starts).any() or (ends - starts + 1 > window_size).any():
+            raise ValueError(f'Invalid window boundaries on {chrom}.')
+        if not np.array_equal(ends[:-1], starts[1:] - 1):
+            raise ValueError(f'Nonterminal windows on {chrom} must have full width.')
+    return windows
+
+
+def _landscape_zscore(values):
+    """Standardize finite values with population SD, retaining missing values."""
+    values = np.asarray(values, dtype=float)
+    result = np.full(values.shape, np.nan)
+    valid = np.isfinite(values)
+    if valid.any():
+        std = values[valid].std(ddof=0)
+        result[valid] = (values[valid] - values[valid].mean()) / std if std > 0 else 0
+    return result
+
+
+def _save_landscape_csv(frame, file_path):
+    """Publish a complete small table by atomic replacement."""
+    temporary_file = f'{file_path}.tmp'
+    frame.to_csv(temporary_file, index=False, compression='gzip')
+    os.replace(temporary_file, file_path)
+
+
+def _landscape_counts(frame, positions, columns, windows, window_size):
+    """Count boolean categories, retaining NaN in bins without background objects."""
+    selected = frame.loc[frame['CHROM'].isin(windows['CHROM']), ['CHROM'] + columns].copy()
+    selected_positions = positions.loc[selected.index].to_numpy()
+    chromosome_ends = windows.groupby('CHROM')['END'].max()
+    if (not np.isfinite(selected_positions).all() or (selected_positions < 1).any()
+            or (selected_positions > selected['CHROM'].map(chromosome_ends).to_numpy()).any()):
+        raise ValueError('Context coordinates fall outside reference chromosome bounds.')
+    selected['START'] = ((selected_positions - 1) // window_size) * window_size + 1
+    groups = selected.groupby(['CHROM', 'START'], sort=False)
+    counts = groups[columns].sum().reindex(pd.MultiIndex.from_frame(windows[['CHROM', 'START']]))
+    background = groups.size().reindex(counts.index)
+    counts.loc[background.isna(), :] = np.nan
+    # A coordinate beyond the last reference bin must not silently disappear.
+    if not groups.size().index.isin(counts.index).all():
+        raise ValueError('Context coordinates fall outside the landscape windows.')
+    return counts.reset_index(drop=True)
+
+
+def prepare_genomic_feature_landscape(track_data_csv, gene_contexts_h5, site_contexts_h5,
+                                      flowering_genes_csv, output_prefix,
+                                      window_size=1_000_000, force_recompute=False):
+    """Prepare raw and standardized feature tracks and cloned-gene markers.
+
+    Workflow
+    --------
+    1. Reuse a complete output set, unless force_recompute is requested.
+    2. Read existing 02 landscape fractions and population statistics unchanged.
+    3. Count gene classes by midpoint and QC site classes by position.
+    4. Match Cloned=1 genes to body coordinates and mark every overlapping bin.
+    5. Standardize each feature across all plotted bins and save small CSVs.
+
+    Parameters
+    ----------
+    track_data_csv : str
+        Existing 02 genome tracks CSV.gz with CHROM/START/END, GENIC_FRACTION,
+        TE_FRACTION, ACR_FRACTION, UMR_FRACTION, VARIANT_COUNT, MAF, PI and
+        meanCmPerMb. Population statistics and BED coordinates are not recalculated.
+    gene_contexts_h5, site_contexts_h5 : str
+        Project context HDF files, key 'df'. Genes use ID/CHROM/START/END;
+        QC sites use CHROM/POS and boolean context columns. Coordinates are
+        1-based inclusive. Conservation counts are restricted to genic_15kb.
+    flowering_genes_csv : str
+        Source CSV containing unique Gene_IDs, Gene Name and binary Cloned.
+        Only Cloned=1 bodies, without flanks, generate markers.
+    output_prefix : str
+        Saves .features.csv.gz, .cloned_genes.csv.gz and .cloned_bins.csv.gz.
+    window_size : int
+        Existing track resolution, default 1 Mb; retain Chr01 through Chr10.
+    force_recompute : bool
+        Rebuild all feature outputs. Reuse assumes inputs/parameters have not
+        changed; explicitly recompute after changing contexts or the cloned list.
+
+    Returns
+    -------
+    dict
+        features, cloned_genes, cloned_bins DataFrames and files mapping.
+        Features contain PANEL/GROUP/TRACK/LABEL, coordinates, RAW_VALUE and
+        Z_SCORE. Empty category backgrounds are NaN; present backgrounds with
+        no category members are zero. Constant finite tracks standardize to zero.
+        Reads context tables one at a time; writes outputs atomically per file.
+    """
+    from time import perf_counter
+
+    started = perf_counter()
+    files = {name: f'{output_prefix}.{name}.csv.gz'
+             for name in ['features', 'cloned_genes', 'cloned_bins']}
+    if not force_recompute and all(os.path.exists(path) for path in files.values()):
+        print(f'[{datetime.now():%H:%M:%S}] Reusing feature landscape: {output_prefix}', flush=True)
+        return {**{name: pd.read_csv(path) for name, path in files.items()}, 'files': files}
+    os.makedirs(os.path.dirname(os.path.abspath(output_prefix)), exist_ok=True)
+    print(f'[{datetime.now():%H:%M:%S}] Preparing feature landscape', flush=True)
+    track_df = pd.read_csv(track_data_csv)
+    windows = _landscape_windows(track_df, window_size)
+    aligned = windows.merge(track_df, on=['CHROM', 'START', 'END'], validate='one_to_one')
+    specs = [
+        ('main', 'Genomic structure', 'GENIC_FRACTION', 'Genic', 'Oranges'),
+        ('main', 'Genomic structure', 'TE_FRACTION', 'TEs', 'Oranges'),
+        ('main', 'Epigenomic features', 'ACR_FRACTION', 'ACRs', 'Reds'),
+        ('main', 'Epigenomic features', 'UMR_FRACTION', 'UMRs', 'Reds'),
+        ('main', 'Gene expression', 'no_expression_genes', 'Genes with no detected expr.', 'Blues'),
+        ('main', 'Gene expression', 'high_variance_genes', 'Genes with high var. expr.', 'Blues'),
+        ('main', 'Gene expression', 'stably_expressed_genes', 'Genes with stable expr.', 'Blues'),
+        ('main', 'Gene regulatory networks', 'non_module_genes', 'Non-module gene', 'Greens'),
+        ('main', 'Gene regulatory networks', 'module_genes', 'Module gene', 'Greens'),
+        ('main', 'Gene regulatory networks', 'module_hub_genes', 'Module hub', 'Greens'),
+        ('main', 'riboSNitches', 'riboSNitch', 'riboSNitches', 'Purples'),
+        ('supp', 'Recombination rate', 'meanCmPerMb', 'Recombination', 'Oranges'),
+        ('supp', 'Population genetic', 'VARIANT_COUNT', '#Variants', 'YlOrBr'),
+        ('supp', 'Population genetic', 'MAF', 'MAF', 'YlOrBr'),
+        ('supp', 'Population genetic', 'PI', 'π', 'YlOrBr'),
+        ('supp', 'Phylogenetic conservation', 'non_CEs', 'Non-evaluable', 'BuGn'),
+        ('supp', 'Phylogenetic conservation', 'accelerated_sites', 'Accelerated', 'BuGn'),
+        ('supp', 'Phylogenetic conservation', 'neutral_sites', 'Neutral', 'BuGn'),
+        ('supp', 'Phylogenetic conservation', 'conserved_sites', 'Conserved', 'BuGn'),
+    ]
+    raw = {name: aligned[name].to_numpy() for name in
+           ['GENIC_FRACTION', 'TE_FRACTION', 'ACR_FRACTION', 'UMR_FRACTION',
+            'meanCmPerMb', 'VARIANT_COUNT', 'MAF', 'PI']}
+    gene_df = pd.read_hdf(gene_contexts_h5, key='df')
+    gene_columns = [spec[2] for spec in specs[4:10]]
+    gene_counts = _landscape_counts(gene_df, (gene_df['START'] + gene_df['END']) // 2,
+                                    gene_columns, windows, window_size)
+    raw.update({name: gene_counts[name].to_numpy() for name in gene_columns})
+    flowering_df = pd.read_csv(flowering_genes_csv)
+    if not flowering_df['Cloned'].isin([0, 1]).all():
+        raise ValueError('Cloned must contain only 0 or 1.')
+    cloned = flowering_df.loc[flowering_df['Cloned'].eq(1), ['Gene_ID', 'Gene Name']]
+    if cloned['Gene_ID'].duplicated().any() or gene_df['ID'].duplicated().any():
+        raise ValueError('Duplicate gene IDs make cloned-coordinate matching ambiguous.')
+    cloned = cloned.merge(gene_df[['ID', 'CHROM', 'START', 'END']], left_on='Gene_ID',
+                          right_on='ID', how='left', validate='one_to_one').drop(columns='ID')
+    if (cloned[['CHROM', 'START', 'END']].isna().any().any()
+            or (cloned['START'] < 1).any() or (cloned['START'] > cloned['END']).any()
+            or not cloned['CHROM'].isin(windows['CHROM']).all()):
+        raise ValueError('Every cloned gene must match valid plotted gene coordinates.')
+    chromosome_ends = windows.groupby('CHROM')['END'].max()
+    if (cloned['END'] > cloned['CHROM'].map(chromosome_ends)).any():
+        raise ValueError('Cloned gene coordinates exceed reference chromosome bounds.')
+    cloned_bins = windows.copy()
+    overlaps = []
+    for row in windows.itertuples(index=False):
+        matches = cloned.loc[(cloned['CHROM'] == row.CHROM)
+                             & (cloned['START'] <= row.END) & (cloned['END'] >= row.START), 'Gene_ID']
+        overlaps.append(';'.join(matches))
+    cloned_bins['GENE_IDS'] = overlaps
+    cloned_bins['IS_CLONED'] = cloned_bins['GENE_IDS'].ne('').astype(int)
+    matched_ids = set(';'.join(overlaps).split(';')) - {''}
+    if matched_ids != set(cloned['Gene_ID']):
+        raise ValueError('Some cloned genes do not overlap any reference window.')
+    del gene_df, gene_counts
+    print(f'[{datetime.now():%H:%M:%S}] Counting QC site contexts', flush=True)
+    site_df = pd.read_hdf(site_contexts_h5, key='df')
+    site_counts = _landscape_counts(site_df, site_df['POS'], ['riboSNitch'], windows, window_size)
+    raw['riboSNitch'] = site_counts['riboSNitch'].to_numpy()
+    conservation_columns = [spec[2] for spec in specs[-4:]]
+    genic_sites = site_df.loc[site_df['genic_15kb']]
+    conservation_counts = _landscape_counts(genic_sites, genic_sites['POS'],
+                                            conservation_columns, windows, window_size)
+    raw.update({name: conservation_counts[name].to_numpy() for name in conservation_columns})
+    del site_df, genic_sites, site_counts, conservation_counts
+    feature_frames = []
+    for order, (panel, group, track, label, cmap) in enumerate(tqdm(specs, desc='Preparing feature tracks', unit='track')):
+        frame = windows.copy()
+        frame['PANEL'], frame['GROUP'], frame['TRACK'] = panel, group, track
+        frame['LABEL'], frame['CMAP'], frame['TRACK_ORDER'] = label, cmap, order
+        frame['RAW_VALUE'] = raw[track]
+        frame['Z_SCORE'] = _landscape_zscore(raw[track])
+        feature_frames.append(frame)
+    features = pd.concat(feature_frames, ignore_index=True)
+    result = {'features': features, 'cloned_genes': cloned, 'cloned_bins': cloned_bins}
+    for name, frame in result.items():
+        _save_landscape_csv(frame, files[name])
+    print(f'[{datetime.now():%H:%M:%S}] Saved {len(windows):,} bins, {len(specs)} tracks and '
+          f'{len(cloned)} cloned genes ({perf_counter() - started:.1f}s): {output_prefix}', flush=True)
+    return {**result, 'files': files}
+
+
+def prepare_gea_landscape(track_data_csv, gwas_dir, environment_metadata_csv,
+                          output_prefix, window_size=1_000_000, top_fraction=0.05,
+                          force_recompute=False):
+    """Prepare top-association hypergeometric enrichment on landscape bins.
+
+    Parameters
+    ----------
+    track_data_csv : str
+        Existing 02 genome tracks defining the complete reference-length bins.
+    gwas_dir : str
+        Genome-wide GEMMA root. Results are read from
+        {gwas_dir}/{env_id}/{env_id}.gemma/{env_id}.gemma.gwas_df.h5, key 'df'.
+        Required fields are CHROM/POS/P_VALUE (the project's Wald P values).
+    environment_metadata_csv : str
+        Source metadata with unique env_id values; all listed variables are used.
+    output_prefix : str
+        Save .gea.csv.gz with env_id, coordinates, N_TESTED, N_TOP, TOTAL_TESTED,
+        TOTAL_TOP, TOP_P_THRESHOLD, P_VALUE and NEG_LOG10_P.
+    window_size : int
+        Existing track resolution, default 1 Mb.
+    top_fraction : float
+        Genome-wide P-value quantile, default 0.05; include ties. The background
+        is all rows of each association table, including unplotted sequences.
+    force_recompute : bool
+        Rebuild the result. Cached inputs/parameters are assumed unchanged;
+        explicitly recompute after changing GWAS inputs or top_fraction.
+
+    Returns
+    -------
+    dict
+        gea DataFrame and files mapping. Process one environmental table at a
+        time with progress; save once after all variables finish. Empty bins
+        have P=1. Zero P values map to NEG_LOG10_P=500. No GWAS is launched.
+
+    Workflow
+    --------
+    Read the existing window grid, select top sites per environment, count
+    tested/top sites in each bin, evaluate hypergeom.sf(k-1, M, K, n), and save.
+    """
+    from scipy.stats import hypergeom
+    from time import perf_counter
+
+    output_file = f'{output_prefix}.gea.csv.gz'
+    if not force_recompute and os.path.exists(output_file):
+        print(f'[{datetime.now():%H:%M:%S}] Reusing GEA landscape: {output_file}', flush=True)
+        return {'gea': pd.read_csv(output_file), 'files': {'gea': output_file}}
+    if not 0 < top_fraction < 1:
+        raise ValueError('top_fraction must be between zero and one.')
+    started = perf_counter()
+    windows = _landscape_windows(pd.read_csv(track_data_csv), window_size)
+    metadata = pd.read_csv(environment_metadata_csv)
+    if metadata['env_id'].duplicated().any():
+        raise ValueError('Environmental IDs must be unique.')
+    window_index = pd.MultiIndex.from_frame(windows[['CHROM', 'START']])
+    frames = []
+    for env_id in tqdm(metadata['env_id'], desc='Summarizing GEA enrichment', unit='environment'):
+        file_path = f'{gwas_dir}/{env_id}/{env_id}.gemma/{env_id}.gemma.gwas_df.h5'
+        gwas = pd.read_hdf(file_path, key='df')[['CHROM', 'POS', 'P_VALUE']]
+        if gwas.empty or not np.isfinite(gwas['P_VALUE']).all() or not gwas['P_VALUE'].between(0, 1).all():
+            raise ValueError(f'GWAS P values for {env_id} must be finite and in [0, 1].')
+        threshold = gwas['P_VALUE'].quantile(top_fraction)
+        gwas['IS_TOP'] = gwas['P_VALUE'].le(threshold)
+        total_tested, total_top = len(gwas), int(gwas['IS_TOP'].sum())
+        plotted = gwas.loc[gwas['CHROM'].isin(windows['CHROM'])].copy()
+        chromosome_ends = windows.groupby('CHROM')['END'].max()
+        if (not np.isfinite(plotted['POS']).all() or (plotted['POS'] < 1).any()
+                or (plotted['POS'] > plotted['CHROM'].map(chromosome_ends)).any()):
+            raise ValueError(f'GWAS coordinates for {env_id} exceed reference chromosome bounds.')
+        plotted['START'] = ((plotted['POS'] - 1) // window_size) * window_size + 1
+        grouped = plotted.groupby(['CHROM', 'START']).agg(N_TESTED=('POS', 'size'), N_TOP=('IS_TOP', 'sum'))
+        if not grouped.index.isin(window_index).all():
+            raise ValueError(f'GWAS coordinates for {env_id} fall outside reference windows.')
+        counts = grouped.reindex(window_index, fill_value=0)
+        frame = windows.copy()
+        frame['env_id'] = env_id
+        frame[['N_TESTED', 'N_TOP']] = counts[['N_TESTED', 'N_TOP']].to_numpy(dtype=int)
+        frame['TOTAL_TESTED'], frame['TOTAL_TOP'] = total_tested, total_top
+        frame['TOP_P_THRESHOLD'] = threshold
+        frame['P_VALUE'] = hypergeom.sf(frame['N_TOP'] - 1, total_tested, total_top, frame['N_TESTED'])
+        pvalues = frame['P_VALUE'].to_numpy()
+        transformed = np.full(len(frame), 500.0)
+        positive = pvalues > 0
+        transformed[positive] = -np.log10(pvalues[positive])
+        frame['NEG_LOG10_P'] = np.maximum(transformed, 0)
+        frames.append(frame)
+        del gwas, plotted, grouped, counts
+    gea = pd.concat(frames, ignore_index=True)
+    os.makedirs(os.path.dirname(os.path.abspath(output_prefix)), exist_ok=True)
+    _save_landscape_csv(gea, output_file)
+    print(f'[{datetime.now():%H:%M:%S}] Saved GEA landscape ({perf_counter() - started:.1f}s): {output_file}', flush=True)
+    return {'gea': gea, 'files': {'gea': output_file}}
+
+
+def plot_genomic_gea_landscape(feature_data_csv, gea_data_csv, cloned_bins_csv,
+                               environment_metadata_csv, environment_corr_csv,
+                               output_prefix, panel='main', window_size=1_000_000,
+                               figsize=(29.7 * 0.7, 21), label_fontsize=16,
+                               title_fontsize=24, chromosome_fontsize=18,
+                               hspace=0.275, wspace=0.15, highlight_env_ids=None):
+    """Plot aligned genomic feature and GEA landscapes from saved statistics.
+
+    Parameters
+    ----------
+    feature_data_csv, gea_data_csv, cloned_bins_csv : str
+        CSV.gz outputs of the two prepare functions. No context, VCF or GWAS
+        source is read and missing statistics are never recalculated.
+    environment_metadata_csv, environment_corr_csv : str
+        Metadata with env_id/env_abbr and a square Pearson correlation matrix
+        indexed by the same environmental IDs. Cluster distance is 1-abs(r)
+        with average linkage. Labels use original IDs before leaf reordering.
+    output_prefix : str
+        Export .pdf, .png (300 dpi) and actual plotted .csv.gz. The latter
+        includes raw/transformed values, DISPLAY_ROW (zero at the top), and
+        color limits, plus cloned IDs and the displayed window markers.
+    panel : {'main', 'supp'}
+        Feature selection; both figures share GEA colors and ordering.
+    window_size : int
+        Existing bin resolution in bp; terminal bins retain their true END.
+    figsize : tuple
+        Canvas width/height in inches, matching the old figure by default.
+    label_fontsize, title_fontsize, chromosome_fontsize : float
+        Label, panel-title and chromosome-title sizes.
+    hspace, wspace : float
+        GridSpec gaps; the left label/tree column has width weight 80.
+    highlight_env_ids : sequence of str or None
+        Environmental IDs whose custom abbreviation labels use bold red text.
+
+    Returns
+    -------
+    dict
+        figure, axes (groups plus GEA tree/heatmaps and cloned marker axes),
+        plot_data and files. Does not call show or alter global plot style.
+        Z-score limits are -1/2.5; GEA uses the shared 5th/95th percentiles.
+        Gray bands span three bins, are centered and clipped to each chromosome.
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.gridspec import GridSpec
+    from matplotlib.colors import Normalize
+    from matplotlib.patches import Rectangle
+    from scipy.cluster.hierarchy import linkage, dendrogram
+    from scipy.spatial.distance import squareform
+
+    if panel not in ['main', 'supp']:
+        raise ValueError("panel must be 'main' or 'supp'.")
+    features = pd.read_csv(feature_data_csv)
+    gea = pd.read_csv(gea_data_csv)
+    cloned_bins = pd.read_csv(cloned_bins_csv, keep_default_na=False)
+    metadata = pd.read_csv(environment_metadata_csv).set_index('env_id')
+    corr = pd.read_csv(environment_corr_csv, index_col=0)
+    if not metadata.index.is_unique or not corr.index.is_unique or not corr.columns.is_unique:
+        raise ValueError('Environmental IDs must be unique.')
+    environment_ids = metadata.index.tolist()
+    highlight_env_ids = set(highlight_env_ids or [])
+    if (set(corr.index) != set(environment_ids) or set(corr.columns) != set(environment_ids)
+            or set(gea['env_id']) != set(environment_ids)):
+        raise ValueError('GEA, metadata and environmental correlations must have identical IDs.')
+    corr = corr.loc[environment_ids, environment_ids]
+    correlations = corr.to_numpy(dtype=float)
+    if (not np.isfinite(correlations).all()
+            or not np.allclose(correlations, correlations.T)
+            or not np.allclose(np.diag(correlations), 1)
+            or (np.abs(correlations) > 1 + 1e-10).any()):
+        raise ValueError('Environmental correlations must be finite, symmetric and have diagonal one.')
+    distance = 1 - np.clip(np.abs(correlations), 0, 1)
+    np.fill_diagonal(distance, 0)
+    tree = linkage(squareform(distance), method='average')
+    leaf_ids = dendrogram(tree, labels=environment_ids, no_plot=True)['ivl']
+    windows = _landscape_windows(cloned_bins, window_size)
+    window_keys = ['CHROM', 'START', 'END']
+    window_index = pd.MultiIndex.from_frame(windows[window_keys])
+    if gea.duplicated(['env_id'] + window_keys).any():
+        raise ValueError('Duplicate GEA bins would make plotted alignment ambiguous.')
+    gea_matrix = gea.pivot(index='env_id', columns=window_keys, values='NEG_LOG10_P')
+    if set(gea_matrix.columns) != set(window_index):
+        raise ValueError('GEA and feature windows must match exactly.')
+    gea_matrix = gea_matrix.reindex(index=leaf_ids, columns=window_index)
+    if not np.isfinite(gea_matrix.to_numpy()).all():
+        raise ValueError('GEA statistics must exist for every environment and window.')
+    gea_limits = np.percentile(gea_matrix.to_numpy(), [5, 95])
+    feature_norm = Normalize(vmin=-1, vmax=2.5)
+    gea_norm = Normalize(vmin=gea_limits[0], vmax=gea_limits[1])
+    selected = features.loc[features['PANEL'].eq(panel)].sort_values('TRACK_ORDER')
+    if selected.empty:
+        raise ValueError(f'No feature tracks found for {panel}.')
+    groups = list(selected.groupby('GROUP', sort=False))
+    chromosomes = windows['CHROM'].drop_duplicates().tolist()
+    sizes = windows.groupby('CHROM', sort=False).size().tolist()
+    heights = [frame['TRACK'].nunique() for _, frame in groups] + [len(leaf_ids), 1]
+    fig = plt.figure(figsize=figsize)
+    grid = GridSpec(len(heights), len(chromosomes) + 1, figure=fig,
+                    width_ratios=[80] + sizes, height_ratios=heights,
+                    hspace=hspace, wspace=wspace, left=0.125, right=0.99,
+                    bottom=0.035, top=0.97)
+    axes, plot_frames = {}, []
+    display_offset = 0
+
+    def add_title(label, row_axes):
+        fig.text(0.015, row_axes[0].get_position().y1 + 0.002, label,
+                 ha='left', va='bottom', fontsize=title_fontsize)
+
+    def add_dividers(row_axes, bottom=None, top=None):
+        y0 = row_axes[0].get_position().y0 if bottom is None else bottom
+        y1 = row_axes[0].get_position().y1 if top is None else top
+        for left, right in zip(row_axes[:-1], row_axes[1:]):
+            x = (left.get_position().x1 + right.get_position().x0) / 2
+            fig.add_artist(plt.Line2D([x, x], [y0, y1], transform=fig.transFigure,
+                                     color='black', linewidth=1, zorder=10))
+
+    for row, (group, frame) in enumerate(groups):
+        tracks = frame['TRACK'].drop_duplicates().tolist()
+        if frame.duplicated(['TRACK'] + window_keys).any():
+            raise ValueError(f'Duplicate feature bins in {group}.')
+        for track in tracks:
+            track_index = pd.MultiIndex.from_frame(frame.loc[frame['TRACK'].eq(track), window_keys])
+            if set(track_index) != set(window_index):
+                raise ValueError(f'Feature track {track} has incompatible windows.')
+        matrix = frame.pivot(index='TRACK', columns=window_keys, values='Z_SCORE')
+        matrix = matrix.reindex(index=tracks, columns=window_index)
+        labels = frame.drop_duplicates('TRACK').set_index('TRACK')['LABEL']
+        cmap = frame['CMAP'].iloc[0]
+        row_axes = []
+        for column, chrom in enumerate(chromosomes, start=1):
+            ax = fig.add_subplot(grid[row, column])
+            data = matrix.xs(chrom, axis=1, level='CHROM').to_numpy(dtype=float)
+            ax.pcolormesh(np.ma.masked_invalid(data), cmap=cmap, norm=feature_norm,
+                          shading='flat', edgecolors='none')
+            ax.set(xlim=(0, data.shape[1]), ylim=(len(tracks), 0))
+            ax.axis('off')
+            for y in range(len(tracks) + 1):
+                ax.axhline(y, color='white', linewidth=4)
+            if row == 0:
+                ax.set_title(chrom, fontsize=chromosome_fontsize, pad=10)
+            row_axes.append(ax)
+        label_ax = fig.add_subplot(grid[row, 0])
+        label_ax.set(xlim=(0, 1), ylim=(len(tracks), 0))
+        label_ax.axis('off')
+        for index, track in enumerate(tracks):
+            label_ax.text(0.95, index + 0.5, labels[track], ha='right', va='center', fontsize=label_fontsize)
+        axes[group] = {'labels': label_ax, 'heatmaps': row_axes}
+        add_title(group, row_axes)
+        add_dividers(row_axes)
+        exported = frame.copy()
+        exported['VALUE'] = exported['Z_SCORE']
+        exported['DISPLAY_ROW'] = exported['TRACK'].map({track: display_offset + i for i, track in enumerate(tracks)})
+        exported['COLOR_MIN'], exported['COLOR_MAX'] = -1, 2.5
+        plot_frames.append(exported)
+        display_offset += len(tracks)
+
+    gea_row = len(groups)
+    tree_ax = fig.add_subplot(grid[gea_row, 0])
+    dendrogram(tree, orientation='left', labels=environment_ids, ax=tree_ax, color_threshold=0.5)
+    # Dendrogram coordinates increase from bottom to top; row zero is the bottom leaf.
+    leaf_positions = tree_ax.get_yticks()
+    tree_ax.tick_params(axis='both', length=0, labelbottom=False, labeltop=False,
+                        labelleft=False, labelright=False)
+    tree_ax.set_yticks([])
+    x_left, x_right = tree_ax.get_xlim()
+    label_space = (x_left - x_right) * 0.7
+    for y, env_id in zip(leaf_positions, leaf_ids):
+        tree_ax.text(x_right - label_space * 0.95, y, metadata.loc[env_id, 'env_abbr'],
+                     ha='right', va='center', fontsize=label_fontsize,
+                     color='red' if env_id in highlight_env_ids else 'black',
+                     fontweight='bold' if env_id in highlight_env_ids else 'normal')
+    tree_ax.set_xlim(x_left, x_right - label_space)
+    for spine in tree_ax.spines.values():
+        spine.set_visible(False)
+    gea_axes = []
+    for column, chrom in enumerate(chromosomes, start=1):
+        ax = fig.add_subplot(grid[gea_row, column])
+        data = gea_matrix.xs(chrom, axis=1, level='CHROM').to_numpy(dtype=float)
+        ax.pcolormesh(data, cmap='Reds', norm=gea_norm, shading='flat', edgecolors='none')
+        ax.set(xlim=(0, data.shape[1]), ylim=(0, len(leaf_ids)))
+        ax.axis('off')
+        gea_axes.append(ax)
+    axes['GEA signals'] = {'tree': tree_ax, 'heatmaps': gea_axes}
+    add_title('GEA signals', gea_axes)
+    add_dividers(gea_axes)
+    gea_export = gea.copy()
+    gea_export['PANEL'], gea_export['GROUP'] = panel, 'GEA signals'
+    gea_export['TRACK'] = gea_export['env_id']
+    gea_export['LABEL'] = gea_export['env_id'].map(metadata['env_abbr'])
+    gea_export['RAW_VALUE'], gea_export['VALUE'] = gea_export['P_VALUE'], gea_export['NEG_LOG10_P']
+    gea_export['DISPLAY_ROW'] = gea_export['env_id'].map(
+        {env_id: display_offset + len(leaf_ids) - 1 - i for i, env_id in enumerate(leaf_ids)})
+    gea_export['COLOR_MIN'], gea_export['COLOR_MAX'] = gea_limits
+    plot_frames.append(gea_export)
+
+    cloned_row = gea_row + 1
+    band_top = grid[0, 1].get_position(fig).y1
+    band_bottom = grid[cloned_row, 1].get_position(fig).y0
+    cloned_axes = []
+    marker_matrix = cloned_bins.set_index(window_keys).reindex(window_index)
+    for column, chrom in enumerate(chromosomes, start=1):
+        ax = fig.add_subplot(grid[cloned_row, column])
+        ax.set(xlim=(0, sizes[column - 1]), ylim=(0, 1))
+        ax.axis('off')
+        box = ax.get_position()
+        markers = marker_matrix.xs(chrom, level='CHROM')['IS_CLONED'].to_numpy(dtype=int)
+        nbin = len(markers)
+        for index in np.flatnonzero(markers):
+            # Bin centers are c+0.5; clip the three-bin band to chromosome edges.
+            left = max(0, index + 0.5 - 1.5)
+            right = min(nbin, index + 0.5 + 1.5)
+            rect = Rectangle((box.x0 + left / nbin * box.width, band_bottom),
+                             (right - left) / nbin * box.width, band_top - band_bottom,
+                             transform=fig.transFigure, facecolor='black', edgecolor='none', alpha=0.2, zorder=3)
+            fig.add_artist(rect)
+        ax.scatter(np.flatnonzero(markers) + 0.5, np.full(markers.sum(), 0.5),
+                   s=28, color='black', clip_on=True, zorder=4)
+        cloned_axes.append(ax)
+    label_ax = fig.add_subplot(grid[cloned_row, 0])
+    label_ax.set(xlim=(0, 1), ylim=(0, 1))
+    label_ax.axis('off')
+    label_ax.text(0.95, 0.5, 'Cloned Flowering Genes', ha='right', va='center', fontsize=label_fontsize)
+    axes['Flowering genes'] = {'labels': label_ax, 'markers': cloned_axes}
+    add_title('Flowering genes', cloned_axes)
+    add_dividers(cloned_axes, bottom=band_bottom, top=band_top)
+    cloned_export = marker_matrix.reset_index()
+    cloned_export['PANEL'], cloned_export['GROUP'] = panel, 'Flowering genes'
+    cloned_export['TRACK'], cloned_export['LABEL'] = 'Cloned', 'Cloned Flowering Genes'
+    cloned_export['RAW_VALUE'], cloned_export['VALUE'] = cloned_export['IS_CLONED'], cloned_export['IS_CLONED']
+    cloned_export['DISPLAY_ROW'] = display_offset + len(leaf_ids)
+    cloned_export['BAND_WIDTH_BINS'] = 3
+    plot_frames.append(cloned_export)
+    plot_data = pd.concat(plot_frames, ignore_index=True).sort_values(['DISPLAY_ROW', 'CHROM', 'START']).reset_index(drop=True)
+    files = {kind: f'{output_prefix}.{extension}' for kind, extension in
+             [('pdf', 'pdf'), ('png', 'png'), ('csv', 'csv.gz')]}
+    os.makedirs(os.path.dirname(os.path.abspath(output_prefix)), exist_ok=True)
+    fig.savefig(files['pdf'], format='pdf', facecolor='none', edgecolor='none')
+    fig.savefig(files['png'], dpi=300, facecolor='white')
+    _save_landscape_csv(plot_data, files['csv'])
+    print(f'[{datetime.now():%H:%M:%S}] Exported {panel} landscape: {output_prefix}', flush=True)
+    return {'figure': fig, 'axes': axes, 'plot_data': plot_data, 'files': files}

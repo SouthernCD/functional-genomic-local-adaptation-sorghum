@@ -237,6 +237,34 @@
       "maf_0.4_0.5"
     ]
   },
+  "core_flowering_non_coding_vs_coding": {
+    "id": "core_flowering_non_coding_vs_coding",
+    "foreground": "(core_flowering_time_genes & genic_2kb) - CDS",
+    "background": "(core_flowering_time_genes & genic_2kb) & CDS",
+    "dataset": "genome",
+    "maf_stratify": [
+      "all",
+      "maf_0.05_0.1",
+      "maf_0.1_0.2",
+      "maf_0.2_0.3",
+      "maf_0.3_0.4",
+      "maf_0.4_0.5"
+    ]
+  },
+  "flowering_non_coding_vs_coding": {
+    "id": "flowering_non_coding_vs_coding",
+    "foreground": "(flowering_time_genes & genic_2kb) - CDS",
+    "background": "(flowering_time_genes & genic_2kb) & CDS",
+    "dataset": "genome",
+    "maf_stratify": [
+      "all",
+      "maf_0.05_0.1",
+      "maf_0.1_0.2",
+      "maf_0.2_0.3",
+      "maf_0.3_0.4",
+      "maf_0.4_0.5"
+    ]
+  },
   "missense_vs_CDS": {
     "id": "missense_vs_CDS",
     "foreground": "`missense_cds_0.01`",
