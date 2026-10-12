@@ -4766,12 +4766,142 @@ def calculate_ld_overlap_from_csr(
     }
 
 
-def calculate_contrast_ld_overlap(contrast_id, contrast_json, context_df, env_id_list, ld_df, output_dir, bin_width=0.05, min_R2=0.5, random_seed=42):
+def prepare_ld_pairs(site_info_df, input_vcf_file, output_h5, *,
+                     legacy_pairs_h5=None, ld_window_size=15000, min_r2=0.5,
+                     pool_num=4, chunk_size=5_000_000, force_recompute=False):
+    """Reuse or prepare LD edges with compact, stable integer node indices.
+
+    Parameters
+    ----------
+    site_info_df : pandas.DataFrame
+        Unique, nonmissing ID, CHROM and POS columns in fixed row order, with
+        a RangeIndex starting at zero. LD nodes refer to these row positions;
+        retain ID as a column for alignment, not as the computational index.
+    input_vcf_file : str
+        Indexed VCF used only when neither saved nor legacy LD pairs exist,
+        or when force_recompute is True.
+    output_h5 : str
+        Integer INDEX_1, INDEX_2 and R2 table, HDF key 'df'. A companion
+        .nodes.h5 records the exact ID/coordinate order to validate reuse.
+    legacy_pairs_h5 : str or None
+        Existing string-ID edge table. Map endpoints to row positions once,
+        preserving every edge, its order and R2; do not query genotypes again.
+        The legacy file remains intact. Missing endpoint IDs raise an error.
+    ld_window_size : int
+        Distance bound in bp, used for new LD calculations only.
+    min_r2 : float
+        Minimum retained R2, used for new calculations only. Legacy results
+        must have been calculated with the same distance and R2 parameters.
+    pool_num : int
+        LD worker count, used for new calculations only.
+    chunk_size : int
+        Number of endpoints per string-to-integer conversion chunk.
+    force_recompute : bool
+        Explicitly recalculate LD after input/parameter changes. Otherwise
+        reuse complete outputs, rejecting a mismatched node-order contract.
+
+    Returns
+    -------
+    pandas.DataFrame
+        LD edges in memory, with int32 endpoints where possible, otherwise
+        int64. The overlap stage receives this table directly and does not
+        read it from disk per environment. Saved tables use atomic replacement.
+    """
+    from datetime import datetime
+    from tqdm.auto import tqdm
+
+    node_df = site_info_df[['ID', 'CHROM', 'POS']].copy()
+    if not node_df.index.equals(pd.RangeIndex(len(node_df))):
+        raise ValueError('LD sites must have the fixed zero-based RangeIndex.')
+    if node_df.isna().any().any() or not node_df['ID'].is_unique:
+        raise ValueError('LD node IDs must be unique and node fields nonmissing.')
+    chunk_size = index(chunk_size)
+    if chunk_size < 1:
+        raise ValueError('chunk_size must be positive.')
+    nodes_h5 = f'{os.path.splitext(output_h5)[0]}.nodes.h5'
+    if not force_recompute and os.path.exists(output_h5) and os.path.exists(nodes_h5):
+        saved_nodes = pd.read_hdf(nodes_h5, key='df')
+        if not saved_nodes.equals(node_df):
+            raise ValueError(f'LD node order differs from {nodes_h5}; explicitly recompute LD.')
+        print(f'[{datetime.now():%H:%M:%S}] Reading integer LD pairs: {output_h5}', flush=True)
+        pairs = pd.read_hdf(output_h5, key='df')
+    else:
+        node_dtype = np.int32 if len(node_df) < np.iinfo(np.int32).max else np.int64
+        if not force_recompute and legacy_pairs_h5 and os.path.exists(legacy_pairs_h5):
+            print(f'[{datetime.now():%H:%M:%S}] Converting saved LD node IDs once', flush=True)
+            pairs = pd.read_hdf(legacy_pairs_h5, key='df')
+            node_ids = pd.Index(node_df['ID'])
+            for column in ['INDEX_1', 'INDEX_2']:
+                endpoints = pairs[column].to_numpy(copy=False)
+                mapped = np.empty(len(pairs), dtype=node_dtype)
+                for start in tqdm(range(0, len(pairs), chunk_size), desc=f'Mapping {column}'):
+                    stop = min(start + chunk_size, len(pairs))
+                    positions = node_ids.get_indexer(endpoints[start:stop])
+                    if (positions < 0).any():
+                        raise ValueError(f'{legacy_pairs_h5}: LD endpoint IDs are absent from site contexts.')
+                    mapped[start:stop] = positions
+                pairs[column] = mapped
+                del endpoints, mapped
+        else:
+            print(f'[{datetime.now():%H:%M:%S}] Calculating integer-indexed LD pairs', flush=True)
+            pairs = calculate_ld_matrix(
+                site_info_df[['CHROM', 'POS']], input_vcf_file,
+                ld_window_size=ld_window_size, min_r2=min_r2, pool_num=pool_num,
+            )
+            for column in ['INDEX_1', 'INDEX_2']:
+                pairs[column] = pairs[column].astype(node_dtype, copy=False)
+        os.makedirs(os.path.dirname(os.path.abspath(output_h5)), exist_ok=True)
+        for path, frame in [(nodes_h5, node_df), (output_h5, pairs)]:
+            temporary_h5 = f'{path}.tmp'
+            frame.to_hdf(temporary_h5, key='df', mode='w')
+            os.replace(temporary_h5, path)
+        print(f'[{datetime.now():%H:%M:%S}] Saved integer LD pairs: {output_h5}', flush=True)
+    for column in ['INDEX_1', 'INDEX_2']:
+        endpoints = pairs[column]
+        if not pd.api.types.is_integer_dtype(endpoints):
+            raise ValueError(f'{output_h5}: {column} must contain integer node indices.')
+        if len(endpoints) and (endpoints.min() < 0 or endpoints.max() >= len(node_df)):
+            raise ValueError(f'{output_h5}: {column} contains out-of-range node indices.')
+    return pairs
+
+
+def calculate_contrast_ld_overlap(contrast_id, contrast_json, context_df, env_id_list, ld_df, output_dir, bin_width=0.05, min_R2=0.5, random_seed=42, force_recompute=False):
+    """Summarize and save cross-group LD by separately ranked GEA bins.
+
+    Parameters
+    ----------
+    contrast_id : str
+        Configuration ID and filename prefix.
+    contrast_json : dict
+        Foreground, background and dataset definitions.
+    context_df : pandas.DataFrame
+        Site annotations and GEA score columns; index labels must match ld_df.
+    env_id_list : sequence of str
+        Environmental score columns.
+    ld_df : pandas.DataFrame
+        Saved INDEX_1, INDEX_2 and R2 edges using context_df index labels.
+    output_dir : str
+        Destination for {contrast_id}_overlap_results.pkl.
+    bin_width : float
+        Width of separately ranked foreground/background bins, default 0.05.
+    min_R2 : float
+        Lower bound for positive scaled linkage, default 0.5.
+    random_seed : int
+        Seed for shuffling scores to provide the reference, default 42.
+    force_recompute : bool
+        Recompute after input or parameter changes; otherwise reuse the pickle.
+
+    Returns
+    -------
+    str
+        Saved pickle path; each environment has overlap_df and random_overlap_df.
+        Calls the existing LD-overlap calculation without changing its statistics.
+    """
 
     results_pkl_file = os.path.join(
         output_dir, f"{contrast_id}_overlap_results.pkl")
 
-    if not os.path.exists(results_pkl_file):
+    if force_recompute or not os.path.exists(results_pkl_file):
         enrich_data_df = build_enrich_data_df(
             context_df, contrast_json, env_id_list)
 
@@ -4794,8 +4924,10 @@ def calculate_contrast_ld_overlap(contrast_id, contrast_json, context_df, env_id
                 "random_overlap_df": random_overlap_df,
             }
 
-        with open(results_pkl_file, "wb") as f:
+        temporary_file = f"{results_pkl_file}.tmp"
+        with open(temporary_file, "wb") as f:
             pickle.dump(overlap_results, f)
+        os.replace(temporary_file, results_pkl_file)
 
     else:
         print(f"LD overlap results already exist for contrast {contrast_id}. Skipping calculation.")

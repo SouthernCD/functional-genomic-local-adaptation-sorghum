@@ -445,11 +445,37 @@ def get_jaccard(set1_mask, set2_mask):
     return intersection / union
 
 
-def gene_contrast_runner(contrast_id, contrast_json, context_df, env_id_list, output_dir, permutations=1000, top_percent=0.05, seed=42):
-    """Test gene-set overlap using chromosome-local shifts on per-environment backgrounds.
+def gene_contrast_runner(contrast_id, contrast_json, context_df, env_id_list, output_dir, permutations=1000, top_percent=0.05, seed=42, force_recompute=False):
+    """Test gene-set overlap using chromosome-local shifts.
 
-    Each background excludes missing scores, target labels, and coordinates, and
-    is sorted by CHROM/START. All filtering and sorting use private copies.
+    Parameters
+    ----------
+    contrast_id : str
+        Contrast ID used for the saved result filename.
+    contrast_json : dict
+        Gene target column and dataset definition.
+    context_df : pandas.DataFrame
+        Gene coordinates, boolean target labels and association scores. Each
+        environment retains complete scores, labels and CHROM/START coordinates.
+    env_id_list : sequence of str
+        Environmental score columns in analysis order.
+    output_dir : str
+        Directory for the atomically saved enrichment JSON.gz.
+    permutations : int
+        Number of chromosome-local label shifts; default 1000.
+    top_percent : float
+        Fraction of strongest gene scores, including threshold ties; default 0.05.
+    seed : int
+        Random seed for reproducible shifts; default 42.
+    force_recompute : bool
+        Replace saved results after input changes when True. Otherwise reuse
+        results with matching method, parameters, environments and target.
+
+    Returns
+    -------
+    str
+        JSON.gz path with observed/permutation Jaccard values, two-sided empirical
+        P values and background counts. Sorting and filtering use private copies.
     """
     if not 0 < top_percent <= 1:
         raise ValueError("top_percent must be in (0, 1]")
@@ -463,7 +489,7 @@ def gene_contrast_runner(contrast_id, contrast_json, context_df, env_id_list, ou
         output_dir, f"{contrast_id}.enrichment.json.gz")
 
     # Old global-roll results must not be reused under the new null model.
-    if os.path.exists(results_json_file):
+    if not force_recompute and os.path.exists(results_json_file):
         try:
             with gzip.open(results_json_file, 'rt', encoding='utf-8') as f:
                 existing = json.load(f)['all']
@@ -521,8 +547,11 @@ def gene_contrast_runner(contrast_id, contrast_json, context_df, env_id_list, ou
         print(f"{contrast_id} / {env_id}: {len(run_context_df)}/{len(context_df)} genes "
               f"retained; {int(target_mask.sum())} target, {int(env_top_mask.sum())} top genes")
 
-    with gzip.open(results_json_file, 'wt', encoding='utf-8') as f:
+    os.makedirs(output_dir, exist_ok=True)
+    temporary_file = f'{results_json_file}.tmp'
+    with gzip.open(temporary_file, 'wt', encoding='utf-8') as f:
         json.dump({'all': results_json}, f, indent=4)
+    os.replace(temporary_file, results_json_file)
     return results_json_file
 
 
@@ -827,6 +856,11 @@ def plot_enrichment_with_stratify(
 
         ax.set_ylim(-ylim_pad[0], len(stratify_list) - ylim_pad[1])
 
+    if symmetric_xlim:
+        for ax in axs:
+            bound = max(abs(value) for value in ax.get_xlim())
+            ax.set_xlim(-bound, bound)
+
     # Attach each title to its axes so it follows tight_layout and stays centered.
     for ax, env_id in zip(axs, env_id_list):
         env_label = env_metadata_df.loc[
@@ -846,6 +880,36 @@ def plot_enrichment_with_stratify(
         plt.show()
     if return_fig_ax:
         return fig, axs
+
+
+def _add_enrichment_header(fig, axes, labels, title_fontsize=14,
+                           enrichment_direction=True):
+    """Place shared environmental titles and direction arrows above the panels."""
+    from matplotlib.patches import FancyArrowPatch
+
+    height = fig.get_size_inches()[1]
+    top = axes[0].get_position().y1
+    for ax, label in zip(axes, labels):
+        position = ax.get_position()
+        label = str(label).replace('Striga', r'$\mathit{Striga}$')
+        fig.text((position.x0 + position.x1) / 2, top + 0.38 / height,
+                 label, fontsize=title_fontsize, ha='center', va='bottom',
+                 multialignment='center')
+    if enrichment_direction:
+        position = axes[-1].get_position()
+        center = (position.x0 + position.x1) / 2
+        width = position.width
+        y = top + 0.92 / height
+        for label, start, end in [
+            ('depleted', center - 0.05 * width, center - 0.48 * width),
+            ('enriched', center + 0.05 * width, center + 0.48 * width),
+        ]:
+            arrow = FancyArrowPatch((start, y), (end, y), transform=fig.transFigure,
+                                    arrowstyle='-|>', mutation_scale=13,
+                                    linewidth=1.8, color='black', clip_on=False)
+            fig.add_artist(arrow)
+            fig.text((start + end) / 2, y + 0.05 / height, label,
+                     fontsize=title_fontsize, ha='center', va='bottom')
 
 
 def plot_set_enrichment(
@@ -894,27 +958,95 @@ def plot_set_enrichment(
     tight_layout=True,
     show=True,
     return_fig_ax=True,
+    apply_style=True,
+    output_prefix=None,
+    figure_title=None,
+    figure_title_fontsize=15,
+    figure_title_position='above_environments',
+    subplot_spec=None,
+    wspace=0.15,
+    enrichment_direction=False,
+    symmetric_xlim=False,
 ):
-    """Plot enrichment results for multiple sets.
+    """Plot multiple enrichment sets as rows across environmental panels.
 
-    The original data arguments and their order are preserved. Plot styling
-    is configurable through optional arguments appended to the signature.
-    When ``return_fig_ax`` is true, return ``(fig, axes)``.
+    Parameters
+    ----------
+    set_results_json : dict
+        Set IDs mapped to saved contrast-runner results with an 'all' stratum.
+        Reads supplied results only; never runs enrichment or LD calculations.
+    env_id_list : sequence of str
+        Environmental variables in horizontal display order.
+    env_metadata_df : pandas.DataFrame
+        Unique env_id values and description labels for environmental titles.
+    set_label_map : sequence of (str, str)
+        Set IDs and labels in bottom-to-top row order.
+    apply_style : bool
+        Apply the shared style when True; False retains notebook initialization.
+    output_prefix : str or None
+        Optional PDF, PNG and actual plotted values CSV.gz destination prefix.
+    figure_title : str or None
+        Optional figure heading aligned to the left above environmental titles.
+    figure_title_position : str
+        'above_environments' keeps the figure heading above column titles;
+        'below_environments' places column titles in a shared top header and
+        the figure heading immediately above the scatter panels.
+    figure_title_fontsize : float
+        Figure heading size; default 15. Other styling options control axes,
+        markers, stars and spacing without altering saved statistics.
+    return_fig_ax : bool
+        Return figure and axes when True; default True.
+    show : bool
+        Display the figure when True; default True.
+
+    subplot_spec : matplotlib.gridspec.SubplotSpec or None
+        Embed panels in a parent figure when supplied; retain parent layout.
+    wspace : float
+        Horizontal panel gap for embedded plots.
+    enrichment_direction : bool
+        Add depleted/enriched arrows to the shared header when the figure title
+        is below environmental titles; default False.
+    symmetric_xlim : bool
+        Center each panel on zero using its plotted limits; default False.
+
+    Returns
+    -------
+    tuple or None
+        (figure, axes) when requested. Plot Z scores use the observation and
+        all permutations jointly. Optional exports preserve raw values,
+        transformed values, saved P values and final row/column order.
     """
 
-    set_plot_style()
+    if apply_style:
+        set_plot_style()
 
     # stratify_list.reverse()
 
     if figsize is None:
         figsize = (10, height_per_set * len(set_results_json))
-    fig, axs = plt.subplots(figsize=figsize, nrows=1,
-                            ncols=len(env_id_list), sharey=True)
-    axs = np.atleast_1d(axs)
+    if subplot_spec is None:
+        fig, axs = plt.subplots(figsize=figsize, nrows=1,
+                                ncols=len(env_id_list), sharey=True)
+        axs = np.atleast_1d(axs)
+    else:
+        from matplotlib.gridspec import GridSpecFromSubplotSpec
+
+        fig = subplot_spec.get_gridspec().figure
+        grid = GridSpecFromSubplotSpec(1, len(env_id_list), subplot_spec=subplot_spec,
+                                      wspace=wspace)
+        axs = []
+        for column in range(len(env_id_list)):
+            ax = fig.add_subplot(grid[0, column], sharey=axs[0] if axs else None)
+            if column:
+                ax.tick_params(axis='y', labelleft=False)
+            axs.append(ax)
+        axs = np.asarray(axs)
+        tight_layout = False
 
     y_values = {s: i for i, s in enumerate([s[0] for s in set_label_map])}
 
-    for ax, env_id in zip(axs, env_id_list):
+    plot_frames = []
+    for env_column, (ax, env_id) in enumerate(zip(axs, env_id_list)):
         for s, label in set_label_map:
             obs_value = set_results_json[s]['all']['obs_values'][env_id]
             perm_values = set_results_json[s]['all']['perm_values'][env_id]
@@ -934,6 +1066,16 @@ def plot_set_enrichment(
 
             p_value = set_results_json[s]['all']['stat'][env_id]['pval']
             mean_perm = set_results_json[s]['all']['stat'][env_id]['mean_perm']
+            if output_prefix is not None:
+                values = np.asarray([obs_value] + list(perm_values), dtype=float)
+                plot_frames.append(pd.DataFrame({
+                    'CONTRAST': s, 'LABEL': label, 'ROW': y_values[s],
+                    'ENV_ID': env_id, 'ENV_COLUMN': env_column,
+                    'POINT_TYPE': ['observed'] + ['permutation'] * len(perm_values),
+                    'PERMUTATION_ID': [-1] + list(range(len(perm_values))),
+                    'RAW_VALUE': values, 'Z_SCORE': np.concatenate(([obs_z], perm_z)),
+                    'P_VALUE': p_value, 'SIGNIFICANT': p_value < significance_threshold,
+                }))
 
             if p_value < significance_threshold:
                 if obs_value > mean_perm:
@@ -1004,8 +1146,39 @@ def plot_set_enrichment(
 
     # ax.yaxis_inverted()
 
-    if tight_layout:
-        fig.tight_layout()
+    if figure_title_position not in ['above_environments', 'below_environments']:
+        raise ValueError('Unknown figure_title_position.')
+    if figure_title is not None and figure_title_position == 'below_environments':
+        column_titles = [ax.get_title() for ax in axs]
+        for ax in axs:
+            ax.set_title('')
+        figure_height = fig.get_size_inches()[1]
+        if tight_layout:
+            fig.tight_layout(rect=(0, 0, 1, 1 - 1.15 / figure_height))
+        top = axs[0].get_position().y1
+        fig.text(0.015, top + 0.055 / figure_height, figure_title,
+                 fontsize=figure_title_fontsize, ha='left', va='bottom')
+        _add_enrichment_header(fig, axs, column_titles, title_fontsize,
+                               enrichment_direction=enrichment_direction)
+    else:
+        if figure_title is not None:
+            fig.suptitle(figure_title, x=0.015, ha='left', y=0.99,
+                         fontsize=figure_title_fontsize)
+        if tight_layout:
+            if figure_title is None:
+                fig.tight_layout()
+            else:
+                fig.tight_layout(rect=(0, 0, 1, 0.88))
+    if output_prefix is not None:
+        os.makedirs(os.path.dirname(os.path.abspath(output_prefix)), exist_ok=True)
+        fig.savefig(f'{output_prefix}.pdf', bbox_inches='tight')
+        fig.savefig(f'{output_prefix}.png', dpi=300, bbox_inches='tight')
+        temporary_csv = f'{output_prefix}.csv.gz.tmp'
+        pd.concat(plot_frames, ignore_index=True).to_csv(
+            temporary_csv, index=False, compression='gzip',
+        )
+        os.replace(temporary_csv, f'{output_prefix}.csv.gz')
+        print(f'Figure and plot data: {output_prefix}.{{pdf,png,csv.gz}}')
     if show:
         plt.show()
     if return_fig_ax:
@@ -1827,6 +2000,7 @@ def plot_enrichment_and_overlap(
     show=True,
     return_fig_ax=True,
     apply_style=True,
+    subplot_spec=None,
 ):
     """
     Combined figure:
@@ -1842,6 +2016,8 @@ def plot_enrichment_and_overlap(
     4-panel figure, but most style parameters remain configurable.
 
     Set apply_style=False to retain the notebook initialization style.
+    Supply subplot_spec to embed the two-row panel in a parent figure;
+    embedded panels retain the parent layout and ignore standalone margins.
 
     Returns
     -------
@@ -1889,20 +2065,18 @@ def plot_enrichment_and_overlap(
     # ============================================================
     # Figure
     # ============================================================
-    fig = plt.figure(
-        figsize=(
-            figsize_per_panel[0] * n_env,
-            figsize_per_panel[1],
-        )
-    )
+    if subplot_spec is None:
+        fig = plt.figure(figsize=(figsize_per_panel[0] * n_env, figsize_per_panel[1]))
+        gs = fig.add_gridspec(2, n_env, height_ratios=height_ratios,
+                             wspace=wspace, hspace=hspace)
+    else:
+        from matplotlib.gridspec import GridSpecFromSubplotSpec
 
-    gs = fig.add_gridspec(
-        nrows=2,
-        ncols=n_env,
-        height_ratios=height_ratios,
-        wspace=wspace,
-        hspace=hspace,
-    )
+        fig = subplot_spec.get_gridspec().figure
+        gs = GridSpecFromSubplotSpec(
+            2, n_env, subplot_spec=subplot_spec, height_ratios=height_ratios,
+            wspace=wspace, hspace=hspace,
+        )
 
     top_axes = []
     bottom_axes = []
@@ -2504,14 +2678,15 @@ def plot_enrichment_and_overlap(
     # ============================================================
     # Global layout
     # ============================================================
-    fig.subplots_adjust(
-        left=fig_left,
-        right=fig_right,
-        bottom=fig_bottom,
-        top=fig_top,
-        wspace=wspace,
-        hspace=hspace,
-    )
+    if subplot_spec is None:
+        fig.subplots_adjust(
+            left=fig_left,
+            right=fig_right,
+            bottom=fig_bottom,
+            top=fig_top,
+            wspace=wspace,
+            hspace=hspace,
+        )
 
     axes = {
         'top': top_axes,
@@ -2632,3 +2807,384 @@ def plot_gene_enrichment_histogram(results_json_file, env_id_list, env_metadata_
     return {'figure': fig, 'axes': axes, 'plot_data': plot_data,
             'histogram_data': histogram_data, 'files': files}
 
+
+def plot_enrichment_section(result_files, contrast_label_map, env_id_list,
+                             env_metadata_df, stratify_label_map, output_prefix,
+                             figsize=None, block_height=3.8, block_gap=0.22,
+                             section_title_fontsize=18, significance_threshold=0.05,
+                             panel_params=None, letter_labels=True,
+                             env_titles_first_only=True, enrichment_direction=True):
+    """Stack multiple saved enrichment/LD contrasts into one section figure.
+
+    Parameters
+    ----------
+    result_files : dict
+        Mapping of contrast ID to 'enrichment' JSON.gz and 'overlap' pickle
+        paths returned by the existing contrast runners. Reads saved results
+        only; never computes enrichment, LD or permutations.
+    contrast_label_map : sequence of (str, str)
+        Contrast IDs and descriptive headings in vertical display order.
+    env_id_list : sequence of str
+        Environmental variables in horizontal display order.
+    env_metadata_df : pandas.DataFrame
+        Unique env_id and description columns for environmental titles.
+    stratify_label_map : sequence of (str, str)
+        Saved MAF strata and labels, ordered from bottom to top in each panel.
+    output_prefix : str
+        Prefix for PDF, PNG, enrichment CSV.gz and LD-overlap CSV.gz exports.
+    figsize : tuple or None
+        Inches; default width is 3 times the number of environments and height
+        is block_height times the number of contrasts.
+    block_height, block_gap : float
+        Default height per contrast and vertical spacing between blocks.
+    section_title_fontsize : float
+        Contrast heading font size.
+    significance_threshold : float
+        Empirical P cutoff for stars, passed to the existing panel plotter.
+    panel_params : dict or None
+        Styling arguments for plot_enrichment_and_overlap, such as wspace,
+        hspace, height_ratios and axis limits. Parent layout is managed here.
+
+    letter_labels : bool
+        Prefix multiple contrast headings with A., B., etc. A single contrast
+        has no prefix. Supports up to 26 contrasts.
+    env_titles_first_only : bool
+        Place environmental titles in a shared header above the first block.
+        False retains environmental titles on every block.
+    enrichment_direction : bool
+        Show leftward depleted and rightward enriched arrows above the final
+        environmental column in the shared header; default True.
+
+    Returns
+    -------
+    dict
+        figure, per-contrast axes, raw/transformed enrichment plot_data,
+        ld_plot_data and files. Z scores use the observed statistic and all
+        permutations jointly, matching the existing plotter. Both figure-data
+        tables preserve contrast and environment IDs, row order and raw values.
+        Uses the notebook's existing style and does not call show.
+    """
+    import pickle
+    from datetime import datetime
+    from tqdm.auto import tqdm
+
+    labels = list(contrast_label_map)
+    env_id_list = list(env_id_list)
+    if not labels or not env_id_list or len({cid for cid, _ in labels}) != len(labels):
+        raise ValueError('Contrasts and environments must be nonempty; contrast IDs must be unique.')
+    if not env_metadata_df['env_id'].is_unique:
+        raise ValueError('Environmental metadata IDs must be unique.')
+    if letter_labels and len(labels) > 26:
+        raise ValueError('Lettered headings support up to 26 contrasts.')
+    params = dict(panel_params or {})
+    if any(key in params for key in ['subplot_spec', 'show', 'return_fig_ax', 'apply_style', 'significance_threshold']):
+        raise ValueError('Panel parameters must not override section layout or significance settings.')
+    if figsize is None:
+        figsize = (3 * len(env_id_list), block_height * len(labels))
+    print(f'{datetime.now():%Y-%m-%d %H:%M:%S} Plotting {len(labels)} enrichment contrasts')
+    fig = plt.figure(figsize=figsize)
+    figure_height = figsize[1]
+    top_margin_inches = 1.15 if env_titles_first_only else 1.45
+    outer = fig.add_gridspec(
+        len(labels), 1, left=0.13, right=0.99, bottom=0.45 / figure_height,
+        top=1 - top_margin_inches / figure_height,
+        hspace=block_gap if env_titles_first_only else block_gap + 0.18,
+    )
+    axes, enrichment_frames, overlap_frames = {}, [], []
+    for row, (contrast_id, label) in enumerate(tqdm(labels, desc='Enrichment panels')):
+        with gzip.open(result_files[contrast_id]['enrichment'], 'rt') as handle:
+            enrichment = json.load(handle)
+        with open(result_files[contrast_id]['overlap'], 'rb') as handle:
+            overlap = pickle.load(handle)
+        heading_label = f'{chr(65 + row)}. {label}' if letter_labels and len(labels) > 1 else label
+        _, panel_axes = plot_enrichment_and_overlap(
+            enrichment, overlap, env_id_list, env_metadata_df, stratify_label_map,
+            significance_threshold=significance_threshold, show=False,
+            return_fig_ax=True, apply_style=False, subplot_spec=outer[row], **params,
+        )
+        top_position = panel_axes['top'][0].get_position()
+        # Headings sit immediately above each scatter row, outside the MAF labels.
+        heading_offset = 0.055 if env_titles_first_only else 0.65
+        heading = fig.text(
+            0.015, top_position.y1 + heading_offset / figure_height, heading_label,
+            fontsize=section_title_fontsize, ha='left', va='bottom',
+        )
+        if env_titles_first_only:
+            if row == 0:
+                _add_enrichment_header(
+                    fig, panel_axes['top'], [ax.get_title() for ax in panel_axes['top']],
+                    params.get('title_fontsize', 14), enrichment_direction,
+                )
+            for ax in panel_axes['top']:
+                ax.set_title('')
+        axes[contrast_id] = {'heading': heading, **panel_axes}
+        for stratum_row, (stratum, _) in enumerate(stratify_label_map):
+            for env_column, env_id in enumerate(env_id_list):
+                result = enrichment[stratum]
+                values = np.asarray([result['obs_values'][env_id]]
+                                    + list(result['perm_values'][env_id]), dtype=float)
+                p_value = result['stat'][env_id]['pval']
+                enrichment_frames.append(pd.DataFrame({
+                    'CONTRAST': contrast_id, 'LABEL': label, 'PANEL_TITLE': heading_label, 'CONTRAST_ROW': row,
+                    'STRATUM': stratum, 'STRATUM_ROW': stratum_row,
+                    'ENV_ID': env_id, 'ENV_COLUMN': env_column,
+                    'POINT_TYPE': ['observed'] + ['permutation'] * (len(values) - 1),
+                    'PERMUTATION_ID': [-1] + list(range(len(values) - 1)),
+                    'SCORE_RATIO': values, 'Z_SCORE': zscore(values), 'P_VALUE': p_value,
+                    'SIGNIFICANT': p_value < significance_threshold,
+                }))
+        for env_column, env_id in enumerate(env_id_list):
+            for kind in ['overlap_df', 'random_overlap_df']:
+                frame = overlap[env_id][kind].copy()
+                frame['CONTRAST'], frame['LABEL'], frame['CONTRAST_ROW'] = contrast_id, label, row
+                frame['PANEL_TITLE'] = heading_label
+                frame['ENV_ID'], frame['ENV_COLUMN'], frame['POINT_TYPE'] = env_id, env_column, kind
+                start_col, end_col = params.get('start_col', 'gea_rank_start'), params.get('end_col', 'gea_rank_end')
+                frame['BIN_CENTER'] = (frame[start_col] + frame[end_col]) / 2
+                overlap_frames.append(frame)
+    plot_data = pd.concat(enrichment_frames, ignore_index=True)
+    ld_plot_data = pd.concat(overlap_frames, ignore_index=True)
+    os.makedirs(os.path.dirname(os.path.abspath(output_prefix)), exist_ok=True)
+    files = {'pdf': f'{output_prefix}.pdf', 'png': f'{output_prefix}.png',
+             'enrichment_csv': f'{output_prefix}.enrichment.csv.gz',
+             'ld_overlap_csv': f'{output_prefix}.ld_overlap.csv.gz'}
+    fig.savefig(files['pdf'], bbox_inches='tight')
+    fig.savefig(files['png'], dpi=300, bbox_inches='tight')
+    for key, frame in [('enrichment_csv', plot_data), ('ld_overlap_csv', ld_plot_data)]:
+        temporary_csv = f'{files[key]}.tmp'
+        frame.to_csv(temporary_csv, index=False, compression='gzip')
+        os.replace(temporary_csv, files[key])
+    print(f'{datetime.now():%Y-%m-%d %H:%M:%S} Saved {output_prefix}')
+    return {'figure': fig, 'axes': axes, 'plot_data': plot_data,
+            'ld_plot_data': ld_plot_data, 'files': files}
+
+
+def summarize_site_contrasts(context_df, contrasts_settings, contrast_ids, output_csv=None):
+    """Count foreground and comparison sites for configured MAF strata.
+
+    Parameters
+    ----------
+    context_df : pandas.DataFrame
+        Site annotations with unique ID values and boolean context/MAF columns.
+        Counts describe annotation membership, not per-environment nonmissing
+        association scores. All supplied contrasts must use this dataset.
+    contrasts_settings : dict
+        Foreground/background expressions and optional maf_stratify definitions.
+        Direct contrasts require disjoint foreground and background sets.
+    contrast_ids : sequence of str
+        Contrasts in summary order.
+    output_csv : str or None
+        Optional atomic CSV.gz export of the count table.
+
+    Returns
+    -------
+    pandas.DataFrame
+        CONTRAST, STRATUM, N_FOREGROUND, N_BACKGROUND, N_TESTED, FOREGROUND
+        and BACKGROUND. For nested backgrounds, comparison counts exclude the
+        foreground, matching site_contrast_runner. Empty groups retain zero
+        counts so they can be inspected before running permutations.
+    """
+    from datetime import datetime
+    from tqdm.auto import tqdm
+
+    if context_df['ID'].isna().any() or not context_df['ID'].is_unique:
+        raise ValueError('Site IDs must be nonmissing and unique for counts.')
+    print(f'[{datetime.now():%H:%M:%S}] Summarizing contrast site counts')
+    rows = []
+    for contrast_id in tqdm(contrast_ids, desc='Contrast site counts'):
+        contrast = contrasts_settings[contrast_id]
+        foreground = filter_df_by_set_expr(context_df, contrast['foreground'])
+        background = filter_df_by_set_expr(context_df, contrast['background'])
+        if contrast.get('contrast_type') == 'direct' and (foreground & background).any():
+            raise ValueError(f'{contrast_id}: direct comparison sets overlap.')
+        comparison = background & ~foreground
+        strata = ['all'] + [s for s in contrast.get('maf_stratify', []) if s != 'all']
+        for stratum in strata:
+            mask = np.ones(len(context_df), dtype=bool) if stratum == 'all' else context_df[stratum]
+            n_fore = int((foreground & mask).sum())
+            n_back = int((comparison & mask).sum())
+            rows.append({'CONTRAST': contrast_id, 'STRATUM': stratum,
+                         'N_FOREGROUND': n_fore, 'N_BACKGROUND': n_back,
+                         'N_TESTED': n_fore + n_back,
+                         'FOREGROUND': contrast['foreground'], 'BACKGROUND': contrast['background']})
+    counts = pd.DataFrame(rows)
+    if output_csv is not None:
+        os.makedirs(os.path.dirname(os.path.abspath(output_csv)), exist_ok=True)
+        temporary_csv = f'{output_csv}.tmp'
+        counts.to_csv(temporary_csv, index=False, compression='gzip')
+        os.replace(temporary_csv, output_csv)
+    return counts
+
+
+def plot_set_enrichment_section(result_files, group_label_map, set_label_maps,
+                                 env_id_list, env_metadata_df, output_prefix,
+                                 figsize=(12, 8), block_gap=0.5,
+                                 section_title_fontsize=15,
+                                 significance_threshold=0.05,
+                                 value_column='RAW_VALUE', panel_params=None,
+                                 enrichment_direction=True, left=0.25,
+                                 heading_x=0.015, hypothesis_groups=None,
+                                 hypothesis_line_x=0.07, hypothesis_label_x=0.03,
+                                 hypothesis_fontsize=12, hypothesis_linewidth=3,
+                                 hypothesis_bottom_offset=-0.18, header_labels=None,
+                                 hypothesis_fontweight='normal'):
+    """Stack groups of enrichment sets without MAF or LD panels.
+
+    Parameters
+    ----------
+    result_files : dict
+        Set IDs mapped to saved contrast-runner JSON.gz paths. No statistical
+        calculations are launched; only plotting transformations are applied.
+    group_label_map : sequence of (str, str)
+        Group IDs and headings in top-to-bottom order; headings receive letters
+        when more than one group is supplied.
+    set_label_maps : dict
+        Each group mapped to (set ID, label) pairs in top-to-bottom display order.
+    env_id_list : sequence of str
+        Environmental variables in left-to-right display order.
+    env_metadata_df : pandas.DataFrame
+        Unique env_id and description columns for the shared top header.
+    output_prefix : str
+        Destination prefix for PDF, PNG and actual plotted-value CSV.gz.
+    figsize : tuple
+        Figure dimensions in inches.
+    block_gap : float
+        Vertical gap relative to group height.
+    section_title_fontsize : float
+        Font size for lettered group headings.
+    significance_threshold : float
+        Saved P-value cutoff for stars; default 0.05.
+    value_column : str or dict
+        Raw-statistic column name, or group-to-column mapping for mixed site
+        ('SCORE_RATIO') and gene ('JACCARD') panels.
+    panel_params : dict or None
+        Styling arguments for plot_set_enrichment, excluding layout/export
+        controls. Existing notebook plotting defaults are retained.
+    enrichment_direction : bool
+        Show depleted/enriched arrows above the final environmental column;
+        default True. Shared titles italicize Striga.
+    left, heading_x : float
+        Figure-relative panel left margin and heading position.
+    hypothesis_groups : sequence of dict or None
+        Optional vertical brackets with label, color and group_ids in contiguous
+        display order. Brackets are annotations, not statistical comparisons.
+    hypothesis_line_x, hypothesis_label_x : float
+        Figure-relative positions of vertical lines and rotated labels.
+    hypothesis_fontsize, hypothesis_linewidth : float
+        Font size for hypothesis labels and line width in points.
+    hypothesis_bottom_offset : float
+        Bottom endpoint offset from the final panel bottom, in inches.
+    header_labels : sequence of str or None
+        Optional environmental header labels in column order; preserves supplied
+        line breaks without altering environmental metadata.
+    hypothesis_fontweight : str
+        Font weight for the rotated hypothesis labels; default normal.
+
+    Returns
+    -------
+    dict
+        figure, per-group axes, plot_data and exported files. Raw statistics,
+        Z scores, saved P values and final row/column order are preserved.
+        Per-environment background counts are exported when present in the
+        input results. Environmental titles appear once, above all groups.
+    """
+    from datetime import datetime
+    from matplotlib.lines import Line2D
+    from tqdm.auto import tqdm
+
+    groups, env_id_list = list(group_label_map), list(env_id_list)
+    if not groups or not env_id_list or len(groups) > 26:
+        raise ValueError('Require one to 26 groups and at least one environment.')
+    params = dict(panel_params or {})
+    controlled = {'subplot_spec', 'show', 'return_fig_ax', 'apply_style',
+                  'output_prefix', 'figure_title', 'significance_threshold', 'xlabel'}
+    if controlled & params.keys():
+        raise ValueError('Panel parameters cannot override group layout or exports.')
+    params.setdefault('xlabel_fontsize', 10)
+    print(f'[{datetime.now():%H:%M:%S}] Plotting grouped enrichment sets')
+    fig = plt.figure(figsize=figsize)
+    height = figsize[1]
+    outer = fig.add_gridspec(len(groups), 1, left=left, right=0.99,
+                            top=1 - 1.15 / height, bottom=0.55 / height,
+                            hspace=block_gap,
+                            height_ratios=[len(set_label_maps[key]) for key, _ in groups])
+    axes, frames = {}, []
+    for row, (group_id, title) in enumerate(tqdm(groups, desc='Enrichment groups')):
+        labels = list(set_label_maps[group_id])
+        results = {}
+        for set_id, _ in labels:
+            with gzip.open(result_files[set_id], 'rt') as handle:
+                results[set_id] = json.load(handle)
+        _, panel_axes = plot_set_enrichment(
+            results, env_id_list, env_metadata_df, list(reversed(labels)),
+            significance_threshold=significance_threshold, show=False,
+            apply_style=False, subplot_spec=outer[row],
+            xlabel='Enrichment z-score' if row == len(groups) - 1 else None,
+            **params,
+        )
+        top = panel_axes[0].get_position().y1
+        heading_label = f'{chr(65 + row)}. {title}' if len(groups) > 1 else title
+        heading = fig.text(heading_x, top + 0.055 / height, heading_label,
+                           fontsize=section_title_fontsize, ha='left', va='bottom')
+        if row == 0:
+            _add_enrichment_header(
+                fig, panel_axes, (header_labels if header_labels is not None
+                                  else [ax.get_title() for ax in panel_axes]),
+                params.get('title_fontsize', 14), enrichment_direction,
+            )
+        for column, (ax, env_id) in enumerate(zip(panel_axes, env_id_list)):
+            ax.set_title('')
+            for set_row, (set_id, label) in enumerate(labels):
+                result = results[set_id]['all']
+                values = np.asarray([result['obs_values'][env_id]]
+                                    + list(result['perm_values'][env_id]), dtype=float)
+                p_value = result['stat'][env_id]['pval']
+                frame = pd.DataFrame({
+                    'GROUP': group_id, 'GROUP_ROW': row, 'PANEL_TITLE': heading_label,
+                    'CONTRAST': set_id, 'LABEL': label, 'SET_ROW': set_row,
+                    'PLOT_Y': len(labels) - 1 - set_row, 'ENV_ID': env_id, 'ENV_COLUMN': column,
+                    'POINT_TYPE': ['observed'] + ['permutation'] * (len(values) - 1),
+                    'PERMUTATION_ID': [-1] + list(range(len(values) - 1)),
+                    (value_column[group_id] if isinstance(value_column, dict) else value_column): values,
+                    'STATISTIC': value_column[group_id] if isinstance(value_column, dict) else value_column,
+                    'STRATUM': 'all', 'Z_SCORE': zscore(values),
+                    'P_VALUE': p_value, 'SIGNIFICANT': p_value < significance_threshold,
+                })
+                info = result.get('background_info', {}).get(env_id, {})
+                for source, target in [('n_genes', 'N_BACKGROUND'), ('n_target', 'N_TARGET'), ('n_top', 'N_TOP')]:
+                    if source in info:
+                        frame[target] = info[source]
+                frames.append(frame)
+        axes[group_id] = {'heading': heading, 'panels': panel_axes}
+    # Bracket selected contiguous groups after all axes positions are known.
+    group_ids = [key for key, _ in groups]
+    for bracket in hypothesis_groups or []:
+        selected = list(bracket['group_ids'])
+        positions = [group_ids.index(key) for key in selected]
+        if not positions or positions != list(range(positions[0], positions[-1] + 1)):
+            raise ValueError('Hypothesis groups must follow contiguous display order.')
+        first = axes[selected[0]]['panels'][0].get_position()
+        last = axes[selected[-1]]['panels'][0].get_position()
+        top = first.y1 + 0.28 / height
+        bottom = last.y0 + hypothesis_bottom_offset / height
+        fig.add_artist(Line2D([hypothesis_line_x] * 2, [bottom, top],
+                                 transform=fig.transFigure, color=bracket['color'],
+                                 linewidth=hypothesis_linewidth, solid_capstyle='butt', clip_on=False))
+        fig.text(hypothesis_label_x, (top + bottom) / 2, bracket['label'],
+                 rotation=90, fontsize=hypothesis_fontsize, fontweight=hypothesis_fontweight,
+                 ha='center', va='center')
+    plot_data = pd.concat(frames, ignore_index=True)
+    if hypothesis_groups:
+        hypothesis_labels = {key: bracket['label'] for bracket in hypothesis_groups
+                             for key in bracket['group_ids']}
+        plot_data['HYPOTHESIS'] = plot_data['GROUP'].map(hypothesis_labels)
+    os.makedirs(os.path.dirname(os.path.abspath(output_prefix)), exist_ok=True)
+    files = {kind: f'{output_prefix}.{extension}' for kind, extension in
+             [('pdf', 'pdf'), ('png', 'png'), ('csv', 'csv.gz')]}
+    fig.savefig(files['pdf'], bbox_inches='tight')
+    fig.savefig(files['png'], dpi=300, bbox_inches='tight')
+    temporary_csv = f'{files["csv"]}.tmp'
+    plot_data.to_csv(temporary_csv, index=False, compression='gzip')
+    os.replace(temporary_csv, files['csv'])
+    print(f'[{datetime.now():%H:%M:%S}] Saved {output_prefix}')
+    return {'figure': fig, 'axes': axes, 'plot_data': plot_data, 'files': files}

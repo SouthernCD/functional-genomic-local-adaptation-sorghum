@@ -420,7 +420,7 @@
   "proximal_ACR_TE_UMR_vs_proximal": {
     "id": "proximal_ACR_TE_UMR_vs_proximal",
     "foreground": "(ACR | TE | UMR) & genic_proximal",
-    "background": "genic_proximal",
+    "background": "genic_proximal - (ACR | TE | UMR)",
     "dataset": "genome",
     "contrast_type": "direct",
     "maf_stratify": [
@@ -435,7 +435,7 @@
   "not_proximal_ACR_TE_UMR_vs_proximal": {
     "id": "not_proximal_ACR_TE_UMR_vs_proximal",
     "foreground": "genic_proximal - (ACR | TE | UMR)",
-    "background": "genic_proximal",
+    "background": "(ACR | TE | UMR) & genic_proximal",
     "dataset": "genome",
     "contrast_type": "direct",
     "maf_stratify": [
@@ -654,5 +654,35 @@
     "id": "high_recombination_genes",
     "target": "high_recombination_genes",
     "dataset": "gene"
+  },
+  "proximal_ACR_not_UMR_vs_proximal_UMR_not_ACR": {
+    "id": "proximal_ACR_not_UMR_vs_proximal_UMR_not_ACR",
+    "foreground": "(ACR & genic_proximal) - UMR",
+    "background": "(UMR & genic_proximal) - ACR",
+    "dataset": "genome",
+    "contrast_type": "direct",
+    "maf_stratify": [
+      "all",
+      "maf_0.05_0.1",
+      "maf_0.1_0.2",
+      "maf_0.2_0.3",
+      "maf_0.3_0.4",
+      "maf_0.4_0.5"
+    ]
+  },
+  "proximal_UMR_not_TE_vs_proximal_TE_not_UMR": {
+    "id": "proximal_UMR_not_TE_vs_proximal_TE_not_UMR",
+    "foreground": "(UMR & genic_proximal) - TE",
+    "background": "(TE & genic_proximal) - UMR",
+    "dataset": "genome",
+    "contrast_type": "direct",
+    "maf_stratify": [
+      "all",
+      "maf_0.05_0.1",
+      "maf_0.1_0.2",
+      "maf_0.2_0.3",
+      "maf_0.3_0.4",
+      "maf_0.4_0.5"
+    ]
   }
 }
