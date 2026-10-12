@@ -555,7 +555,7 @@ def gene_contrast_runner(contrast_id, contrast_json, context_df, env_id_list, ou
     return results_json_file
 
 
-def win_contrast_runner(contrast_id, contrast_json, context_df, trait_id_list, output_dir, permutations=1000):
+def win_contrast_runner(contrast_id, contrast_json, context_df, trait_id_list, output_dir, permutations=1000, force_recompute=False):
     """Test overlap of a boolean window target with boolean window traits.
 
     For each trait, exclude missing CHROM/START/END, target, or trait values,
@@ -571,13 +571,13 @@ def win_contrast_runner(contrast_id, contrast_json, context_df, trait_id_list, o
     results_json_file = os.path.join(
         output_dir, f"{contrast_id}.enrichment.json.gz")
 
-    if os.path.exists(results_json_file):
+    if not force_recompute and os.path.exists(results_json_file):
         try:
             with gzip.open(results_json_file, 'rt', encoding='utf-8') as f:
                 existing = json.load(f)['all']
             if (existing.get('permutation_scheme') == WINDOW_PERMUTATION_SCHEME
                     and existing.get('permutations') == permutations
-                    and existing.get('trait_id_list') == trait_id_list
+                    and set(trait_id_list).issubset(existing.get('trait_id_list', []))
                     and existing.get('target') == target):
                 print(f"Enrichment results already exist for contrast {contrast_id}, skipping.")
                 return results_json_file
@@ -624,12 +624,14 @@ def win_contrast_runner(contrast_id, contrast_json, context_df, trait_id_list, o
         print(f"{contrast_id} / {trait_id}: {len(run_context_df)}/{len(context_df)} windows "
               f"retained; {int(target_mask.sum())} target, {int(trait_mask.sum())} trait windows")
 
-    with gzip.open(results_json_file, 'wt', encoding='utf-8') as f:
+    temporary_file = f'{results_json_file}.tmp'
+    with gzip.open(temporary_file, 'wt', encoding='utf-8') as f:
         json.dump({'all': results_json}, f, indent=4)
+    os.replace(temporary_file, results_json_file)
     return results_json_file
 
 
-def site_jaccard_contrast_runner(contrast_id, contrast_json, context_df, trait_id_list, output_dir, permutations=1000):
+def site_jaccard_contrast_runner(contrast_id, contrast_json, context_df, trait_id_list, output_dir, permutations=1000, force_recompute=False):
     """Test overlap of a boolean site target with boolean site traits.
 
     For each trait, exclude missing CHROM/POS, target, or trait values,
@@ -645,13 +647,13 @@ def site_jaccard_contrast_runner(contrast_id, contrast_json, context_df, trait_i
     results_json_file = os.path.join(
         output_dir, f"{contrast_id}.enrichment.json.gz")
 
-    if os.path.exists(results_json_file):
+    if not force_recompute and os.path.exists(results_json_file):
         try:
             with gzip.open(results_json_file, 'rt', encoding='utf-8') as f:
                 existing = json.load(f)['all']
             if (existing.get('permutation_scheme') == SITE_JACCARD_PERMUTATION_SCHEME
                     and existing.get('permutations') == permutations
-                    and existing.get('trait_id_list') == trait_id_list
+                    and set(trait_id_list).issubset(existing.get('trait_id_list', []))
                     and existing.get('target') == target):
                 print(f"Enrichment results already exist for contrast {contrast_id}, skipping.")
                 return results_json_file
@@ -698,8 +700,10 @@ def site_jaccard_contrast_runner(contrast_id, contrast_json, context_df, trait_i
         print(f"{contrast_id} / {trait_id}: {len(run_context_df)}/{len(context_df)} sites "
               f"retained; {int(target_mask.sum())} target, {int(trait_mask.sum())} trait sites")
 
-    with gzip.open(results_json_file, 'wt', encoding='utf-8') as f:
+    temporary_file = f'{results_json_file}.tmp'
+    with gzip.open(temporary_file, 'wt', encoding='utf-8') as f:
         json.dump({'all': results_json}, f, indent=4)
+    os.replace(temporary_file, results_json_file)
     return results_json_file
 
 
@@ -1927,7 +1931,7 @@ def plot_enrichment_and_overlap(
 
     # top axes
     top_xlim=None,
-    top_xlabel='Enrichment z-score',
+    top_xlabel=r'Enrichment $z$-score',
     top_xlabel_fontsize=10,
     top_xlabel_pad=4,
     top_tick_fontsize=10,
@@ -3119,7 +3123,7 @@ def plot_set_enrichment_section(result_files, group_label_map, set_label_maps,
             results, env_id_list, env_metadata_df, list(reversed(labels)),
             significance_threshold=significance_threshold, show=False,
             apply_style=False, subplot_spec=outer[row],
-            xlabel='Enrichment z-score' if row == len(groups) - 1 else None,
+            xlabel=r'Enrichment $z$-score' if row == len(groups) - 1 else None,
             **params,
         )
         top = panel_axes[0].get_position().y1
@@ -3188,3 +3192,225 @@ def plot_set_enrichment_section(result_files, group_label_map, set_label_maps,
     os.replace(temporary_csv, files['csv'])
     print(f'[{datetime.now():%H:%M:%S}] Saved {output_prefix}')
     return {'figure': fig, 'axes': axes, 'plot_data': plot_data, 'files': files}
+
+
+def prepare_low_tail_enrichment(context_h5, contrasts_settings, contrast_ids,
+                                trait_id, output_dir, summary_csv,
+                                lower_fraction=0.05, context_threshold=None,
+                                permutations=1000, force_recompute=False):
+    """Summarize annotation overlap with the lower tail of a numeric trait.
+
+    Parameters
+    ----------
+    context_h5 : str
+        Existing HDF table (key 'df'). Window annotations are numeric coverage
+        fractions; site annotations are boolean and retain the table's MAF.
+    contrasts_settings : dict
+        Existing foreground/background definitions. Never modified in place.
+    contrast_ids : sequence of str
+        Requested contrasts, sharing one background and dataset.
+    trait_id : str
+        Numeric trait column, such as PI or MAF. The lower-tail threshold is
+        calculated once across the common tested background, including ties.
+    output_dir, summary_csv : str
+        Per-contrast JSON.gz directory and small summary CSV.gz destination.
+    lower_fraction : float
+        Lower-tail fraction; default 0.05.
+    context_threshold : float or None
+        For windows, convert annotation fractions > this value to membership.
+        None retains existing boolean site labels. Numeric traits stay intact.
+    permutations : int
+        Number of chromosome-local shifts, default 1000; seeds follow the
+        existing runners (0 through permutations - 1).
+    force_recompute : bool
+        Recompute statistics after input/definition changes when True. Legacy
+        results assume the original lower_fraction=0.05 and window threshold
+        0.75; compatible stored counts and methods are checked before reuse.
+
+    Returns
+    -------
+    pandas.DataFrame
+        Threshold, group counts, lower-tail proportions, foreground-to-comparison
+        risk ratio, observed Jaccard and empirical P for each contrast. Existing
+        result JSON.gz files are reused when compatible. PI is never recalculated.
+    """
+    from datetime import datetime
+    from tqdm.auto import tqdm
+
+    if not 0 < lower_fraction < 1:
+        raise ValueError('lower_fraction must be between zero and one.')
+    contrasts = [dict(contrasts_settings[key]) for key in contrast_ids]
+    if not contrasts or len({c['background'] for c in contrasts}) != 1 or len({c['dataset'] for c in contrasts}) != 1:
+        raise ValueError('Contrasts must share one background and dataset.')
+    print(f'[{datetime.now():%H:%M:%S}] Preparing lower-tail {trait_id} enrichment')
+    data = pd.read_hdf(context_h5, key='df').copy()
+    if 'ID' not in data:
+        data['ID'] = data['CHROM'] + ':' + data['START'].astype(str) + '-' + data['END'].astype(str)
+    if data['ID'].isna().any() or not data['ID'].is_unique:
+        raise ValueError('Context IDs must be nonmissing and unique.')
+    window_mode = context_threshold is not None
+    if window_mode:
+        statistics = {'ID', 'CHROM', 'START', 'END', 'VARIANT_COUNT', 'SNP_COUNT', 'PI', 'TajimaD', 'meanCmPerMb'}
+        for column in data.columns.difference(list(statistics)):
+            data[column] = data[column] > context_threshold
+        data['genome'] = True
+    else:
+        data[contrasts[0]['dataset']] = True
+    numeric = pd.to_numeric(data[trait_id], errors='raise')
+    background = filter_df_by_set_expr(data, contrasts[0]['background'])
+    valid = background & numeric.notna()
+    if not valid.any() or not np.isfinite(numeric[valid]).all():
+        raise ValueError('The common background must have finite trait values.')
+    cutoff = float(numeric[valid].quantile(lower_fraction))
+    data[trait_id] = pd.Series(np.nan, index=data.index, dtype=object)
+    data.loc[numeric.notna(), trait_id] = numeric[numeric.notna()] <= cutoff
+    runner = win_contrast_runner if window_mode else site_jaccard_contrast_runner
+    scheme = WINDOW_PERMUTATION_SCHEME if window_mode else SITE_JACCARD_PERMUTATION_SCHEME
+    definition = dict(lower_fraction=lower_fraction, context_threshold=context_threshold,
+                      background=contrasts[0]['background'], dataset=contrasts[0]['dataset'],
+                      trait_id=trait_id, threshold=cutoff)
+    rows = []
+    for contrast_id, contrast in tqdm(list(zip(contrast_ids, contrasts)), desc=f'{trait_id} contrasts'):
+        contrast['target'] = 'foreground'
+        foreground = filter_df_by_set_expr(data, contrast['foreground'])
+        if (foreground & ~background).any():
+            raise ValueError(f'{contrast_id}: foreground extends outside the common background.')
+        fore, back = valid & foreground, valid & ~foreground
+        if not fore.any() or not back.any():
+            raise ValueError(f'{contrast_id}: a comparison group is empty.')
+        n_fore, n_back = int(fore.sum()), int(back.sum())
+        low = numeric <= cutoff
+        low_fore, low_back = int((fore & low).sum()), int((back & low).sum())
+        result_dir = f'{output_dir}/{contrast_id}'
+        os.makedirs(result_dir, exist_ok=True)
+        result_file = f'{result_dir}/{contrast_id}.enrichment.json.gz'
+        reuse = False
+        if not force_recompute and os.path.exists(result_file):
+            with gzip.open(result_file, 'rt') as handle:
+                existing = json.load(handle)['all']
+            info = existing.get('background_info', {}).get(trait_id, {})
+            legacy = 'low_tail_definition' not in existing
+            definition_ok = (lower_fraction == 0.05 and context_threshold in [None, 0.75]) if legacy else existing['low_tail_definition'] == definition
+            reuse = (definition_ok and existing.get('permutation_scheme') == scheme
+                     and existing.get('permutations') == permutations
+                     and existing.get('target') == 'foreground'
+                     and trait_id in existing.get('trait_id_list', [])
+                     and info.get('n_windows' if window_mode else 'n_sites') == int(valid.sum())
+                     and info.get('n_target') == n_fore
+                     and info.get('n_trait') == int((valid & low).sum()))
+            if reuse:
+                print(f'{contrast_id}: reuse {result_file}' + (' (legacy threshold definition assumed)' if legacy else ''))
+        if not reuse:
+            contexts = build_enrich_data_df(data, contrast, [trait_id])
+            runner(contrast_id, contrast, contexts, [trait_id], result_dir,
+                   permutations=permutations, force_recompute=True)
+            with gzip.open(result_file, 'rt') as handle:
+                payload = json.load(handle)
+            payload['all']['low_tail_definition'] = definition
+            temporary = f'{result_file}.tmp'
+            with gzip.open(temporary, 'wt') as handle:
+                json.dump(payload, handle, indent=4)
+            os.replace(temporary, result_file)
+            existing = payload['all']
+        fore_fraction, back_fraction = low_fore / n_fore, low_back / n_back
+        rows.append(dict(CONTRAST=contrast_id, TRAIT=trait_id, BACKGROUND=contrast['background'],
+                         THRESHOLD=cutoff, LOWER_FRACTION=lower_fraction,
+                         N_FOREGROUND=n_fore, N_COMPARISON=n_back, N_LOW_FOREGROUND=low_fore,
+                         N_LOW_COMPARISON=low_back, FOREGROUND_LOW_FRACTION=fore_fraction,
+                         COMPARISON_LOW_FRACTION=back_fraction,
+                         RISK_RATIO=fore_fraction / back_fraction if back_fraction else np.nan,
+                         JACCARD=existing['obs_values'][trait_id], P_VALUE=existing['stat'][trait_id]['pval'],
+                         RESULT_FILE=result_file))
+    summary = pd.DataFrame(rows)
+    os.makedirs(os.path.dirname(os.path.abspath(summary_csv)), exist_ok=True)
+    temporary = f'{summary_csv}.tmp'
+    summary.to_csv(temporary, index=False, compression='gzip')
+    os.replace(temporary, summary_csv)
+    return summary
+
+
+def plot_low_tail_enrichment(panels, output_prefix, figsize=(11, 5.5),
+                            title_fontsize=14, label_fontsize=12, tick_fontsize=10,
+                            panel_letter_fontsize=20, wspace=0.9):
+    """Display saved lower-tail enrichment results in horizontal panels.
+
+    Parameters
+    ----------
+    panels : sequence of dict
+        Each panel supplies trait_id, title, definition, background, labels in
+        top-to-bottom order, result_files and summary_csv. Reads saved results
+        only. No statistics, genotypes or permutations are calculated.
+    output_prefix : str
+        PDF, PNG and actual plotted-value CSV.gz destination prefix.
+    figsize : tuple
+        Canvas dimensions in inches.
+    title_fontsize, label_fontsize, tick_fontsize, panel_letter_fontsize : float
+        Typography sizes in points; retain the notebook's initialized style.
+    wspace : float
+        Horizontal panel gap allowing independent annotation row labels.
+
+    Returns
+    -------
+    dict
+        figure, axes, plot_data and files. Exports raw Jaccard values, joint
+        observed/permutation Z scores, empirical P values, final row order and
+        group proportions/risk ratios from the saved summaries.
+    """
+    from datetime import datetime
+    from tqdm.auto import tqdm
+
+    print(f'[{datetime.now():%H:%M:%S}] Plotting lower-tail enrichment')
+    fig = plt.figure(figsize=figsize)
+    grid = fig.add_gridspec(1, len(panels), left=0.19, right=0.98,
+                           bottom=0.16, top=0.57, wspace=wspace)
+    axes, frames = [], []
+    for index, panel in enumerate(tqdm(panels, desc='Lower-tail panels')):
+        trait = panel['trait_id']
+        summary = pd.read_csv(panel['summary_csv']).set_index('CONTRAST')
+        results = {}
+        for contrast_id, _ in panel['labels']:
+            with gzip.open(panel['result_files'][contrast_id], 'rt') as handle:
+                results[contrast_id] = json.load(handle)
+        metadata = pd.DataFrame([dict(env_id=trait, description=panel['title'])])
+        _, panel_axes = plot_set_enrichment(
+            results, [trait], metadata, list(reversed(panel['labels'])),
+            subplot_spec=grid[index], apply_style=False, show=False,
+            xlabel=r'Enrichment $z$-score', xlabel_fontsize=label_fontsize,
+            set_tick_fontsize=label_fontsize, tick_fontsize=tick_fontsize,
+            symmetric_xlim=True, ylim_pad=(0.5, 0.5),
+        )
+        ax = panel_axes[0]
+        ax.set_title('')
+        position = ax.get_position()
+        center, top = (position.x0 + position.x1) / 2, position.y1
+        fig.text(center, top + 0.035, panel['title'], fontsize=title_fontsize,
+                 ha='center', va='bottom')
+        fig.text(center, top + 0.105, f"{panel['definition']}\nBackground: {panel['background']}",
+                 fontsize=tick_fontsize, ha='center', va='bottom')
+        _add_enrichment_header(fig, [ax], [''], title_fontsize, True)
+        fig.text(position.x0 - 0.15, top + 0.025, chr(65 + index),
+                 fontsize=panel_letter_fontsize, ha='left', va='bottom')
+        for row, (contrast_id, label) in enumerate(panel['labels']):
+            result = results[contrast_id]['all']
+            values = np.asarray([result['obs_values'][trait]] + result['perm_values'][trait], dtype=float)
+            frame = pd.DataFrame(dict(PANEL=chr(65 + index), TRAIT=trait, LABEL=label,
+                                     CONTRAST=contrast_id, ROW=row, PLOT_Y=len(panel['labels']) - 1 - row,
+                                     POINT_TYPE=['observed'] + ['permutation'] * (len(values) - 1),
+                                     PERMUTATION_ID=[-1] + list(range(len(values) - 1)),
+                                     JACCARD=values, Z_SCORE=zscore(values),
+                                     P_VALUE=result['stat'][trait]['pval']))
+            for column, value in summary.loc[contrast_id].items():
+                if column not in frame and column != 'RESULT_FILE':
+                    frame[column] = value
+            frame['PANEL_TITLE'], frame['DEFINITION'], frame['BACKGROUND_LABEL'] = panel['title'], panel['definition'], panel['background']
+            frames.append(frame)
+        axes.append(ax)
+    data = pd.concat(frames, ignore_index=True)
+    os.makedirs(os.path.dirname(os.path.abspath(output_prefix)), exist_ok=True)
+    files = {key: f'{output_prefix}.{ext}' for key, ext in [('pdf', 'pdf'), ('png', 'png'), ('csv', 'csv.gz')]}
+    fig.savefig(files['pdf'], bbox_inches='tight')
+    fig.savefig(files['png'], dpi=300, bbox_inches='tight')
+    temporary = f'{files["csv"]}.tmp'
+    data.to_csv(temporary, index=False, compression='gzip')
+    os.replace(temporary, files['csv'])
+    return dict(figure=fig, axes=axes, plot_data=data, files=files)
