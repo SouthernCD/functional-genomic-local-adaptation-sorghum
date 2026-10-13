@@ -28,7 +28,7 @@ from matplotlib.colors import LinearSegmentedColormap
 from cyvcf2 import VCF
 from interlap import InterLap
 
-from .feature import get_gene_range_df, read_gff_file
+from .feature import get_gene_range_df, read_gff_file, read_fasta_by_faidx
 from .ld import calculate_ld_matrix
 from .utils import multiprocess_running
 from .plot import set_plot_style
@@ -660,10 +660,9 @@ def _save_profile(
 def read_profile(output_file):
     """Read a profile database and its metadata."""
     with pd.HDFStore(output_file, mode="r") as store:
-        profile_df = store["profile"]
-        metadata = json.loads(
-            getattr(store.get_storer("profile").attrs, "metadata", "{}")
-        )
+        key = 'df' if '/df' in store.keys() else 'profile'
+        profile_df = store[key]
+        metadata = json.loads(getattr(store.get_storer(key).attrs, 'metadata', '{}'))
 
     return profile_df, metadata
 
@@ -781,6 +780,19 @@ def build_pi_profiles(
         output_files[anchor] = output_file
 
         if os.path.exists(output_file) and not overwrite:
+            with pd.HDFStore(output_file, mode='r') as store:
+                metadata = json.loads(store.get_storer('profile').attrs.metadata)
+            expected = dict(source=str(vcf_file), flank=int(flank),
+                            bin_size=int(bin_size), step=int(step),
+                            track='pi', anchor=anchor,
+                            orientation='transcription_direction')
+            if any(metadata.get(key) != value for key, value in expected.items()):
+                raise ValueError(
+                    f'{output_file}: saved PI source or window parameters differ. '
+                    'Rebuild only PI with build_pi_profiles(..., overwrite=True), '
+                    'or select a new output directory.'
+                )
+            print(f'Reusing PI profile: {output_file} (source={metadata["source"]})')
             continue
 
         anchor_df = make_anchor_table(gene_info, anchor)
@@ -1299,6 +1311,7 @@ def build_gene_profile_database(
     ld_exclude_self=True,
     ld_min_pairs=1,
     overwrite=False,
+    pi_vcf_file=None,
 ):
     """
     Build all requested per-gene profile databases.
@@ -1316,6 +1329,10 @@ def build_gene_profile_database(
 
     LD is supported as track="ld" but is intentionally not included in the
     default track tuple because it is substantially more expensive to build.
+
+    pi_vcf_file optionally selects a separate unfiltered VCF for diversity;
+    otherwise PI retains the historical vcf_file input. LD uses vcf_file.
+    QRE reads qre_sources GEMMA statistics, not genotypes.
     """
     output_dir = os.fspath(output_dir)
     os.makedirs(output_dir, exist_ok=True)
@@ -1377,16 +1394,17 @@ def build_gene_profile_database(
             )
 
     if "pi" in tracks:
-        if vcf_file is None:
+        pi_source = pi_vcf_file if pi_vcf_file is not None else vcf_file
+        if pi_source is None:
             raise ValueError(
-                "vcf_file is required when building pi profiles"
+                "pi_vcf_file or vcf_file is required when building pi profiles"
             )
 
         p = cfg["pi"]
 
         outputs["pi"] = build_pi_profiles(
             gene_info,
-            vcf_file,
+            pi_source,
             output_dir,
             flank=p["flank"],
             bin_size=p["bin_size"],
@@ -1461,6 +1479,7 @@ def build_gene_profile_database(
 # ---------------------------------------------------------------------
 PLOT_TRACK_ALIASES = {
     "qre": "QRE",
+    "rasi": "RASI",
     "pi": "pi",
     "acr": "ACR",
     "acrs": "ACR",
@@ -1487,6 +1506,8 @@ def _get_plot_profile_path(profile_db, env_name, track, anchor):
     if anchor not in {"TSS", "TTS"}:
         raise ValueError("anchor must be 'TSS' or 'TTS'")
 
+    if track == "RASI":
+        return os.fspath(profile_db['rasi'][env_name][anchor])
     if track == "QRE":
         try:
             return os.fspath(profile_db['qre'][env_name][anchor])
@@ -1508,7 +1529,9 @@ def _get_plot_profile_path(profile_db, env_name, track, anchor):
 def _load_gene_info_from_profile_db(profile_db):
     if "gene_info" not in profile_db:
         raise KeyError("profile_db must contain the 'gene_info' output")
-    return pd.read_hdf(profile_db["gene_info"], key="gene_info")
+    with pd.HDFStore(profile_db['gene_info'], mode='r') as store:
+        key = 'df' if '/df' in store.keys() else 'gene_info'
+        return store[key]
 
 
 def _prepare_plot_gene_sets(
@@ -1600,7 +1623,8 @@ def _summarize_profile_for_plot(
     )
 
     bin_size = int(metadata.get("bin_size", 500))
-    x = profile_df.columns.to_numpy(dtype=float) + bin_size / 2
+    offset = (bin_size - 1) / 2 if metadata.get('position_kind') == 'window_start' else bin_size / 2
+    x = profile_df.columns.to_numpy(dtype=float) + offset
     keep = (x >= plot_xlim[0]) & (x <= plot_xlim[1])
     if not keep.any():
         raise ValueError(
@@ -1877,22 +1901,22 @@ def _add_gene_utr_bars(fig, qre_tss_ax, qre_tts_ax, data, config):
     _plot_length_bar(
         fig, qre_tss_ax, top_gene_info,
         feature_col="gene_length", label="Gene length",
-        y=config.get("gene_bar_y", 0.65), invert_x=False, config=config,
+        y=config.get("gene_bar_y", 0.665), invert_x=False, config=config,
     )
     _plot_length_bar(
         fig, qre_tss_ax, top_gene_info,
         feature_col="5utr_length", label="5' UTR length",
-        y=config.get("utr_bar_y", 0.61), invert_x=False, config=config,
+        y=config.get("utr_bar_y", 0.625), invert_x=False, config=config,
     )
     _plot_length_bar(
         fig, qre_tts_ax, top_gene_info,
         feature_col="gene_length", label="Gene length",
-        y=config.get("gene_bar_y", 0.65), invert_x=True, config=config,
+        y=config.get("gene_bar_y", 0.665), invert_x=True, config=config,
     )
     _plot_length_bar(
         fig, qre_tts_ax, top_gene_info,
         feature_col="3utr_length", label="3' UTR length",
-        y=config.get("utr_bar_y", 0.61), invert_x=True, config=config,
+        y=config.get("utr_bar_y", 0.625), invert_x=True, config=config,
     )
 
 
@@ -1925,8 +1949,6 @@ def _plot_profile_track(
 
     if show_gene_set_labels:
         top_pct = config["_top_gene_quantile"] * 100
-        random_num = config["_random_num"]
-        ci_low, ci_high = config.get("ci_percentiles", (5, 95))
         ax_left.text(
             0.04, 0.90, f"Top {top_pct:g}% GEA genes",
             transform=ax_left.transAxes, ha="left", va="top",
@@ -1934,7 +1956,7 @@ def _plot_profile_track(
         )
         ax_left.text(
             0.04, 0.80,
-            f"Random gene sets\n({ci_low}–{ci_high}%)",
+            "Random gene sets",
             transform=ax_left.transAxes, ha="left", va="top",
             fontsize=config.get("legend_fontsize", 10), color=random_color,
         )
@@ -1988,7 +2010,8 @@ def _plot_high_effect_index_track(ax_left, ax_right, high_effect_df, config, is_
             *config.get("high_effect_annotation_fig_xy", (0.35, 0.19)),
             config.get(
                 "high_effect_annotation_text",
-                "Frequency of high impact CRISPR mutations",
+                'Frequency of high impact CRISPR mutations\n'
+                r'(Groover $\it{et}$ $\it{al.,}$ 2026)',
             ),
             fontsize=config.get("high_effect_annotation_fontsize", 9),
             color=config.get("high_effect_annotation_color", "#000000"),
@@ -2115,8 +2138,8 @@ DEFAULT_PLOT_CONFIG = {
     "show_length_bars": True,
     "length_bar_max": 5500,
     "length_bar_height": 0.02,
-    "gene_bar_y": 0.65,
-    "utr_bar_y": 0.61,
+    "gene_bar_y": 0.665,
+    "utr_bar_y": 0.625,
     "length_bar_label_offset_bp": 200,
     "length_bar_median_target": 0.5,
     "length_bar_median_linewidth": 1,
@@ -2181,6 +2204,9 @@ def plot_env_tracks(
     seed=42,
     track_order=None,
     save_path=None,
+    prepared_data=None,
+    high_effect_df=None,
+    apply_style=True,
 ):
     """
     Plot TSS/TTS tracks from build_gene_profile_database() output.
@@ -2188,28 +2214,33 @@ def plot_env_tracks(
     Top genes are selected from magma_gwas_df_h5 by ascending P_VALUE.
     Each random set contains the same number of genes sampled without
     replacement from the remaining non-top MAGMA genes. The same random
-    sets are used for every anchor and every track.
+    sets are used for every anchor and every track. If prepared_data is supplied,
+    selection/sampling/aggregation are skipped. high_effect_df then supplies the
+    saved TSS mutation curve; apply_style=False retains notebook initialization.
     """
-    set_plot_style()
-
-    plt.rcParams['xtick.labelsize'] = 10
-    plt.rcParams['ytick.labelsize'] = 10
+    if apply_style:
+        set_plot_style()
 
     plot_config = dict(config)
     plot_config["_top_gene_quantile"] = float(top_gene_quantile)
     plot_config["_random_num"] = int(random_num)
 
-    data, track_order = load_env_track_data(
-        env_name,
-        magma_gwas_df_h5,
-        plot_config,
-        top_gene_quantile=top_gene_quantile,
-        random_num=random_num,
-        seed=seed,
-        track_order=track_order,
-    )
+    if prepared_data is None:
+        data, track_order = load_env_track_data(
+            env_name,
+            magma_gwas_df_h5,
+            plot_config,
+            top_gene_quantile=top_gene_quantile,
+            random_num=random_num,
+            seed=seed,
+            track_order=track_order,
+        )
+    else:
+        data = prepared_data
+        track_order = [_normalize_plot_track(track) for track in plot_config['track_order']]
+    primary = 'RASI' if 'RASI' in data else 'QRE'
 
-    all_rows = ["QRE"] + list(track_order)
+    all_rows = [primary] + list(track_order)
     n_rows = len(all_rows)
     height_ratios = [plot_config.get("qre_height_ratio", 3)] + [
         plot_config.get("track_height_ratio", 1)
@@ -2230,15 +2261,15 @@ def plot_env_tracks(
             left_ax = fig.add_subplot(gs[row_idx, 0])
             right_ax = fig.add_subplot(gs[row_idx, 1], sharey=left_ax)
         else:
-            left_ax = fig.add_subplot(gs[row_idx, 0], sharex=axes["QRE"][0])
+            left_ax = fig.add_subplot(gs[row_idx, 0], sharex=axes[primary][0])
             right_ax = fig.add_subplot(
-                gs[row_idx, 1], sharex=axes["QRE"][1], sharey=left_ax
+                gs[row_idx, 1], sharex=axes[primary][1], sharey=left_ax
             )
         axes[track] = (left_ax, right_ax)
 
     _plot_profile_track(
-        *axes["QRE"],
-        data["QRE"],
+        *axes[primary],
+        data[primary],
         _qre_label(env_desc),
         plot_config,
         is_bottom_track=(n_rows == 1),
@@ -2247,7 +2278,7 @@ def plot_env_tracks(
 
     scale_bar_panel = plot_config.get("scale_bar_panel", "TSS")
     _add_scale_bar(
-        axes["QRE"][0 if scale_bar_panel == "TSS" else 1],
+        axes[primary][0 if scale_bar_panel == "TSS" else 1],
         plot_config,
     )
 
@@ -2258,7 +2289,6 @@ def plot_env_tracks(
         # "LD": r"LD ($r^2$)",
         "LD": ("LD\n" r"($r^2$)"),
     }
-    high_effect_df = None
 
     for i, track in enumerate(track_order):
         is_bottom = i == len(track_order) - 1
@@ -2278,11 +2308,11 @@ def plot_env_tracks(
                 is_bottom_track=is_bottom,
             )
 
-    for ax in axes["QRE"]:
+    for ax in axes[primary]:
         ax.set_xlim(*plot_config.get("plot_xlim", (-5500, 5500)))
 
     _add_gene_utr_bars(
-        fig, axes["QRE"][0], axes["QRE"][1], data, plot_config
+        fig, axes[primary][0], axes[primary][1], data, plot_config
     )
 
     if save_path is None and plot_config.get("save_fig", True):
@@ -2386,3 +2416,660 @@ if __name__ == "__main__":
         random_num=1000,
         seed=42,
     )
+
+
+def prepare_rasi_examples(gff_file, gwas_h5, gene_configs, output_dir,
+                          env_id='gsl', env_description='Growing Season Length',
+                          flank=10000, bin_size=500, step=10,
+                          min_variants=4, force_recompute=False):
+    """Prepare small anchor-centered examples of relative association intensity.
+
+    Parameters
+    ----------
+    gff_file, gwas_h5 : str
+        Gene annotation and QC GEMMA table (key 'df', ID/CHROM/POS/P_WALD).
+        Both are read once for all requested examples needing preparation.
+    gene_configs : sequence of dict
+        gene_id and gene_name entries; each produces TSS and TTS examples.
+    output_dir : str
+        Destination for per-gene/environment sites, windows and summary CSV.gz.
+    env_id, env_description : str
+        Environmental identifier and display label.
+    flank, bin_size, step : int
+        Anchor region radius, window length and step in bp.
+        Defaults are 10000, 500 and 10. Windows follow transcription direction;
+        plot positions use the original window coordinate plus bin_size / 2.
+    min_variants : int
+        Minimum tested variants for the raw-P quartile; default 4. Windows
+        with fewer variants use the regional quartile (ratio one). Regions
+        with fewer variants have ratio one throughout, as in original QRE.
+    force_recompute : bool
+        Replace saved examples when True. Otherwise reuse a complete three-file
+        set; input/parameter changes require explicit recomputation.
+
+    Returns
+    -------
+    dict
+        summaries, files. Ratios use -log10 of raw-P 25th percentiles. Regions
+        extend from anchor-flank through anchor+flank-1; the original window
+        splitter retains its final clipped window. No MAGMA selection, random sampling or whole-genome profiles
+        are computed; existing legacy QRE results are not modified.
+    """
+    from datetime import datetime
+    from tqdm.auto import tqdm
+
+    if min(flank, bin_size, step, min_variants) < 1 or bin_size > 2 * flank + 1:
+        raise ValueError('Require positive sizes and windows fitting within the region.')
+    configs = list(gene_configs)
+    if not configs or len({c['gene_id'] for c in configs}) != len(configs):
+        raise ValueError('Provide at least one example with unique gene IDs.')
+    os.makedirs(output_dir, exist_ok=True)
+    files = {c['gene_id']: {kind: f"{output_dir}/{c['gene_id']}.{env_id}.rasi.{kind}.csv.gz"
+                          for kind in ['sites', 'windows', 'summary']} for c in configs}
+    pending = [c for c in configs if force_recompute or not all(os.path.exists(path) for path in files[c['gene_id']].values())]
+    print(f'[{datetime.now():%H:%M:%S}] Preparing {len(pending)} RASI examples')
+    if pending:
+        genes = read_gff_file(gff_file)['gene']
+        associations = pd.read_hdf(gwas_h5, key='df')[['ID', 'CHROM', 'POS', 'P_WALD']]
+        if associations['ID'].isna().any() or not associations['ID'].is_unique:
+            raise ValueError('GEMMA variant IDs must be unique and nonmissing.')
+    summaries = []
+    for config in tqdm(configs, desc='RASI examples'):
+        gene_id, gene_name = config['gene_id'], config['gene_name']
+        paths = files[gene_id]
+        if config not in pending:
+            summary = pd.read_csv(paths['summary'])
+            if 'STATISTIC' not in summary or not summary['STATISTIC'].eq(QRE_STATISTIC).all():
+                raise ValueError('Saved example statistic changed; use force_recompute=True.')
+            expected = dict(GENE_ID=gene_id, GENE_NAME=gene_name, ENV_ID=env_id,
+                            ENV_DESCRIPTION=env_description, FLANK=flank,
+                            BIN_SIZE=bin_size, STEP=step, MIN_VARIANTS=min_variants)
+            if any(key not in summary or not summary[key].eq(value).all()
+                   for key, value in expected.items()):
+                raise ValueError('Saved example parameters changed; use force_recompute=True.')
+            print(f'Reusing {paths["summary"]}; explicit recomputation is required after input/parameter changes.')
+        else:
+            if gene_id not in genes:
+                raise ValueError(f'Gene not found in GFF: {gene_id}')
+            gene = genes[gene_id]
+            if gene.strand not in ['+', '-']:
+                raise ValueError(f'{gene_id}: strand must be + or -.')
+            direction = 1 if gene.strand == '+' else -1
+            anchors = dict(TSS=gene.start if direction == 1 else gene.end,
+                           TTS=gene.end if direction == 1 else gene.start)
+            site_frames, window_rows, reference_rows = [], [], []
+            for anchor, position in anchors.items():
+                region_start, region_end = position - flank, position + flank - 1
+                sites = associations.loc[(associations['CHROM'] == gene.chr_id)
+                                         & associations['POS'].between(region_start, region_end)].copy()
+                pvalues = sites['P_WALD'].to_numpy(dtype=float)
+                if not np.isfinite(pvalues).all() or ((pvalues < 0) | (pvalues > 1)).any():
+                    raise ValueError(f'{gene_id} {anchor}: require valid P values in [0, 1].')
+                with np.errstate(divide='ignore'):
+                    sites['SIGNAL'] = -np.log10(pvalues)
+                sites['RELATIVE_POS'] = direction * (sites['POS'] - position)
+                sites['ANCHOR'], sites['GENE_ID'], sites['ENV_ID'] = anchor, gene_id, env_id
+                sites = sites.sort_values(['POS', 'ID'])
+                profile = _legacy_qre_profile(position, gene.strand, sites['POS'].to_numpy(),
+                    sites['P_WALD'].to_numpy(), flank, bin_size, step, min_variants)
+                region_q1 = profile['region_signal']
+                site_frames.append(sites)
+                for i, coordinate in enumerate(profile['coordinates']):
+                    lo, hi = profile['bounds'][i]
+                    window_rows.append(dict(GENE_ID=gene_id, ENV_ID=env_id, ANCHOR=anchor,
+                        RELATIVE_START=int(coordinate), RELATIVE_END=int(coordinate + hi - lo),
+                        RELATIVE_CENTER=float(coordinate + bin_size / 2),
+                        GENOMIC_START=int(lo), GENOMIC_END=int(hi),
+                        N_VARIANTS=int(profile['counts'][i]), WINDOW_P_Q25=profile['p25'][i],
+                        REGION_P_Q25=profile['region_p25'], WINDOW_SIGNAL=profile['signal'][i],
+                        REGION_SIGNAL=region_q1, RASI=profile['ratios'][i]))
+                reference_rows.append(dict(GENE_ID=gene_id, GENE_NAME=gene_name, ENV_ID=env_id,
+                                           ENV_DESCRIPTION=env_description, CHROM=gene.chr_id,
+                                           STRAND=gene.strand, GENE_START=gene.start, GENE_END=gene.end,
+                                           ANCHOR=anchor, ANCHOR_POS=position,
+                                           REGION_START=region_start, REGION_END=region_end,
+                                           N_VARIANTS=len(sites), REGION_SIGNAL=region_q1,
+                                           REGION_P_Q25=profile['region_p25'], STATISTIC=QRE_STATISTIC, FLANK=flank,
+                                           BIN_SIZE=bin_size, STEP=step, MIN_VARIANTS=min_variants))
+            summary = pd.DataFrame(reference_rows)
+            for kind, frame in [('sites', pd.concat(site_frames, ignore_index=True)),
+                                ('windows', pd.DataFrame(window_rows)), ('summary', summary)]:
+                temporary = f'{paths[kind]}.tmp'
+                frame.to_csv(temporary, index=False, compression='gzip')
+                os.replace(temporary, paths[kind])
+        summaries.append(summary)
+    return dict(summaries=pd.concat(summaries, ignore_index=True), files=files)
+
+
+def plot_rasi_example(sites_csv, windows_csv, summary_csv, output_prefix,
+                       figsize=(10, 6.5), label_fontsize=11, title_fontsize=12,
+                       point_size=10, wspace=0.25, hspace=0.15):
+    """Plot GWAS signals, transformed raw-P quartiles and RASI for TSS/TTS of one example gene.
+
+    Parameters
+    ----------
+    sites_csv, windows_csv, summary_csv : str
+        Saved prepare_rasi_examples outputs; plotting performs no calculations.
+    output_prefix : str
+        Destination prefix for PDF, PNG and actual plotted-value CSV.gz.
+    figsize : tuple
+        Figure dimensions in inches; two anchors by three rows.
+    label_fontsize, title_fontsize, point_size : float
+        Label/title sizes and GWAS scatter area in points squared.
+    wspace, hspace : float
+        Horizontal and vertical subplot spacing. Shared style is retained.
+
+    Returns
+    -------
+    dict
+        figure, axes, plot_data and files. Export series include GWAS signals,
+        transformed raw-P Q25, regional references, RASI and gene coordinates. No enrichment
+        significance is inferred; RASI=1 is a regional-intensity reference.
+    """
+    sites, windows, summary = [pd.read_csv(path) for path in [sites_csv, windows_csv, summary_csv]]
+    if len(summary) != 2 or set(summary['ANCHOR']) != {'TSS', 'TTS'} or summary['GENE_ID'].nunique() != 1:
+        raise ValueError('Expected one gene and exactly two anchor summaries.')
+    fig, axes = plt.subplots(3, 2, figsize=figsize, sharex='col', squeeze=False)
+    frames = []
+    for column, anchor in enumerate(['TSS', 'TTS']):
+        meta = summary.loc[summary['ANCHOR'] == anchor].iloc[0]
+        points = sites.loc[sites['ANCHOR'] == anchor]
+        curve = windows.loc[windows['ANCHOR'] == anchor]
+        x = curve['RELATIVE_CENTER'] / 1000
+        axes[0, column].scatter(points['RELATIVE_POS'] / 1000, points['SIGNAL'],
+                                s=point_size, color='#5580B0', alpha=0.8)
+        axes[1, column].plot(x, curve['WINDOW_SIGNAL'], color='#5580B0', label=r'Window $-\log_{10}[Q_{25}(P)]$')
+        axes[1, column].axhline(meta['REGION_SIGNAL'], color='#C36A2D', linestyle='--',
+                                 label=f"Regional reference = {meta['REGION_SIGNAL']:.3f}")
+        axes[1, column].legend(fontsize=9, frameon=False, loc='upper right')
+        axes[2, column].plot(x, curve['RASI'], color='#5580B0')
+        axes[2, column].axhline(1, color='#C36A2D', linestyle='--')
+        direction = 1 if meta['STRAND'] == '+' else -1
+        gene_limits = sorted([direction * (meta['GENE_START'] - meta['ANCHOR_POS']) / 1000,
+                              direction * (meta['GENE_END'] - meta['ANCHOR_POS']) / 1000])
+        for row in range(3):
+            ax = axes[row, column]
+            ax.axvline(0, color='gray', linestyle=':', linewidth=0.8)
+            ax.axvspan(max(gene_limits[0], -meta['FLANK'] / 1000),
+                       min(gene_limits[1], meta['FLANK'] / 1000), color='gray', alpha=0.08)
+            ax.set_xlim(-meta['FLANK'] / 1000, meta['FLANK'] / 1000)
+            ax.tick_params(labelsize=label_fontsize - 1)
+            ax.spines[['top', 'right']].set_visible(False)
+        axes[0, column].set_title(f'{anchor} | {meta["CHROM"]}:{int(meta["ANCHOR_POS"]):,} ({meta["STRAND"]})', fontsize=title_fontsize)
+        axes[2, column].set_xlabel(f'Distance from {anchor} (kb; transcription direction)', fontsize=label_fontsize)
+        a = points.copy(); a['SERIES'], a['X_KB'], a['VALUE'] = 'GWAS', a['RELATIVE_POS'] / 1000, a['SIGNAL']; frames.append(a)
+        for series, values in [('WINDOW_SIGNAL', curve['WINDOW_SIGNAL']), ('REGION_SIGNAL', curve['REGION_SIGNAL']), ('RASI', curve['RASI'])]:
+            a = curve.copy(); a['SERIES'], a['X_KB'], a['VALUE'] = series, x, values; frames.append(a)
+        a = pd.DataFrame([dict(GENE_ID=meta['GENE_ID'], ENV_ID=meta['ENV_ID'], ANCHOR=anchor,
+                              SERIES='RASI_REFERENCE', X_KB=-meta['FLANK'] / 1000, VALUE=1),
+                          dict(GENE_ID=meta['GENE_ID'], ENV_ID=meta['ENV_ID'], ANCHOR=anchor,
+                               SERIES='RASI_REFERENCE', X_KB=meta['FLANK'] / 1000, VALUE=1)])
+        frames.extend([a, summary.loc[summary['ANCHOR'] == anchor].assign(SERIES='GENE_AND_REGION')])
+    for row, ylabel in enumerate([r'$-\log_{10}(P)$', r'$-\log_{10}[Q_{25}(P)]$', 'RASI']):
+        axes[row, 0].set_ylabel(ylabel, fontsize=label_fontsize)
+    meta = summary.iloc[0]
+    fig.suptitle(f"{meta['GENE_NAME']} | {meta['ENV_DESCRIPTION']}", fontsize=title_fontsize + 1)
+    fig.subplots_adjust(top=0.88, bottom=0.10, left=0.09, right=0.98, wspace=wspace, hspace=hspace)
+    data = pd.concat(frames, ignore_index=True)
+    os.makedirs(os.path.dirname(os.path.abspath(output_prefix)), exist_ok=True)
+    files = {kind: f'{output_prefix}.{extension}' for kind, extension in [('pdf', 'pdf'), ('png', 'png'), ('csv', 'csv.gz')]}
+    fig.savefig(files['pdf'], bbox_inches='tight')
+    fig.savefig(files['png'], dpi=300, bbox_inches='tight')
+    temporary = f'{files["csv"]}.tmp'
+    data.to_csv(temporary, index=False, compression='gzip')
+    os.replace(temporary, files['csv'])
+    return dict(figure=fig, axes=axes, plot_data=data, files=files)
+
+
+def _spatial_window_starts(flank, bin_size, step):
+    """Return full-window starts in transcription-oriented anchor coordinates."""
+    return np.arange(-flank, flank - bin_size + 2, step, dtype=int)
+
+
+QRE_STATISTIC = 'negative_log10_raw_P25_ratio_legacy_windows'
+
+
+def _legacy_qre_profile(position, strand, positions, pvalues, flank, bin_size, step, min_variants=4):
+    """Reproduce original raw-P quartiles, sparse-window fallback and coordinates."""
+    region_start, region_end = position - flank, position + flank - 1
+    windows = list(split_sequence_to_windows(region_end, step, bin_size, start=region_start))
+    coordinates, bounds = [], []
+    for _, start, end in windows:
+        if strand == '-':
+            start, end = region_start + region_end - start, region_start + region_end - end
+            coordinate = abs(start - region_end) + 1 - flank
+        else:
+            coordinate = abs(start - region_start) + 1 - flank
+        coordinates.append(coordinate)
+        bounds.append(sorted((start, end)))
+    bounds = np.asarray(bounds, dtype=int)
+    positions, pvalues = np.asarray(positions), np.asarray(pvalues, dtype=float)
+    order = np.argsort(positions, kind='stable')
+    positions, pvalues = positions[order], pvalues[order]
+    keep = (positions >= region_start) & (positions <= region_end)
+    positions, pvalues = positions[keep], pvalues[keep]
+    if not np.isfinite(pvalues).all() or ((pvalues < 0) | (pvalues > 1)).any():
+        raise ValueError('QRE requires finite raw P values in [0, 1].')
+    left = np.searchsorted(positions, bounds[:, 0], side='left')
+    right = np.searchsorted(positions, bounds[:, 1], side='right')
+    counts = right - left
+    ratios = np.ones(len(bounds), dtype=float)
+    regional_q25 = np.percentile(pvalues, 25) if len(pvalues) >= min_variants else np.nan
+    window_q25 = np.full(len(bounds), regional_q25, dtype=float)
+    if len(pvalues) >= min_variants:
+        for i, (lo, hi) in enumerate(zip(left, right)):
+            if hi - lo >= min_variants:
+                window_q25[i] = np.percentile(pvalues[lo:hi], 25)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            ratios = -np.log10(window_q25) / -np.log10(regional_q25)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        regional_signal = -np.log10(regional_q25)
+        window_signal = -np.log10(window_q25)
+    return dict(coordinates=np.asarray(coordinates), bounds=bounds, counts=counts,
+                p25=window_q25, region_p25=regional_q25,
+                signal=window_signal, region_signal=regional_signal, ratios=ratios)
+
+
+def _spatial_rasi_worker(arguments):
+    position, strand, positions, pvalues, flank, bin_size, step, min_variants = arguments
+    return _legacy_qre_profile(position, strand, positions, pvalues, flank,
+                               bin_size, step, min_variants)['ratios']
+
+
+def _spatial_genotype_worker(arguments):
+    chrom, position, strand, vcf_file, track, starts, bin_size, flank, exclude_self, min_pairs, chromosome_length = arguments
+    direction = 1 if strand == '+' else -1
+    boundaries = position + direction * np.column_stack([starts, starts + bin_size - 1])
+    windows = np.sort(boundaries, axis=1).astype(int)
+    output = np.full(len(starts), np.nan)
+    valid = (windows[:, 0] >= 1) & (windows[:, 1] <= chromosome_length)
+    if not valid.any():
+        return output
+    if track == 'pi':
+        genotypes, positions = load_genotypes(vcf_file, chrom, [(max(1, position - flank), min(chromosome_length, position + flank))])
+        if genotypes is None:
+            output[valid] = 0
+            return output
+        counts = allel.GenotypeArray(genotypes).count_alleles()
+        order = np.argsort(windows[valid, 0], kind='stable')
+        sorted_windows = windows[valid][order]
+        diversity, _, _, _ = allel.windowed_diversity(positions, counts, windows=sorted_windows)
+        restored = np.empty(len(order)); restored[order] = diversity
+        output[valid] = restored
+        return output
+    sites = _load_variant_sites(vcf_file, chrom, max(1, position - flank), min(chromosome_length, position + flank))
+    if sites.empty:
+        return output
+    relative = direction * (sites['POS'] - position)
+    reference_start = -(bin_size // 2)
+    reference = sites.loc[relative.between(reference_start, reference_start + bin_size - 1)]
+    if reference.empty:
+        return output
+    r2 = calculate_ld_matrix(reference, vcf_file, site_info_df2=sites,
+                             ld_window_size=flank + bin_size + 1,
+                             output_format='matrix', pool_num=1, show_progress=False).to_numpy(dtype=float, copy=True)
+    if exclude_self:
+        r2[reference['POS'].to_numpy()[:, None] == sites['POS'].to_numpy()[None, :]] = np.nan
+    order = np.argsort(sites['POS'].to_numpy())
+    positions = sites['POS'].to_numpy()[order]
+    sums = np.r_[0, np.cumsum(np.nansum(r2, axis=0)[order])]
+    counts = np.r_[0, np.cumsum(np.isfinite(r2).sum(axis=0)[order])]
+    left = np.searchsorted(positions, windows[:, 0], side='left')
+    right = np.searchsorted(positions, windows[:, 1], side='right')
+    pair_count = counts[right] - counts[left]
+    np.divide(sums[right] - sums[left], pair_count, out=output,
+              where=valid & (pair_count >= min_pairs))
+    return output
+
+
+def _write_spatial_profile(frame, path, metadata):
+    """Save one large profile with key df and atomic replacement."""
+    temporary = f'{path}.tmp'
+    with pd.HDFStore(temporary, mode='w') as store:
+        store.put('df', frame, format='fixed')
+        store.get_storer('df').attrs.metadata = json.dumps(metadata)
+    os.replace(temporary, path)
+
+
+def _reuse_spatial_profile(path, metadata, force_recompute):
+    """Reuse only a profile with matching source and scientific parameters."""
+    if force_recompute or not os.path.exists(path):
+        return False
+    with pd.HDFStore(path, mode='r') as store:
+        saved = json.loads(store.get_storer('df').attrs.metadata)
+    if saved != metadata:
+        raise ValueError(f'{path}: profile definition changed; set force_recompute=True or use a new output directory.')
+    print(f'Reusing {path}')
+    return True
+
+
+def prepare_spatial_profile_database(gff_file, association_sources, qc_vcf_file,
+                                     pi_vcf_file, acr_bed_file, umr_bed_file,
+                                     output_dir, flank=10000, bin_size=500, step=10,
+                                     min_variants=4, threads=20, ld_threads=4,
+                                     bed_zero_based=False, exclude_self=True,
+                                     min_pairs=1, force_recompute=False,
+                                     genome_fasta_file=None):
+    """Prepare consistent RASI, PI, coverage and LD matrices around gene anchors.
+
+    Parameters
+    ----------
+    gff_file : str
+        Gene annotation; TSS/TTS follow strand. Gene/UTR lengths retain the
+        existing first-annotated-transcript definition for length bars.
+    association_sources : dict
+        Environmental IDs mapped to QC GEMMA HDF tables with key df.
+    qc_vcf_file, pi_vcf_file : str
+        QC genotypes for LD and unfiltered landrace genotypes for diversity.
+    acr_bed_file, umr_bed_file : str
+        Project annotation intervals; coordinates are 1-based inclusive unless
+        bed_zero_based=True explicitly requests standard BED conversion.
+    output_dir : str
+        Large matrices (key df) and profile_database.json destination.
+    genome_fasta_file : str
+        Reference FASTA used to obtain sequence lengths through the existing
+        feature.read_fasta_by_faidx helper without loading sequences into memory.
+        Required; VCF header lengths are not used.
+    flank, bin_size, step : int
+        Symmetric anchor radius, window size and step in bp; defaults 10000/500/10.
+    min_variants : int
+        Minimum tested variants for the raw-P Q25; default 4. Sparse windows
+        use the regional percentile, and sparse regions have RASI=1 throughout.
+    threads, ld_threads : int
+        Independent-anchor process counts. All computation is explicit here.
+    bed_zero_based, exclude_self : bool
+        Interval conversion and LD identical-site exclusion controls.
+    min_pairs : int
+        Minimum finite LD pairs per window; default 1.
+    force_recompute : bool
+        Rebuild after inputs/parameters change; otherwise reuse compatible files.
+        Source-content changes at the same path require explicit recomputation.
+
+    Returns
+    -------
+    dict
+        Profile paths also saved in a JSON manifest. RASI compares -log10 of
+        raw-P Q25 between each window and its full anchor region;
+        ACR/UMR are union-covered bases divided by the full window length.
+        RASI retains the original relative window coordinates plus bin_size/2
+        for plotting. Other tracks use full-window centers in transcription
+        direction. Existing legacy profile files are not modified.
+    """
+    from concurrent.futures import ProcessPoolExecutor
+    from datetime import datetime
+    from tqdm.auto import tqdm
+    from .contexts import _window_repeat_fraction
+
+    if min(flank, bin_size, step, min_variants, threads, ld_threads, min_pairs) < 1 or bin_size > 2 * flank + 1:
+        raise ValueError('Require positive settings and windows fitting inside the region.')
+    if genome_fasta_file is None:
+        raise ValueError('genome_fasta_file is required for reference chromosome lengths.')
+    genome = read_fasta_by_faidx(genome_fasta_file)
+    chromosome_lengths = {chrom: record.len() for chrom, record in genome.items()}
+    os.makedirs(output_dir, exist_ok=True)
+    gene_file = f'{output_dir}/gene_info.gff.h5'
+    gene_metadata = dict(source=str(gff_file), utr_transcript='first_annotated')
+    if _reuse_spatial_profile(gene_file, gene_metadata, force_recompute):
+        genes = pd.read_hdf(gene_file, key='df')
+    else:
+        genes = build_gene_info(gff_file)
+        _write_spatial_profile(genes, gene_file, gene_metadata)
+    starts = _spatial_window_starts(flank, bin_size, step)
+    vcf = VCF(qc_vcf_file)
+    try:
+        qc_samples = list(vcf.samples)
+    finally:
+        vcf.close()
+    vcf = VCF(pi_vcf_file)
+    try:
+        if list(vcf.samples) != qc_samples:
+            raise ValueError('PI and QC VCFs must contain the same landrace samples in the same order.')
+    finally:
+        vcf.close()
+    if any(chrom not in chromosome_lengths or chromosome_lengths[chrom] < 1 for chrom in genes['chrom'].unique()):
+        raise ValueError('Reference FASTA must contain positive lengths for all gene chromosomes.')
+    outputs = dict(gene_info=gene_file, rasi={}, pi={}, ld={}, acr={}, umr={})
+    common = dict(gff_file=str(gff_file), genome_fasta_file=str(genome_fasta_file),
+                  flank=flank, bin_size=bin_size, step=step,
+                  orientation='transcription_direction', position_kind='window_start',
+                  coordinate_system='1-based inclusive', region_definition='anchor ± flank')
+    print(f'[{datetime.now():%H:%M:%S}] Building spatial profiles for {len(genes)} genes')
+    for env_id, source in tqdm(association_sources.items(), desc='RASI environments'):
+        outputs['rasi'][env_id] = {}
+        association = None
+        for anchor in ['TSS', 'TTS']:
+            path = f'{output_dir}/{anchor}.RASI.{env_id}.h5'
+            outputs['rasi'][env_id][anchor] = path
+            metadata = dict(common, track='RASI', anchor=anchor, source=str(source),
+                            min_variants=min_variants, statistic=QRE_STATISTIC)
+            metadata.update(position_kind='legacy_qre_window',
+                            region_definition='anchor-flank through anchor+flank-1',
+                            insufficient_variants='ratio_one')
+            rasi_coordinates = _relative_window_positions(flank, step, bin_size)
+            if _reuse_spatial_profile(path, metadata, force_recompute):
+                continue
+            if association is None:
+                data = pd.read_hdf(source, key='df')[['ID', 'CHROM', 'POS', 'P_WALD']]
+                if data['ID'].isna().any() or not data['ID'].is_unique:
+                    raise ValueError(f'{env_id}: variant IDs must be nonmissing and unique.')
+                association = {chrom: frame.sort_values('POS') for chrom, frame in data.groupby('CHROM')}
+                del data
+            unique = list(dict.fromkeys((row['chrom'], int(row[anchor]), row['strand']) for _, row in genes.iterrows()))
+            arguments = []
+            for chrom, position, strand in unique:
+                frame = association.get(chrom)
+                if frame is None:
+                    positions, pvalues = np.array([], dtype=int), np.array([], dtype=float)
+                else:
+                    positions = frame['POS'].to_numpy()
+                    left = np.searchsorted(positions, position-flank, side='left')
+                    right = np.searchsorted(positions, position+flank-1, side='right')
+                    pvalues = frame['P_WALD'].to_numpy()[left:right]
+                    positions = positions[left:right]
+                arguments.append((position, strand, positions, pvalues, flank, bin_size, step, min_variants))
+            with ProcessPoolExecutor(max_workers=threads) as pool:
+                values = list(tqdm(pool.map(_spatial_rasi_worker, arguments, chunksize=16), total=len(arguments), desc=f'{env_id} {anchor}'))
+            lookup = dict(zip(unique, values))
+            frame = pd.DataFrame([lookup[(row['chrom'], int(row[anchor]), row['strand'])]
+                                  for _, row in genes.iterrows()], index=genes.index,
+                                  columns=rasi_coordinates)
+            _write_spatial_profile(frame, path, metadata)
+        del association
+    for track, source, workers in [('pi', pi_vcf_file, threads), ('ld', qc_vcf_file, ld_threads)]:
+        for anchor in ['TSS', 'TTS']:
+            name = 'pi.unfiltered' if track == 'pi' else 'LD'
+            path = f'{output_dir}/{anchor}.{name}.centered.h5'
+            outputs[track][anchor] = path
+            metadata = dict(common, track=track, source=str(source), anchor=anchor)
+            if track == 'ld':
+                metadata.update(exclude_self=exclude_self, min_pairs=min_pairs, reference_window='anchor-centered', aggregation='mean_finite_pairwise_r2')
+            if _reuse_spatial_profile(path, metadata, force_recompute):
+                continue
+            unique = list(dict.fromkeys((row['chrom'], int(row[anchor]), row['strand']) for _, row in genes.iterrows()))
+            arguments = [(chrom, position, strand, source, track, starts, bin_size, flank, exclude_self, min_pairs, chromosome_lengths[chrom]) for chrom, position, strand in unique]
+            with ProcessPoolExecutor(max_workers=workers) as pool:
+                values = list(tqdm(pool.map(_spatial_genotype_worker, arguments, chunksize=4), total=len(arguments), desc=f'{track} {anchor}'))
+            lookup = dict(zip(unique, values))
+            frame = pd.DataFrame([lookup[(row['chrom'], int(row[anchor]), row['strand'])] for _, row in genes.iterrows()], index=genes.index, columns=starts)
+            _write_spatial_profile(frame, path, metadata)
+    for track, source in [('acr', acr_bed_file), ('umr', umr_bed_file)]:
+        intervals = None
+        for anchor in ['TSS', 'TTS']:
+            path = f'{output_dir}/{anchor}.{track.upper()}.coverage.h5'
+            outputs[track][anchor] = path
+            metadata = dict(common, track=track, source=str(source), anchor=anchor,
+                            aggregation='union_covered_base_fraction', bed_zero_based=bed_zero_based)
+            if _reuse_spatial_profile(path, metadata, force_recompute):
+                continue
+            if intervals is None:
+                bed = pd.read_csv(source, sep='\t', header=None, comment='#', usecols=[0, 1, 2], names=['CHROM', 'START', 'END'])
+                if bed_zero_based:
+                    bed['START'] += 1
+                if (bed['START'] < 1).any() or (bed['END'] < bed['START']).any():
+                    raise ValueError(f'{source}: invalid annotation intervals.')
+                intervals = {chrom: InterLap(list(frame[['START', 'END']].itertuples(index=False, name=None))) for chrom, frame in bed.groupby('CHROM')}
+            values = []
+            for _, row in tqdm(genes.iterrows(), total=len(genes), desc=f'{track} {anchor}'):
+                direction = 1 if row['strand'] == '+' else -1
+                windows = np.sort(int(row[anchor]) + direction * np.column_stack([starts, starts+bin_size-1]), axis=1)
+                tree = intervals.get(row['chrom'])
+                overlap = list(tree.find((int(windows.min()), int(windows.max())))) if tree is not None else []
+                fractions = _window_repeat_fraction(windows, overlap)
+                fractions[(windows[:, 0] < 1) | (windows[:, 1] > chromosome_lengths[row['chrom']])] = np.nan
+                values.append(fractions)
+            _write_spatial_profile(pd.DataFrame(values, index=genes.index, columns=starts), path, metadata)
+    manifest = f'{output_dir}/profile_database.json'
+    with open(f'{manifest}.tmp', 'w') as handle:
+        json.dump(outputs, handle, indent=2)
+    os.replace(f'{manifest}.tmp', manifest)
+    return outputs
+
+
+def prepare_gene_set_profiles(profile_manifest, env_id, magma_h5, high_effect_csv,
+                               output_prefix, top_gene_quantile=0.05, random_num=1000,
+                               seed=42, plot_xlim=(-5500, 5500),
+                               ci_percentiles=(5, 95), random_batch_size=8,
+                               force_recompute=False):
+    """Save mean spatial tracks and equal-size random-set empirical intervals.
+
+    Parameters
+    ----------
+    profile_manifest : str
+        JSON manifest written by prepare_spatial_profile_database.
+    env_id, magma_h5 : str
+        Environmental ID and MAGMA association table.
+    high_effect_csv : str
+        Computed promoter mutation index from Section 2.
+    output_prefix : str
+        Summary, gene selection, selected gene information and settings prefixes.
+    top_gene_quantile : float
+        Fixed-count top fraction after sorting MAGMA P values, default 0.05.
+        The original floor-count rule is retained; ties do not expand the set.
+    random_num, seed : int
+        Number and seed of equal-size non-top gene samples, defaults 1000/42.
+    plot_xlim, ci_percentiles : tuple
+        Window-center range in bp and empirical bounds, defaults ±5500/5–95.
+    random_batch_size : int
+        Batch size for mean aggregation; default 8.
+    force_recompute : bool
+        Recompute when inputs or scientific parameters change; otherwise reuse
+        complete results with matching settings. Same-path content changes require force.
+
+    Returns
+    -------
+    dict
+        Small CSV.gz profiles, selection and gene-info paths plus metadata JSON.
+        One random-set collection is shared across tracks/anchors; sampling is
+        without replacement within each set, from eligible non-top MAGMA genes.
+        The fixed promoter index is TSS-only and has no random interval.
+    """
+    from datetime import datetime
+    files = {key: f'{output_prefix}.{suffix}' for key, suffix in
+             [('profiles', 'profiles.csv.gz'), ('selection', 'genes.csv.gz'),
+              ('gene_info', 'top_gene_info.csv.gz'), ('metadata', 'metadata.json')]}
+    settings = dict(profile_manifest=profile_manifest, env_id=env_id, magma_h5=magma_h5,
+                    high_effect_csv=high_effect_csv, top_gene_quantile=top_gene_quantile,
+                    random_num=random_num, seed=seed, plot_xlim=list(plot_xlim),
+                    ci_percentiles=list(ci_percentiles), rasi_statistic=QRE_STATISTIC)
+    if not force_recompute and all(os.path.exists(path) for path in files.values()):
+        with open(files['metadata']) as handle:
+            saved = json.load(handle)
+        if all(saved.get(key) == value for key, value in settings.items()):
+            print(f'Reusing {output_prefix}; input-content changes require force_recompute=True.')
+            return files
+        raise ValueError('Saved gene-set definition changed; set force_recompute=True.')
+    print(f'[{datetime.now():%H:%M:%S}] Summarizing {env_id} spatial tracks')
+    with open(profile_manifest) as handle:
+        database = json.load(handle)
+    genes = _load_gene_info_from_profile_db(database)
+    sets = _prepare_plot_gene_sets(magma_h5, genes.index, top_gene_quantile, random_num, seed)
+    frames = []
+    for track in ['RASI', 'pi', 'LD', 'ACR', 'UMR']:
+        for anchor in ['TSS', 'TTS']:
+            summary = _summarize_profile_for_plot(_get_plot_profile_path(database, env_id, track, anchor), sets,
+                                                   plot_xlim, ci_percentiles, random_batch_size)
+            frames.append(pd.DataFrame(dict(ENV_ID=env_id, TRACK=track, ANCHOR=anchor,
+                                            X=summary['x'], TOP_MEAN=summary['top_mean'],
+                                            RANDOM_LOW=summary['random_low'], RANDOM_HIGH=summary['random_high'])))
+    high = pd.read_csv(high_effect_csv).sort_values('center')
+    high = high.loc[high['center'].between(*plot_xlim)]
+    frames.append(pd.DataFrame(dict(ENV_ID=env_id, TRACK='high_effect_index', ANCHOR='TSS', X=high['center'],
+                                    TOP_MEAN=high['relative_probability_index'], RANDOM_LOW=np.nan, RANDOM_HIGH=np.nan)))
+    selection = pd.DataFrame({'gene_id': np.r_[sets['top_genes'], sets['background_genes']],
+                              'COHORT': ['top'] * len(sets['top_genes']) + ['background'] * len(sets['background_genes'])})
+    os.makedirs(os.path.dirname(os.path.abspath(output_prefix)), exist_ok=True)
+    for key, frame in [('profiles', pd.concat(frames, ignore_index=True)), ('selection', selection),
+                       ('gene_info', genes.reindex(sets['top_genes']).reset_index())]:
+        temporary = f'{files[key]}.tmp'; frame.to_csv(temporary, index=False, compression='gzip'); os.replace(temporary, files[key])
+    settings.update(top_gene_num=sets['top_gene_num'], eligible_gene_num=sets['eligible_gene_num'])
+    with open(f'{files["metadata"]}.tmp', 'w') as handle:
+        json.dump(settings, handle, indent=2)
+    os.replace(f'{files["metadata"]}.tmp', files['metadata'])
+    return files
+
+
+def plot_gene_set_profiles(output_prefix, env_description, figure_prefix,
+                            config=None):
+    """Plot saved gene-set summaries without selection, sampling or profile calculation.
+
+    Parameters
+    ----------
+    output_prefix : str
+        Prefix returned by prepare_gene_set_profiles.
+    env_description : str
+        Display label from environmental metadata.
+    figure_prefix : str
+        PDF, PNG and actual plotted-data CSV.gz destination.
+    config : dict or None
+        Overrides for existing plot layout/colors; global style stays unchanged.
+
+    Returns
+    -------
+    dict
+        figure, axes, plot_data and files. Includes fixed TSS promoter-index values
+        and selected-gene length/UTR information used by the length bars.
+    """
+    frame = pd.read_csv(f'{output_prefix}.profiles.csv.gz')
+    selection = pd.read_csv(f'{output_prefix}.genes.csv.gz')
+    genes = pd.read_csv(f'{output_prefix}.top_gene_info.csv.gz').set_index('gene_id')
+    with open(f'{output_prefix}.metadata.json') as handle:
+        settings = json.load(handle)
+    data = dict(gene_info=genes, gene_sets=dict(top_genes=selection.loc[selection['COHORT'] == 'top', 'gene_id'].to_numpy()))
+    for track in ['RASI', 'pi', 'LD', 'ACR', 'UMR']:
+        data[track] = {}
+        for anchor in ['TSS', 'TTS']:
+            rows = frame.loc[(frame['TRACK'] == track) & (frame['ANCHOR'] == anchor)]
+            data[track][anchor] = dict(x=rows['X'].to_numpy(), top_mean=rows['TOP_MEAN'].to_numpy(),
+                                       random_low=rows['RANDOM_LOW'].to_numpy(), random_high=rows['RANDOM_HIGH'].to_numpy())
+    high = frame.loc[frame['TRACK'] == 'high_effect_index']
+    plot_config = dict(DEFAULT_PLOT_CONFIG)
+    plot_config.update(config or {})
+    plot_config.update(plot_xlim=settings['plot_xlim'], ci_percentiles=settings['ci_percentiles'],
+                       show_fig=False, save_fig=False)
+    fig, axes = plot_env_tracks(settings['env_id'], env_description, None, plot_config,
+                                top_gene_quantile=settings['top_gene_quantile'], random_num=settings['random_num'],
+                                seed=settings['seed'], prepared_data=data,
+                                high_effect_df=high.rename(columns={'X': 'center', 'TOP_MEAN': 'relative_probability_index'}),
+                                apply_style=False)
+    files = {key: f'{figure_prefix}.{suffix}' for key, suffix in [('pdf', 'pdf'), ('png', 'png'), ('csv', 'csv.gz')]}
+    os.makedirs(os.path.dirname(os.path.abspath(figure_prefix)), exist_ok=True)
+    fig.savefig(files['pdf'], bbox_inches='tight'); fig.savefig(files['png'], dpi=300, bbox_inches='tight')
+    information = genes.reset_index().assign(TRACK='gene_and_utr_lengths')
+    length_frames = []
+    length_max = int(plot_config.get('length_bar_max', 5500))
+    lengths = np.arange(length_max)
+    for anchor, feature in [('TSS', 'gene_length'), ('TSS', '5utr_length'),
+                            ('TTS', 'gene_length'), ('TTS', '3utr_length')]:
+        values = pd.to_numeric(genes[feature], errors='coerce')
+        values = values[np.isfinite(values)].to_numpy(dtype=float)
+        if len(values):
+            dist = (values[:, None] >= lengths).mean(axis=0)
+            median_index = int(np.argmin(np.abs(
+                dist - plot_config.get('length_bar_median_target', 0.5))))
+            length_frames.append(pd.DataFrame(dict(TRACK='length_bar', ANCHOR=anchor,
+                                                    FEATURE=feature, X=lengths,
+                                                    COLOR_VALUE=dist,
+                                                    MEDIAN_LENGTH=median_index)))
+    plot_data = pd.concat([frame, information] + length_frames, ignore_index=True)
+    temporary = f'{files["csv"]}.tmp'; plot_data.to_csv(temporary, index=False, compression='gzip'); os.replace(temporary, files['csv'])
+    return dict(figure=fig, axes=axes, plot_data=plot_data, files=files)
