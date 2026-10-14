@@ -1,32 +1,61 @@
+# Project dependencies audited from notebooks/01-05 and src on 2026-10-14.
+# Versions match the analysis environment on Linux x86_64.
+# This is a project dependency specification, not a full environment lockfile.
 name: laenrich
 channels:
   - conda-forge
   - bioconda
 dependencies:
-  - python=3.11
-  - bcftools
-  - htslib
-  - bcbio-gff
-  - biopython
-  - cyvcf2
-  - interlap
-  - pyfaidx
-  - python-igraph
-  - scikit-allel
-  - tqdm
-  - bedtools
-  - gemma=0.98.3
-  - ipykernel
-  - jupyterlab
-  - matplotlib
-  - numpy
-  - pandas
-  - plink
-  - pyyaml
-  - pysam
-  - r-base
-  - scikit-learn=1.5.2
-  - scipy
-  - seaborn
-  - statsmodels=0.14.4
-  - tables
+  - python=3.11.15
+
+  # Numeric analysis, statistics and plotting.
+  - numpy=2.4.6
+  - pandas=3.0.3
+  - scipy=1.17.1
+  - scikit-learn=1.9.0
+  - statsmodels=0.14.6
+  - matplotlib=3.10.9
+  - seaborn=0.13.2
+  - networkx=3.6.1
+  - python-igraph=1.0.0
+  - numba=0.67.0
+  - threadpoolctl=3.6.0
+  - tqdm=4.70.0
+
+  # Genome annotations, VCF access and interval queries.
+  - bcbio-gff=0.7.1
+  - biopython=1.88
+  - cyvcf2=0.34.0
+  - interlap=0.2.7
+  - pyfaidx=0.9.0.4
+  - htslib=1.23.1  # Provides the bgzip and tabix commands used by src.
+
+  # Geographic maps, including shapefile I/O and CRS transformation.
+  - geopandas-base=1.1.1
+  - shapely=2.1.2
+  - pyproj=3.7.2
+  - pyogrio=0.13.0
+
+  # HDF5 storage, configuration and the notebook runtime.
+  - pytables=3.11.1  # Python import name: tables.
+  - pyyaml=6.0.3
+  - ipython=9.15.0
+  - ipykernel=7.3.0
+  - jupyterlab=4.6.0
+
+  # scikit-allel is installed from PyPI with Conda-managed Dask.
+  - dask-core=2026.8.0
+  - pip=26.1.2
+  - pip:
+      - scikit-allel==1.3.13
+
+# Additional executables required on PATH, installed separately:
+#   bcftools 1.24          - VCF preparation and sample/region extraction.
+#   samtools 1.23.1       - FASTA indexing when indexes are absent.
+#   PLINK 1.9.0-b.8       - LD pruning, kinship, LD blocks and genotype conversion.
+#   GEMMA 0.98.5          - Environmental GWAS.
+#   MAGMA 1.10            - Gene-level association tests.
+#   LDAK 5.2              - Variance partitioning and prediction.
+#   FastME 2.1.6.3        - Neighbor-joining tree construction.
+# These commands are not installed by this YAML. Keep their launchers on PATH
+# when starting the Jupyter server so the kernel and its subprocesses inherit it.

@@ -1,61 +1,48 @@
-figshare_collection_url: TBD_FIGSHARE_COLLECTION_URL
-
-# Paths are relative to PROJECT_ROOT/data. This file records only technical
-# file-discovery metadata; scientific parameters are defined where used in
-# the notebooks.
+# Paths are relative to PROJECT_ROOT/data.
 files:
-  # Analysis-ready source files distributed with the study.
-  - {id: reference_fasta, path: source/Sbicolor_730_v5.0.fa.gz, description: BTx623 assembly sequence used with the v5.1 annotation release, source: figshare, required_for: [full]}
-  - {id: reference_fasta_fai, path: source/Sbicolor_730_v5.0.fa.gz.fai, description: FASTA sequence index, source: figshare, required_for: [full]}
-  - {id: reference_fasta_gzi, path: source/Sbicolor_730_v5.0.fa.gz.gzi, description: BGZF FASTA block index, source: figshare, required_for: [full]}
-  - {id: gene_annotation, path: source/Sbicolor_730_v5.1.gene_exons.gff3.gz, description: BTx623 v5.1 gene and exon annotation on the v5.0 assembly sequence, source: figshare, required_for: [full]}
-  - {id: repeat_annotation, path: source/Sbicolor_730_v5.1.repeatmasked_assembly_v5.0.gff3.gz, description: Repeat annotation associated with the BTx623 v5.1 release, source: figshare, required_for: [full]}
-  - {id: landrace_vcf, path: source/landraces.vcf.gz, description: Analysis-ready variant calls for the 443-landrace panel, source: figshare, required_for: [full]}
-  - {id: landrace_vcf_index, path: source/landraces.vcf.gz.tbi, description: Tabix index for the 443-landrace VCF, source: figshare, required_for: [full]}
-  - {id: landrace_pruned_vcf, path: source/landraces_snp_pruned.win15000.miss0.5.maf0.01.het0.01.rq0.5.vcf.gz, description: LD-pruned genotype panel used for population structure, source: figshare, required_for: [full]}
-  - {id: landrace_pruned_vcf_index, path: source/landraces_snp_pruned.win15000.miss0.5.maf0.01.het0.01.rq0.5.vcf.gz.tbi, description: Tabix index for the LD-pruned landrace VCF, source: figshare, required_for: [full]}
-  - {id: landrace_metadata, path: source/landraces_metadata.csv, description: Accession geographic botanical and analysis-ready environmental metadata for 443 landraces, source: figshare, required_for: [checkpoint, full]}
-  - {id: environment_metadata, path: source/envir_metadata.csv, description: Definitions and provenance for the 31 environmental variables, source: figshare, required_for: [checkpoint, full]}
-  - {id: rnaseq_vcf, path: source/RNAseqPanel.vcf.gz, description: Analysis-ready variant calls for the 318-accession RNA-seq panel, source: figshare, required_for: [full]}
-  - {id: rnaseq_vcf_index, path: source/RNAseqPanel.vcf.gz.tbi, description: Tabix index for the RNA-seq panel VCF, source: figshare, required_for: [full]}
-  - {id: rnaseq_pruned_vcf, path: source/RNAseqPanel_snp_pruned.win15000.miss0.5.maf0.01.het0.01.rq0.5.vcf.gz, description: LD-pruned RNA-seq panel VCF, source: figshare, required_for: [full]}
-  - {id: rnaseq_pruned_vcf_index, path: source/RNAseqPanel_snp_pruned.win15000.miss0.5.maf0.01.het0.01.rq0.5.vcf.gz.tbi, description: Tabix index for the LD-pruned RNA-seq panel VCF, source: figshare, required_for: [full]}
-  - {id: rnaseq_metadata, path: source/RNAseq_metadata.csv, description: Accession mapping for the 318-accession RNA-seq panel, source: figshare, required_for: [full]}
-  - {id: rnaseq_tpm, path: source/RNAseqPanel.TPMs.csv.gz, description: Analysis-ready TPM matrix used for expression contexts and cis-eQTL analysis, source: figshare, required_for: [full]}
-  - {id: gxe_vcf, path: source/GxE.vcf.gz, description: Analysis-ready variant calls for the 176-accession GxE panel, source: figshare, required_for: [full]}
-  - {id: gxe_vcf_index, path: source/GxE.vcf.gz.tbi, description: Tabix index for the GxE panel VCF, source: figshare, required_for: [full]}
-  - {id: gxe_pruned_vcf, path: source/GxE_snp_pruned.win15000.miss0.5.maf0.01.het0.01.rq0.5.vcf.gz, description: LD-pruned GxE genotype panel, source: figshare, required_for: [full]}
-  - {id: gxe_pruned_vcf_index, path: source/GxE_snp_pruned.win15000.miss0.5.maf0.01.het0.01.rq0.5.vcf.gz.tbi, description: Tabix index for the LD-pruned GxE VCF, source: figshare, required_for: [full]}
-  - {id: gxe_metadata, path: source/GxE_metadata.csv, description: Accession-level average phenotypes and plasticity traits for the GxE panel, source: figshare, required_for: [checkpoint, full]}
-  - {id: accessible_chromatin_regions, path: source/ACRs.v5.bed.gz, description: Accessible chromatin regions harmonized to the project coordinate system, source: figshare, required_for: [full]}
-  - {id: unmethylated_regions, path: source/UMRs.v5.bed.gz, description: Unmethylated regions harmonized to the project coordinate system, source: figshare, required_for: [full]}
-  - {id: phylop_scores, path: source/Sbi_PhyloP.v5.tsv.gz, description: Sorghum phyloP conservation scores, source: figshare, required_for: [full]}
-  - {id: recombination_map, path: source/avg_cM_genomewide_NAM_population.csv, description: NAM population recombination estimates in cM per bp, source: figshare, required_for: [full]}
-  - {id: flowering_genes, path: source/Sorghum_flowering_genes.csv, description: Catalog of 260 FLOR-ID orthologs and 52 literature-curated flowering-time genes, source: figshare, required_for: [full]}
-  - {id: poaceae_hog, path: source/Poaceae_HOG.tsv.gz, description: Analysis-ready Poaceae hierarchical orthogroup table, source: figshare, required_for: [full]}
-  - {id: gcn_edges, path: source/edge_weight_N3.0.01.tsv.gz, description: Prepared gene coexpression network edge table, source: figshare, required_for: [full]}
-  - {id: clusterone_modules, path: source/edge_weight_N3.0.01.clusterone.txt.gz, description: Prepared ClusterONE module assignments, source: figshare, required_for: [full]}
-  - {id: snpfold_results, path: source/snpfold.results.csv.gz, description: Prepared SNPfold results used to define riboSNitch contexts, source: figshare, required_for: [full]}
-  - {id: groover_psbs, path: source/Groover_2026_nbt.PsbS.csv.gz, description: Groover promoter mutagenesis measurements for PsbS, source: figshare, required_for: [checkpoint, full]}
-  - {id: groover_raf1, path: source/Groover_2026_nbt.Raf1.csv.gz, description: Groover promoter mutagenesis measurements for Raf1, source: figshare, required_for: [checkpoint, full]}
-  - {id: groover_sbpase, path: source/Groover_2026_nbt.SBPase.csv.gz, description: Groover promoter mutagenesis measurements for SBPase, source: figshare, required_for: [checkpoint, full]}
 
-  # Published checkpoints. Full mode writes the same contracts below
-  # checkpoints/generated and never overwrites these files.
-  - {id: site_contexts, path: checkpoints/reference/contexts/site_contexts.h5, description: Published site-level genomic contexts, source: figshare, required_for: [checkpoint]}
-  - {id: gene_contexts, path: checkpoints/reference/contexts/gene_contexts.h5, description: Published gene-level genomic contexts, source: figshare, required_for: [checkpoint]}
-  - {id: environment_matrix, path: checkpoints/reference/environment/environment_matrix.h5, description: Published 31-variable landrace environmental matrix, source: figshare, required_for: [checkpoint]}
-  - {id: population_structure, path: checkpoints/reference/environment/population_structure.h5, description: Published population-structure coordinates and sample order, source: figshare, required_for: [checkpoint]}
-  - {id: envgwas_associations, path: checkpoints/reference/envgwas/envgwas_associations.h5, description: Published environmental GWAS association statistics, source: figshare, required_for: [checkpoint]}
-  - {id: envgwas_model_audit, path: checkpoints/reference/envgwas/envgwas_model_audit.tsv, description: Published environmental GWAS model diagnostics, source: figshare, required_for: [checkpoint]}
-  - {id: magma_gene_statistics, path: checkpoints/reference/envgwas/magma_gene_statistics.h5, description: Published MAGMA gene statistics, source: figshare, required_for: [checkpoint]}
-  - {id: envgwas_maf001, path: checkpoints/reference/envgwas/envgwas_associations_maf001.h5, description: Published MAF 0.01 sensitivity associations, source: figshare, required_for: [checkpoint]}
-  - {id: ld_pairs, path: checkpoints/reference/enrichment/ld_pairs.tsv.gz, description: Published LD pairs used by LD-aware enrichment, source: figshare, required_for: [checkpoint]}
-  - {id: variance_variant_sets, path: checkpoints/reference/variance/variant_set_manifest.tsv, description: Published variance-partitioning variant-set manifest, source: figshare, required_for: [checkpoint]}
-  - {id: variance_matched_controls, path: checkpoints/reference/variance/matched_control_audit.tsv, description: Published matched-control audit for variance partitioning, source: figshare, required_for: [checkpoint]}
-  - {id: grm_manifest, path: checkpoints/reference/variance/grm_manifest.tsv, description: Published GRM manifest, source: figshare, required_for: [checkpoint]}
-  - {id: reml_manifest, path: checkpoints/reference/variance/reml_manifest.tsv, description: Published LDAK REML manifest, source: figshare, required_for: [checkpoint]}
-  - {id: prediction_scores, path: checkpoints/reference/prediction/gsl_prediction_scores.h5, description: Published GSL prediction scores and empirical nulls, source: figshare, required_for: [checkpoint]}
+  # Reference genome and annotations.
+  - {"id":"reference_fasta","path":"source/Sbicolor_730_v5.0.fa.gz","description":"BTx623 v5.0 assembly sequence used with the v5.1 annotation release"}
+  - {"id":"gene_annotation","path":"source/Sbicolor_730_v5.1.gene_exons.gff3.gz","description":"BTx623 v5.1 gene and exon annotation on the v5.0 assembly"}
+  - {"id":"repeat_annotation","path":"source/Sbicolor_730_v5.1.repeatmasked_assembly_v5.0.gff3.gz","description":"Repeat annotation on the BTx623 v5.0 assembly"}
 
-  # Reference results are optional validation targets and are not analysis inputs.
-  # Add individual files after the Figshare release is finalized.
+  # Genotypes and sample/environment metadata.
+  - {"id":"all_samples_snp_vcf","path":"source/Sorghum_d8.noduplicates.allChr.snp._markernamesadded_imputed_snpeff.vcf.gz","description":"Imputed SnpEff-annotated SNP calls for 1676 samples; merged with InDels before panel extraction"}
+  - {"id":"all_samples_indel_vcf","path":"source/Sorghum_d8.noduplicates.allChr.indel._markernamesadded_imputed_snpeff.vcf.gz","description":"Imputed SnpEff-annotated InDel calls for 1676 samples; merged with SNPs before panel extraction"}
+  - {"id":"all_samples_metadata","path":"source/Sorghum_d8.noduplicates.allChr.metadata.csv","description":"2143 metadata records including accession mappings and genotype QC; not a one-to-one table for the 1676-sample VCFs"}
+  - {"id":"landrace_metadata","path":"source/landraces_metadata.csv","description":"443 landrace accessions with LIB sample IDs and geographic botanical and environmental metadata"}
+  - {"id":"environment_metadata","path":"source/envir_metadata.csv","description":"Definitions sources units and scales for 31 environmental variables"}
+  - {"id":"gxe_phenotypes","path":"source/Bernardino_2024_GxE_phenotypes.csv","description":"Phenotypic plasticity for grain yield flowering time and plant height in 176 accessions; includes trial-specific and combined traits"}
+
+  # Functional genomic contexts and gene catalogs.
+  - {"id":"accessible_chromatin_regions","path":"source/ACRs.v5.bed.gz","description":"Accessible chromatin regions used for site annotation and gene-centered spatial profiles"}
+  - {"id":"unmethylated_regions","path":"source/UMRs.v5.bed.gz","description":"Unmethylated regions used for site annotation and gene-centered spatial profiles"}
+  - {"id":"phylop_scores","path":"source/Sbi_PhyloP.csv.gz","description":"Variant ID to phyloP score table used to classify conserved neutral and accelerated sites"}
+  - {"id":"recombination_map","path":"source/avg_cM_genomewide_NAM_population.csv.gz","description":"NAM recombination estimates with chr bp and meanCmPerBp columns; used for recombination contexts and genomic landscapes"}
+  - {"id":"snpfold_results","path":"source/snpfold.results.csv.gz","description":"Prepared SNPfold results including CC_BPPROB used to define riboSNitch sites"}
+  - {"id":"flowering_genes","path":"source/Sorghum_flowering_genes.csv","description":"312 flowering-gene catalog records with annotation source and cloned-gene status; used for gene sets and cis-eQTL enrichment"}
+  - {"id":"poaceae_hog","path":"source/Poaceae_HOG.tsv.gz","description":"Hierarchical orthogroups including Sbic gene membership used for gene-family contexts"}
+  - {"id":"gcn_edges","path":"source/edge_weight_N3.0.01.tsv.gz","description":"Prepared gene coexpression network edges and weights used for module and hub contexts"}
+  - {"id":"clusterone_modules","path":"source/edge_weight_N3.0.01.clusterone.txt.gz","description":"Prepared ClusterONE modules with tab-separated gene members per line"}
+
+  # Expression matrices and prepared cis-eQTL inputs.
+  - {"id":"public_rnaseq_tpm","path":"source/Sbi_NCBI_SRA_TPMs.csv.gz","description":"Gene TPM matrix across 1923 public sequencing runs used for expression-level and variability contexts"}
+  - {"id":"rnaseq_tpm","path":"source/RNAseqPanel.tpm.csv.gz","description":"Gene TPM matrix for the 318-sample RNA-seq panel used in cis-eQTL follow-up analyses"}
+  - {"id":"cis_eqtl_sites","path":"source/cis_eQTL_all_genes_sites.csv.gz","description":"Prepared cis-eQTL site association statistics including GENE P_WALD and effect estimates"}
+  - {"id":"cis_eqtl_permutation_pvalues","path":"source/eQTL_perm_pval.csv.gz","description":"Observed and permuted P values with pval and type columns used to estimate empirical cis-eQTL FDR"}
+
+  # Promoter mutagenesis measurements; preserve the existing source subdirectory.
+  - {"id":"groover_sbpase","path":"source/Groover_2026_nbt/3A_sorghum.csv.gz","description":"SBPase barcode-level promoter mutagenesis measurements used to estimate mutation effects and spatial profiles"}
+  - {"id":"groover_raf1","path":"source/Groover_2026_nbt/3B_sorghum.csv.gz","description":"Raf1 barcode-level promoter mutagenesis measurements used to estimate mutation effects and spatial profiles"}
+  - {"id":"groover_psbs","path":"source/Groover_2026_nbt/3C_sorghum.csv.gz","description":"PsbS barcode-level promoter mutagenesis measurements used to estimate mutation effects and spatial profiles"}
+  - {"id":"groover_2b","path":"source/Groover_2026_nbt/2B_sorghum.csv.gz","description":"Additional barcode-level promoter mutagenesis measurements; not read by the current notebooks and gene assignment remains unconfirmed"}
+  - {"id":"groover_2c","path":"source/Groover_2026_nbt/2C_sorghum.csv.gz","description":"Additional barcode-level promoter mutagenesis measurements; not read by the current notebooks and gene assignment remains unconfirmed"}
+
+  # Natural Earth country boundaries and shapefile companions for geographic maps.
+  - {"id":"world_map_shapefile","path":"source/natural_earth/ne_10m_admin_0_countries/ne_10m_admin_0_countries.shp","description":"Natural Earth 1:10m country boundary geometries for accession and environmental maps"}
+  - {"id":"world_map_shx","path":"source/natural_earth/ne_10m_admin_0_countries/ne_10m_admin_0_countries.shx","description":"Country boundary shapefile geometry index"}
+  - {"id":"world_map_dbf","path":"source/natural_earth/ne_10m_admin_0_countries/ne_10m_admin_0_countries.dbf","description":"Country boundary shapefile attributes"}
+  - {"id":"world_map_prj","path":"source/natural_earth/ne_10m_admin_0_countries/ne_10m_admin_0_countries.prj","description":"Country boundary shapefile coordinate reference system"}
+  - {"id":"world_map_cpg","path":"source/natural_earth/ne_10m_admin_0_countries/ne_10m_admin_0_countries.cpg","description":"Country boundary shapefile character encoding"}
+  - {"id":"world_map_version","path":"source/natural_earth/ne_10m_admin_0_countries/ne_10m_admin_0_countries.VERSION.txt","description":"Version identifier supplied with the Natural Earth boundary dataset"}
+  - {"id":"world_map_readme","path":"source/natural_earth/ne_10m_admin_0_countries/ne_10m_admin_0_countries.README.html","description":"Dataset documentation supplied with the Natural Earth boundaries"}

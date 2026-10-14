@@ -194,6 +194,19 @@ def _locus_prefix(output_dir, config):
     return f'{output_dir}/{config["gene_id"]}.{config["env_id"]}'
 
 
+def _valid_nominal_sites(table, label):
+    """Exclude undefined Wald P values before ranking, BH or marker selection."""
+    finite = np.isfinite(table['P_WALD'])
+    excluded = int((~finite).sum())
+    table = table.loc[finite].copy()
+    if excluded:
+        _message(f'{label}: excluded {excluded:,} undefined/nonfinite Wald P values; '
+                 f'{len(table):,} sites retained')
+    if table.empty or not table['P_WALD'].between(0, 1).all():
+        raise ValueError(f'{label} must contain valid nominal P values in [0, 1].')
+    return table
+
+
 def prepare_flowering_gene_loci(configs, site_csv, tpm_csv, threshold_csv, vcf_file,
                                 gff_file, landrace_csv, environment_csv, gwas_dir,
                                 output_dir, force_recompute=False):
@@ -202,7 +215,7 @@ def prepare_flowering_gene_loci(configs, site_csv, tpm_csv, threshold_csv, vcf_f
 
     Workflow
     --------
-    Read target cis tables and TPM once, calculate BH across all cis sites,
+    Read target cis tables and TPM once, calculate BH across valid cis sites,
     process one environment GWAS at a time, match marker alleles in the indexed
     all-sample VCF, and save each gene/environment's plotting inputs.
 
@@ -225,6 +238,8 @@ def prepare_flowering_gene_loci(configs, site_csv, tpm_csv, threshold_csv, vcf_f
         short description and units respectively.
     gwas_dir : str
         Root containing {env}/{env}.gemma/{env}.gemma.gwas_df.h5, key df.
+        Missing/nonfinite Wald P values are excluded before genome-wide
+        quantiles, regional selection and matching shared markers.
     output_dir : str
         Directory for per-gene .locus.csv.gz and .summary.csv.gz tables.
     force_recompute : bool, default False
@@ -236,7 +251,8 @@ def prepare_flowering_gene_loci(configs, site_csv, tpm_csv, threshold_csv, vcf_f
     pandas.DataFrame
         One row per configuration with selected marker, thresholds and saved
         file paths. Saved locus rows distinguish gea, eqtl, gene, exon,
-        env_box and expr_box. BH uses all cis sites before regional selection;
+        env_box and expr_box. BH uses all cis sites with finite Wald P values
+        before regional selection; N_CIS_TESTED counts these retained sites;
         boxplots retain only nonmissing 0/0 and 1/1 observations.
     """
     from cyvcf2 import VCF
@@ -278,8 +294,7 @@ def prepare_flowering_gene_loci(configs, site_csv, tpm_csv, threshold_csv, vcf_f
     per_gene = {}
     for gene_id in target_ids:
         table = sites[sites['GENE'] == gene_id].copy()
-        if not np.isfinite(table['P_WALD']).all() or not table['P_WALD'].between(0, 1).all():
-            raise ValueError(f'Invalid nominal P values for {gene_id}.')
+        table = _valid_nominal_sites(table, gene_id)
         table['BH_FDR'] = multipletests(table['P_WALD'], method='fdr_bh')[1]
         per_gene[gene_id] = table
     del sites, parts
@@ -298,8 +313,7 @@ def prepare_flowering_gene_loci(configs, site_csv, tpm_csv, threshold_csv, vcf_f
             env = env[['ID', 'CHROM', 'POS', 'MAF', 'P_WALD']].copy()
             if not env['ID'].is_unique:
                 raise ValueError(f'Duplicate GWAS IDs for {env_id}.')
-            if not np.isfinite(env['P_WALD']).all() or not env['P_WALD'].between(0, 1).all():
-                raise ValueError(f'Invalid nominal P values for {env_id}.')
+            env = _valid_nominal_sites(env, env_id)
             top1, top5 = env['P_WALD'].quantile([0.01, 0.05])
             for config in [c for c in configs if c['env_id'] == env_id]:
                 gene_id = config['gene_id']
@@ -345,7 +359,7 @@ def prepare_flowering_gene_loci(configs, site_csv, tpm_csv, threshold_csv, vcf_f
                 for panel, table in [('gea', env), ('eqtl', eqtl)]:
                     local = table[(table['CHROM'] == gene.chr_id) & table['POS'].between(start, end)].copy()
                     local['PANEL'] = panel
-                    local['VALUE'] = -np.log10(local['P_WALD'])
+                    local['VALUE'] = -np.log10(local['P_WALD'].clip(lower=np.nextafter(0.0, 1.0)))
                     local['IS_MARKER'] = local['ID'] == marker['ID']
                     regional.append(local)
                 models = []
@@ -610,8 +624,9 @@ def prepare_regulatory_gea_genes(egene_list_file, site_csv, threshold_csv, gwas_
         leads.append(local.sort_values(['P_WALD', 'POS', 'ID']).drop_duplicates('GENE')[columns])
     leads = pd.concat(leads).sort_values(['P_WALD', 'POS', 'ID']).drop_duplicates('GENE').set_index('GENE')
     env = pd.read_hdf(gwas_h5, key='df')[['ID', 'CHROM', 'POS', 'REF', 'ALT', 'P_WALD']]
-    if not env['ID'].is_unique or not np.isfinite(env['P_WALD']).all() or not env['P_WALD'].between(0, 1).all():
-        raise ValueError('Environmental GWAS must have unique IDs and valid P values.')
+    if not env['ID'].is_unique:
+        raise ValueError('Environmental GWAS must have unique IDs.')
+    env = _valid_nominal_sites(env, 'Environmental GWAS')
     env_threshold = float(env['P_WALD'].quantile(top_fraction))
     eligible = env[env['P_WALD'] <= env_threshold].sort_values(['CHROM', 'POS', 'ID'])
     by_chrom = {chrom: table.reset_index(drop=True) for chrom, table in eligible.groupby('CHROM')}

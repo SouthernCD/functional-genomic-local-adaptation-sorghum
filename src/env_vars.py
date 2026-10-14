@@ -199,7 +199,8 @@ def env_vars_map_plotter(main_env,
                          save_fig_path,
                          NATURAL_EARTH_SHP_FILE,
                          longitude_limit=(-20, 52),
-                         latitude_limit=(-37, 22)):
+                         latitude_limit=(-37, 22),
+                         *, tree_position=(-0.12, -0.03), tree_rotate_deg=-60.0):
 
     """Map environmental values and color the existing landrace tree.
 
@@ -223,6 +224,13 @@ def env_vars_map_plotter(main_env,
     longitude_limit, latitude_limit : tuple
         Geographic display bounds. Non-Striga colors span the 2nd to 98th
         percentiles; Striga uses 0–1. Missing environmental values are gray.
+    tree_position : tuple of float
+        Tree inset anchor (x, y) relative to the main map Axes. Increasing x
+        moves right; increasing y moves up. One unit is the full Axes width
+        or height. Negative values place the anchor outside the map Axes.
+        The inset retains its existing size and border padding.
+    tree_rotate_deg : float
+        Tree rotation in degrees, positive counterclockwise. Default is -60.
 
     Returns
     -------
@@ -606,10 +614,10 @@ def env_vars_map_plotter(main_env,
         env_name=main_env,
         df=landraces_reseq_df,
         nj_tree_file=nj_tree_file,
-        bbox_to_anchor=(-0.12, -0.03, 1, 1),
+        bbox_to_anchor=(*tree_position, 1, 1),
         width="62%",
         height="62%",
-        rotate_deg=-60.0
+        rotate_deg=tree_rotate_deg
     )
 
     # =========================
@@ -712,7 +720,7 @@ def env_vars_map_plotter(main_env,
     # print(f"Figure saved to {save_fig_path}")
     return fig, ax_main
 
-def rda_analysis(vcf, landraces_env_df, kinship_file, output_dir):
+def rda_analysis(vcf, landraces_env_df, output_dir):
     """Fit RDA of genotypic variation on standardized environmental variables.
 
     Workflow
@@ -728,9 +736,6 @@ def rda_analysis(vcf, landraces_env_df, kinship_file, output_dir):
         LD-pruned VCF; genotypes are represented as alternative-allele counts.
     landraces_env_df : pandas.DataFrame
         Samples indexed by LIB, with environmental variables as columns.
-    kinship_file : str
-        IBS matrix in the original sample order. Loaded and aligned for a
-        finite-value check; it is not a predictor or covariate in this model.
     output_dir : str
         Save rda_samples.csv, rda_env_contrib.csv and rda_explained.csv.
         Environmental vectors are correlations with the first two RDA axes.
@@ -780,14 +785,8 @@ def rda_analysis(vcf, landraces_env_df, kinship_file, output_dir):
 
     E = StandardScaler().fit_transform(env_clean.values)
 
-    # Align the supplied IBS matrix; the RDA fit below does not use it.
-    K = pd.read_csv(kinship_file, sep=',', names=landraces_env_df.index)
-    K.index = landraces_env_df.index
-    K = K.loc[keep_ids, keep_ids].values
-
     assert np.isfinite(X).all(), 'Genotype matrix contains non-finite values.'
     assert np.isfinite(E).all(), 'Environmental matrix contains non-finite values.'
-    assert np.isfinite(K).all(), 'IBS matrix contains non-finite values.'
 
     # Fit genotype variation to environments.
     lm = LinearRegression().fit(E, X)
@@ -923,7 +922,7 @@ def plot_rda_biplot(rda_samples_df, rda_env_contrib_df, rda_explained_df,
     ax.spines['left'].set_visible(False)
     ax.spines['bottom'].set_visible(False)
 
-    ax.invert_yaxis()
+    # ax.invert_yaxis()
 
     ax.set_xlim(ax.get_xlim()[0]*1.2, ax.get_xlim()[1])
     fig.patch.set_facecolor('none')

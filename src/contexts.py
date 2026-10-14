@@ -2375,7 +2375,9 @@ def prepare_gea_landscape(track_data_csv, gwas_dir, environment_metadata_csv,
         Existing track resolution, default 1 Mb.
     top_fraction : float
         Genome-wide P-value quantile, default 0.05; include ties. The background
-        is all rows of each association table, including unplotted sequences.
+        is all rows with finite P values in each association table, including
+        unplotted sequences. Missing/nonfinite P values are excluded from
+        ranking, genome-wide background counts and window counts.
     force_recompute : bool
         Rebuild the result. Cached inputs/parameters are assumed unchanged;
         explicitly recompute after changing GWAS inputs or top_fraction.
@@ -2411,8 +2413,14 @@ def prepare_gea_landscape(track_data_csv, gwas_dir, environment_metadata_csv,
     for env_id in tqdm(metadata['env_id'], desc='Summarizing GEA enrichment', unit='environment'):
         file_path = f'{gwas_dir}/{env_id}/{env_id}.gemma/{env_id}.gemma.gwas_df.h5'
         gwas = pd.read_hdf(file_path, key='df')[['CHROM', 'POS', 'P_VALUE']]
-        if gwas.empty or not np.isfinite(gwas['P_VALUE']).all() or not gwas['P_VALUE'].between(0, 1).all():
-            raise ValueError(f'GWAS P values for {env_id} must be finite and in [0, 1].')
+        finite = np.isfinite(gwas['P_VALUE'])
+        excluded = int((~finite).sum())
+        gwas = gwas.loc[finite].copy()
+        if excluded:
+            print(f'{env_id}: excluded {excluded:,} undefined/nonfinite GWAS P values; '
+                  f'{len(gwas):,} variants remain in the enrichment background', flush=True)
+        if gwas.empty or not gwas['P_VALUE'].between(0, 1).all():
+            raise ValueError(f'GWAS for {env_id} must contain valid P values in [0, 1].')
         threshold = gwas['P_VALUE'].quantile(top_fraction)
         gwas['IS_TOP'] = gwas['P_VALUE'].le(threshold)
         total_tested, total_top = len(gwas), int(gwas['IS_TOP'].sum())
@@ -2469,6 +2477,7 @@ def plot_genomic_gea_landscape(feature_data_csv, gea_data_csv, cloned_bins_csv,
         color limits, plus cloned IDs and the displayed window markers.
     panel : {'main', 'supp'}
         Feature selection; both figures share GEA colors and ordering.
+        Panel titles are lettered sequentially from A within each figure.
     window_size : int
         Existing bin resolution in bp; terminal bins retain their true END.
     figsize : tuple
@@ -2592,7 +2601,7 @@ def plot_genomic_gea_landscape(feature_data_csv, gea_data_csv, cloned_bins_csv,
         for index, track in enumerate(tracks):
             label_ax.text(0.95, index + 0.5, labels[track], ha='right', va='center', fontsize=label_fontsize)
         axes[group] = {'labels': label_ax, 'heatmaps': row_axes}
-        add_title(group, row_axes)
+        add_title(f'{chr(65 + row)}. {group}', row_axes)
         add_dividers(row_axes)
         exported = frame.copy()
         exported['VALUE'] = exported['Z_SCORE']
@@ -2628,7 +2637,7 @@ def plot_genomic_gea_landscape(feature_data_csv, gea_data_csv, cloned_bins_csv,
         ax.axis('off')
         gea_axes.append(ax)
     axes['GEA signals'] = {'tree': tree_ax, 'heatmaps': gea_axes}
-    add_title('GEA signals', gea_axes)
+    add_title(f'{chr(65 + gea_row)}. GEA signals', gea_axes)
     add_dividers(gea_axes)
     gea_export = gea.copy()
     gea_export['PANEL'], gea_export['GROUP'] = panel, 'GEA signals'
@@ -2668,7 +2677,7 @@ def plot_genomic_gea_landscape(feature_data_csv, gea_data_csv, cloned_bins_csv,
     label_ax.axis('off')
     label_ax.text(0.95, 0.5, 'Cloned Flowering Genes', ha='right', va='center', fontsize=label_fontsize)
     axes['Flowering genes'] = {'labels': label_ax, 'markers': cloned_axes}
-    add_title('Flowering genes', cloned_axes)
+    add_title(f'{chr(65 + cloned_row)}. Flowering genes', cloned_axes)
     add_dividers(cloned_axes, bottom=band_bottom, top=band_top)
     cloned_export = marker_matrix.reset_index()
     cloned_export['PANEL'], cloned_export['GROUP'] = panel, 'Flowering genes'

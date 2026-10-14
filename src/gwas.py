@@ -70,7 +70,8 @@ def gemma_result_parser(gemma_output_assoc_file, var_stat_h5, chr_list):
     Returns
     -------
     pandas.DataFrame
-        Associations with Benjamini–Hochberg FDR over all merged variants,
+        Associations with Benjamini–Hochberg FDR over nonmissing P values.
+        Missing P values retain NaN FDR in their original rows. Results are
         sorted by chromosome and position when coordinates are available.
     """
 
@@ -92,8 +93,11 @@ def gemma_result_parser(gemma_output_assoc_file, var_stat_h5, chr_list):
         lambda x: 1-x if x > 0.5 else x)
 
     print(f'Calculating FDR...')
-    gemma_output_assoc_df['FDR'] = multipletests(
-        gemma_output_assoc_df['P_VALUE'], method='fdr_bh')[1]
+    valid_p_values = gemma_output_assoc_df['P_VALUE'].notna()
+    gemma_output_assoc_df['FDR'] = np.nan
+    if valid_p_values.any():
+        gemma_output_assoc_df.loc[valid_p_values, 'FDR'] = multipletests(
+            gemma_output_assoc_df.loc[valid_p_values, 'P_VALUE'], method='fdr_bh')[1]
     # gemma_output_assoc_df.sort_values('FDR')
 
     if var_stat_h5 is None:
@@ -613,10 +617,27 @@ class MAGMA_JOB():
         self.bfile_prefix = bfile_prefix
 
     def make_p_value_file(self):
-        """Export variant IDs and Wald P values from the GEMMA result HDF."""
+        """Export finite Wald P values from the GEMMA result HDF for MAGMA.
+
+        Returns
+        -------
+        None
+            Set p_value_file and overwrite its headerless ID/P_VALUE table.
+            Exclude undefined/nonfinite P values and report their count; finite
+            values outside [0, 1] or missing SNP IDs raise ValueError.
+        """
         site_gwas_df = pd.read_hdf(self.site_gwas_df_h5, key='df')
+        p_values = site_gwas_df['P_VALUE']
+        finite = np.isfinite(p_values)
+        if not p_values.loc[finite].between(0, 1).all():
+            raise ValueError('MAGMA requires finite P values in [0, 1].')
+        p_value_df = site_gwas_df.loc[finite, ['ID', 'P_VALUE']]
+        if p_value_df.empty or p_value_df['ID'].isna().any():
+            raise ValueError('MAGMA requires at least one valid P value and nonmissing SNP IDs.')
+        print(f'{self.name}: exporting {len(p_value_df):,} SNP P values for MAGMA; '
+              f'excluded {(~finite).sum():,} undefined/nonfinite P values', flush=True)
         p_value_file = self.site_gwas_df_h5.replace(".h5", ".p_value.txt")
-        site_gwas_df[['ID', 'P_VALUE']].to_csv(
+        p_value_df.to_csv(
             p_value_file, sep='\t', index=False, header=False)
         self.p_value_file = p_value_file
 
@@ -884,14 +905,21 @@ def genomewide_general_plotter(data_df, chr_length_df, ax=None, style='scatter',
         total_length += r['LEN']
 
 
-    data_df = data_df.dropna()
+    data_df = data_df.dropna(subset=['CHROM', 'POS', 'VALUE']).copy()
+    data_df = data_df.loc[
+        data_df['CHROM'].isin(chr_list) & np.isfinite(data_df['POS'])
+        & np.isfinite(data_df['VALUE'])].copy()
+    if data_df.empty:
+        raise ValueError('No finite values with valid chromosome coordinates remain for plotting.')
     data_df['CHROM'] = data_df['CHROM'].astype(str)
     data_df['POS'] = data_df['POS'].astype(int)
     data_df['VALUE'] = data_df['VALUE'].astype(float)
 
     ax.set_xlim(0 - total_length*0.05, total_length*1.05)
     max_y = np.max(data_df['VALUE']) if max_y is None else max_y
-    ax.set_ylim(0, max_y*1.1)
+    if not np.isfinite(max_y):
+        raise ValueError('The plot upper limit must be finite.')
+    ax.set_ylim(0, max_y*1.1 if max_y > 0 else 1)
 
 
     ax.set_xlabel('Chromosome')
@@ -920,8 +948,8 @@ def genomewide_general_plotter(data_df, chr_length_df, ax=None, style='scatter',
             ax.fill_between((chr_df['POS'] + chr_df['CHROM'].map(chr_coord_dict)
                              ).values, chr_df['VALUE'].values, color=c, alpha=0.5)
 
-        chr_ticks.append(
-            (chr_df['POS'] + chr_df['CHROM'].map(chr_coord_dict)).mean())
+        chromosome_length = chr_length_df.loc[chr_length_df['CHROM'] == chr_id, 'LEN'].iloc[0]
+        chr_ticks.append(chr_coord_dict[chr_id] + chromosome_length / 2)
         chr_labels.append(chr_id)
         n += 1
 
@@ -940,8 +968,11 @@ def genomewide_gwas_plot(gwas_df, chr_length_df, threshold_fdr=0.05, ax=None, pv
     chr_list: list of chromosome names
     chr_length_dict: dict of chromosome length
     """
-    # data preparation
-    gwas_df.loc[gwas_df['P_VALUE'] <= pval_lim, 'P_VALUE'] = pval_lim
+    # Missing FDR does not invalidate a nominal P value for Manhattan plotting.
+    valid_p_values = (np.isfinite(gwas_df['P_VALUE'])
+                      & gwas_df['P_VALUE'].between(0, 1))
+    gwas_df = gwas_df.loc[valid_p_values].copy()
+    gwas_df['P_VALUE'] = gwas_df['P_VALUE'].clip(lower=pval_lim)
 
     data_df = gwas_df.copy()
     data_df['VALUE'] = -np.log10(data_df['P_VALUE'])
@@ -956,7 +987,7 @@ def genomewide_gwas_plot(gwas_df, chr_length_df, threshold_fdr=0.05, ax=None, pv
 
 
 
-    if plot_fdr:
+    if plot_fdr and gwas_df['FDR'].notna().any():
 
         gwas_df = gwas_df.copy()
         gwas_df.loc[gwas_df['FDR'] == 0, 'FDR'] = pval_lim
@@ -1109,7 +1140,9 @@ def plot_gwas_summary_panel(gwas_df_h5, genome_fasta_file,
         associations; export the actual figure values as CSV.gz alongside PNG/PDF.
         P_VALUE retains the original probabilities; QQ_INCLUDED marks finite
         values in (0, 1] used in the QQ panel. MANHATTAN_P_VALUE records
-        the display floor used in the Manhattan panel. Call plt.show().
+        the display floor used in the Manhattan panel. MANHATTAN_INCLUDED
+        and HISTOGRAM_INCLUDED identify rows used in those panels; missing
+        FDR does not exclude a valid Manhattan point. Call plt.show().
     """
 
     set_plot_style()
@@ -1123,8 +1156,14 @@ def plot_gwas_summary_panel(gwas_df_h5, genome_fasta_file,
     manhattan_df = gwas_df[['CHROM', 'POS', 'P_VALUE', 'FDR']].copy()
     p_values = gwas_df['P_VALUE'].values
     plot_data_df = gwas_df[['ID', 'CHROM', 'POS', 'P_VALUE', 'FDR']].copy()
-    plot_data_df['MANHATTAN_P_VALUE'] = plot_data_df['P_VALUE'].clip(lower=1e-20)
+    valid_p_values = _qq_included(p_values, filter_zero_point=False)
+    plot_data_df['MANHATTAN_P_VALUE'] = plot_data_df['P_VALUE'].where(valid_p_values).clip(lower=1e-20)
+    plot_chromosomes = chr_len_df.loc[chr_len_df['LEN'] > 1e6, 'CHROM']
+    plot_data_df['MANHATTAN_INCLUDED'] = (
+        valid_p_values & plot_data_df['CHROM'].isin(plot_chromosomes)
+        & np.isfinite(plot_data_df['POS']))
     plot_data_df['QQ_INCLUDED'] = _qq_included(p_values)
+    plot_data_df['HISTOGRAM_INCLUDED'] = valid_p_values
 
     if title is None:
         title = gwas_df_h5.split('/')[-1].replace('.h5', '')
@@ -1177,7 +1216,7 @@ def plot_gwas_summary_panel(gwas_df_h5, genome_fasta_file,
     # Histogram
     # -----------------------------
     ax_hist.hist(
-        p_values,
+        p_values[valid_p_values],
         bins=bins,
         edgecolor='gray',
         linewidth=0.1,

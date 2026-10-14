@@ -2440,7 +2440,7 @@ def prepare_rasi_examples(gff_file, gwas_h5, gene_configs, output_dir,
         Defaults are 10000, 500 and 10. Windows follow transcription direction;
         plot positions use the original window coordinate plus bin_size / 2.
     min_variants : int
-        Minimum tested variants for the raw-P quartile; default 4. Windows
+        Minimum variants with finite raw P values for the quartile; default 4. Windows
         with fewer variants use the regional quartile (ratio one). Regions
         with fewer variants have ratio one throughout, as in original QRE.
     force_recompute : bool
@@ -2473,6 +2473,7 @@ def prepare_rasi_examples(gff_file, gwas_h5, gene_configs, output_dir,
         associations = pd.read_hdf(gwas_h5, key='df')[['ID', 'CHROM', 'POS', 'P_WALD']]
         if associations['ID'].isna().any() or not associations['ID'].is_unique:
             raise ValueError('GEMMA variant IDs must be unique and nonmissing.')
+        associations = _valid_rasi_associations(associations, env_id)
     summaries = []
     for config in tqdm(configs, desc='RASI examples'):
         gene_id, gene_name = config['gene_id'], config['gene_name']
@@ -2629,6 +2630,18 @@ def _spatial_window_starts(flank, bin_size, step):
 QRE_STATISTIC = 'negative_log10_raw_P25_ratio_legacy_windows'
 
 
+def _valid_rasi_associations(data, env_id):
+    """Exclude nonfinite Wald P values before counting variants or computing Q25."""
+    finite = np.isfinite(data['P_WALD'])
+    excluded = int((~finite).sum())
+    if excluded:
+        print(f'{env_id}: excluded {excluded:,} variants with nonfinite Wald P values from RASI.', flush=True)
+    data = data.loc[finite].copy()
+    if data.empty or not data['P_WALD'].between(0, 1).all():
+        raise ValueError(f'{env_id}: RASI requires valid Wald P values in [0, 1].')
+    return data
+
+
 def _legacy_qre_profile(position, strand, positions, pvalues, flank, bin_size, step, min_variants=4):
     """Reproduce original raw-P quartiles, sparse-window fallback and coordinates."""
     region_start, region_end = position - flank, position + flank - 1
@@ -2758,7 +2771,9 @@ def prepare_spatial_profile_database(gff_file, association_sources, qc_vcf_file,
         Gene annotation; TSS/TTS follow strand. Gene/UTR lengths retain the
         existing first-annotated-transcript definition for length bars.
     association_sources : dict
-        Environmental IDs mapped to QC GEMMA HDF tables with key df.
+        Environmental IDs mapped to GEMMA HDF tables with key df.
+        Nonfinite Wald P values are excluded before variant counts and Q25;
+        finite values outside [0, 1] raise an error.
     qc_vcf_file, pi_vcf_file : str
         QC genotypes for LD and unfiltered landrace genotypes for diversity.
     acr_bed_file, umr_bed_file : str
@@ -2773,7 +2788,7 @@ def prepare_spatial_profile_database(gff_file, association_sources, qc_vcf_file,
     flank, bin_size, step : int
         Symmetric anchor radius, window size and step in bp; defaults 10000/500/10.
     min_variants : int
-        Minimum tested variants for the raw-P Q25; default 4. Sparse windows
+        Minimum variants with finite raw P values for Q25; default 4. Sparse windows
         use the regional percentile, and sparse regions have RASI=1 throughout.
     threads, ld_threads : int
         Independent-anchor process counts. All computation is explicit here.
@@ -2852,6 +2867,7 @@ def prepare_spatial_profile_database(gff_file, association_sources, qc_vcf_file,
                 data = pd.read_hdf(source, key='df')[['ID', 'CHROM', 'POS', 'P_WALD']]
                 if data['ID'].isna().any() or not data['ID'].is_unique:
                     raise ValueError(f'{env_id}: variant IDs must be nonmissing and unique.')
+                data = _valid_rasi_associations(data, env_id)
                 association = {chrom: frame.sort_values('POS') for chrom, frame in data.groupby('CHROM')}
                 del data
             unique = list(dict.fromkeys((row['chrom'], int(row[anchor]), row['strand']) for _, row in genes.iterrows()))

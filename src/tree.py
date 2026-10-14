@@ -256,31 +256,3 @@ class UnrootedTreePlotter:
     def calculate_coordinates(self, rotate_tree=0, use_edge_length=True):
         self.xx, self.yy, self.node_angles, self.node_axes = calculate_coordinates(
             self.tree, rotate_tree, use_edge_length)
-
-
-def get_ibs_nj_tree_from_snp_pruned_vcf(vcf_file, out_prefix):
-    from .vcf import get_genotype_matrix_from_vcf, get_sample_list_from_vcf
-    from .ibs import get_IBS_matrix_broadcasting_chunk_parallel, get_IBS_distance_matrix
-    from .utils import cmd_run
-
-    sample_names = get_sample_list_from_vcf(vcf_file)
-    genotype_matrix = get_genotype_matrix_from_vcf(vcf_file)
-    ibs_matrix = get_IBS_matrix_broadcasting_chunk_parallel(genotype_matrix)
-    ibs_distance_matrix = get_IBS_distance_matrix(ibs_matrix)
-
-    ibs_file = out_prefix + ".ibs.matrix"
-    np.savetxt(ibs_matrix, ibs_matrix, fmt='%.6f', delimiter=', ')
-    ibs_distance_file = out_prefix + ".ibs_dist.matrix"
-    np.savetxt(ibs_distance_matrix, ibs_distance_matrix, fmt='%.6f', delimiter=', ')
-
-    ibs_distance_phylip_file = out_prefix + ".ibs_dist.phylip"
-    with open(ibs_distance_phylip_file, 'w') as f:
-        f.write(str(len(sample_names)) + '\n')
-        for i, sample_name in enumerate(sample_names):
-            f.write(sample_name + ' ' +
-                    ' '.join(["%.6f" % x for x in ibs_distance_matrix[i]]) + '\n')
-
-    nj_tree_file = out_prefix + ".nj.tree"
-    cmd_run("fastme -i %s -o %s -n" % (ibs_distance_phylip_file, nj_tree_file))
-
-    return nj_tree_file
